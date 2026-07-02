@@ -1,0 +1,36 @@
+# =============================================================
+#  Transkription_Notes_Pipeline - API Keys and Tokens (Template)
+#  Copy this file to keys.cfg and fill in your values.
+#  keys.cfg is git-ignored and never committed.
+# =============================================================
+
+# --- LLM backend for notes/summary generation ---
+# "ollama"    = local LLM, free, private, no internet needed
+# "anthropic" = Claude API, best quality, requires API key
+LLM_BACKEND=ollama
+
+# --- Anthropic API (used when LLM_BACKEND=anthropic) ---
+# Get a key at https://console.anthropic.com
+ANTHROPIC_API_KEY=sk-ant-...
+
+# --- Ollama base URL (no path suffix) ---
+OLLAMA_BASE_URL=http://localhost:11434
+
+# --- Ollama text model for meeting/webinar notes ---
+# Recommended (default as of 2026-07-02): qwen3:14b (128K context, better
+# instruction following than qwen2.5:14b, same VRAM budget)
+# Alternative: qwen2.5:14b (previous default), qwen2.5:7b (less VRAM), llama3.1:8b
+# NOT recommended: mistral:7b (32K context, too small), llama3:8b (8K context)
+# Pull command: ollama pull qwen3:14b
+OLLAMA_MODEL=qwen3:14b
+
+# --- Ollama vision model for slide annotation (video mode only) ---
+# Recommended: qwen2.5vl:7b (better structured text extraction than llava)
+# Pull command: ollama pull qwen2.5vl:7b
+OLLAMA_VLM_MODEL=qwen2.5vl:7b
+
+# --- HuggingFace token (speaker diarization via pyannote) ---
+# Step 1: Register at https://huggingface.co and create a read token.
+# Step 2: Accept model terms at https://huggingface.co/pyannote/speaker-diarization-3.1
+# Step 3: Paste your token below.
+HF_TOKEN=hf_...

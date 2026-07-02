@@ -1,0 +1,41 @@
+# Secrets
+keys.cfg
+
+# Personal vocabulary extensions (keep vocabulary.py.example tracked instead)
+vocabulary.py
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+__pycache__/
+*.pyc
+logs/
+
+# Generated outputs (transcripts, notes, slide reports) - stay next to source media,
+# which normally lives outside this repo, but ignore them if ever created here.
+*_transcript_speakers.txt
+*_text.txt
+*_transcript.srt
+*_segments.json
+*_notes.txt
+*_notes.html
+*_notes.pdf
+*_notes.docx
+*_slides/
+output/
+batch_log_*.txt
+batch_folder_log_*.txt
+notes_batch_log_*.txt
+
+# Sample/test media
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.mkv
+*.mov
+
+# Corruption-recovery backups (see 2026-07-02 db incident), not source
+*.corrupt-backup

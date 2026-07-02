@@ -1,0 +1,832 @@
+# =============================================================
+#  Transkription_Notes_Pipeline V1.1 - run_pipeline.py
+#  Master orchestrator, combining the former
+#  Audio_Transkription_Notes_Pipeline (audio-only meeting/webinar
+#  notes) and Video_Transkription_Notes_Pipeline (slide-change
+#  detection + VLM annotation + webinar summary) into one tool.
+#
+#  Slide detection/VLM annotation only run for video files with
+#  enable_slides=True (default). They are automatically skipped
+#  for audio-only extensions (mp3, wav, m4a, ogg, flac, aac, wma).
+#
+#  V1.1: --output-dir override, --batch-folder auto-discovery,
+#  independent notes format toggles (txt/html/pdf/docx), PDF export
+#  now tries Playwright/Chromium before weasyprint/pdfkit.
+#
+#  CLI usage:
+#    python run_pipeline.py                                  (GUI file picker)
+#    python run_pipeline.py "file.mp4"                        (direct path)
+#    python run_pipeline.py "file.mp4" de                     (force language)
+#    python run_pipeline.py --prompt-template webinar "f.mp4" (choose prompts/webinar.md)
+#    python run_pipeline.py --no-slides "webinar.mp4"         (audio-style run on a video)
+#    python run_pipeline.py --no-vlm "webinar.mp4"            (slides, no VLM annotation)
+#    python run_pipeline.py --no-whisper "webinar.mp4"        (slides only, no transcript)
+#    python run_pipeline.py --no-summary "file.mp4"           (transcript only, no notes)
+#    python run_pipeline.py --dry-run "webinar.mp4"           (slide timestamps only)
+#    python run_pipeline.py --force-retranscribe "file.mp4"
+#    python run_pipeline.py --diarize "file.mp4"
+#    python run_pipeline.py --whisper-model base "file.mp4"
+#    python run_pipeline.py --threshold 5 "webinar.mp4"
+#    python run_pipeline.py --output-dir "D:\Notes\2026-07" "file.mp4"
+#    python run_pipeline.py --docx "file.mp4"                 (also write notes .docx)
+#    python run_pipeline.py --pdf "file.mp4"                  (also write notes .pdf)
+#    python run_pipeline.py --notes-only "file_transcript_speakers.txt"
+#    python run_pipeline.py --notes-batch "D:/Videos"
+#    python run_pipeline.py --file-list "list.txt"             (resumes automatically, skips already-done files)
+#    python run_pipeline.py --batch-folder "D:/Videos"         (every supported file in a folder)
+#    python run_pipeline.py --search "retention index"         (full-text search notes + slides)
+#    python run_pipeline.py --log-file "file.mp4"              (also write this run's log to logs/)
+#    python run_pipeline.py --mode audio_transcript "call.mp3"  (generic audio transcript, no slides)
+#    python run_pipeline.py --mode video_transcript "demo.mp4"  (generic video transcript, slides on)
+#    python run_pipeline.py --meeting-title "Q3 Roadmap" --meeting-date 2026-07-03 "call.mp4"
+#    python run_pipeline.py --ics "invite.ics" "call.mp4"       (meeting title/date from a calendar invite)
+#    python run_pipeline.py --gui                             (parameter GUI)
+#
+#  FORMAT list.txt (pipe separator for language is optional):
+#    D:\Videos\meeting_en.mp4
+#    D:\Videos\webinar_de.mp4|de
+#    # Lines starting with # are ignored
+#
+#  OUTPUT FILES (next to the source file, or under --output-dir if set):
+#    *_transcript_speakers.txt   Full transcript, timestamps + speakers
+#    *_text.txt                  Plain text grouped by speaker
+#    *_transcript.srt            Subtitle file
+#    *_segments.json             Cached whisperx segments (re-run without re-transcribing)
+#    *_notes.txt / *_notes.html  Notes/summary (unless --no-summary)
+#    *_notes.pdf / *_notes.docx  Optional, see --pdf / --docx or the GUI checkboxes
+#  Additional files when slide detection ran (video mode):
+#    *_slides/<stem>_report.html/.pdf, _slides.csv, _slides.json, snapshots/
+# =============================================================
+
+import warnings
+warnings.filterwarnings("ignore", message=".*torchcodec.*")
+warnings.filterwarnings("ignore", message=".*Lightning automatically upgraded.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+
+import argparse
+import json
+import logging
+import shutil
+import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+logging.getLogger("fontTools").setLevel(logging.ERROR)
+logging.getLogger("weasyprint").setLevel(logging.ERROR)
+logging.getLogger("lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
+logging.getLogger("whisperx").setLevel(logging.WARNING)
+
+from config import CONFIG, PROMPTS_DIR, is_audio_only, SUPPORTED_EXTENSIONS
+import db
+import notes
+import reporter
+import transcriber
+
+log = logging.getLogger("Transkription_Notes_Pipeline")
+
+
+def setup_logging(level: str = "INFO", log_to_file: bool = False,
+                  log_dir: str | None = None) -> Path | None:
+    """Configure root logging. If log_to_file is set, also writes a
+    timestamped copy of this run's log under log_dir and returns its
+    path (used by the GUI Settings tab / CLI banner); otherwise None."""
+    handlers = [logging.StreamHandler()]
+    log_file_path = None
+    if log_to_file:
+        log_dir_path = Path(log_dir or (Path(__file__).parent / "logs"))
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_dir_path / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        handlers.append(logging.FileHandler(log_file_path, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )
+    if log_file_path:
+        log.info("Logging to file: %s", log_file_path)
+    return log_file_path
+
+
+# ---------------------------------------------------------------------------
+# Config merge helper - never mutate the module-level CONFIG so that GUI
+# runs (same process, repeated calls) stay isolated per run.
+# ---------------------------------------------------------------------------
+
+def build_run_config(overrides: dict) -> dict:
+    cfg = dict(CONFIG)
+    for k, v in overrides.items():
+        if v is not None:
+            cfg[k] = v
+    return cfg
+
+
+def resolve_output_prefix(source_file: str, cfg: dict) -> str:
+    """
+    Return the "<dir>/<stem>" prefix used to name every output file.
+    Honors output_dir_override (--output-dir / GUI field): when set, ALL
+    outputs for this run go there instead of next to the source file.
+    """
+    stem = Path(source_file).stem
+    override = (cfg.get("output_dir_override") or "").strip()
+    if override:
+        out_dir = Path(override)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return str(out_dir / stem)
+    return str(Path(source_file).parent / stem)
+
+
+# ---------------------------------------------------------------------------
+# Single-file processing
+# ---------------------------------------------------------------------------
+
+def process_file(file: str, overrides: dict | None = None) -> bool:
+    """
+    Run the full pipeline on a single audio or video file.
+    overrides: dict of CONFIG keys to override for this run (from CLI or GUI).
+    Returns True on success.
+    """
+    overrides = overrides or {}
+    cfg = build_run_config(overrides)
+
+    file = str(Path(file))
+    if not Path(file).exists():
+        log.error("File not found: %s", file)
+        return False
+
+    filename = Path(file).name
+    output_prefix = resolve_output_prefix(file, cfg)
+    audio_only = is_audio_only(file)
+    enable_slides = cfg["enable_slides"] and not audio_only
+    if cfg["enable_slides"] and audio_only:
+        log.info("Audio-only file detected: slide detection disabled automatically.")
+
+    log.info("=" * 60)
+    log.info("PROCESSING: %s", filename)
+    log.info("Mode: %s | Language: %s | Prompt: %s | Output: %s",
+             "video+slides" if enable_slides else "audio", cfg["whisper_language"],
+             cfg["prompt_template"], Path(output_prefix).parent)
+    log.info("=" * 60)
+    log.info("STAGE:start")
+
+    db.validate_schema(cfg["db_path"])
+
+    # -----------------------------------------------------------------
+    # Step 1: Transcription (shared by both modes, cache-aware)
+    # -----------------------------------------------------------------
+    segments: list[dict] = []
+    segments_cache = Path(output_prefix + "_segments.json")
+    speakers_cache_exists = transcriber.transcript_cache_exists(output_prefix)
+
+    if cfg["enable_whisper"]:
+        log.info("STAGE:transcribe")
+        if not cfg["force_retranscribe"] and speakers_cache_exists and segments_cache.exists():
+            log.info("Transcript cache found - loading %s (use --force-retranscribe to redo).",
+                     segments_cache.name)
+            segments = json.loads(segments_cache.read_text(encoding="utf-8"))
+        else:
+            segments = transcriber.transcribe(
+                file_path=file,
+                model_size=cfg["whisper_model"],
+                language=cfg["whisper_language"],
+                device=cfg["whisper_device"],
+                batch_size=cfg["whisper_batch_size"],
+                compute_type=cfg["whisper_compute_type"],
+                hf_token=cfg.get("hf_token"),
+                enable_diarization=cfg["enable_diarization"],
+                use_vocabulary=cfg["whisper_use_vocabulary"],
+                min_speakers=cfg.get("diarization_min_speakers"),
+                max_speakers=cfg.get("diarization_max_speakers"),
+            )
+            if not segments:
+                log.error("Transcription returned no segments - aborting.")
+                return False
+
+            transcriber.write_transcript_files(file, segments, output_prefix)
+            segments_cache.write_text(
+                json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+
+            duration = segments[-1].get("end", 0) if segments else 0
+            conn = db.get_connection(cfg["db_path"])
+            db.upsert_transcript(
+                conn, file, cfg["whisper_model"],
+                cfg["whisper_language"] or "auto", len(segments), duration,
+            )
+            conn.close()
+    else:
+        log.info("Transcription disabled (--no-whisper).")
+
+    # -----------------------------------------------------------------
+    # Step 2: Slide detection + VLM annotation (video mode only)
+    # -----------------------------------------------------------------
+    slides_annotated: list[dict] = []
+    if enable_slides:
+        log.info("STAGE:slides")
+        import extractor
+        import detector
+        import annotator
+
+        slides_dir = Path(output_prefix + "_slides")
+        snapshot_dir = slides_dir / "snapshots"
+        frames_dir = slides_dir / "_frames_tmp"
+        slides_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            frames = extractor.extract_frames(
+                video_path=file, output_dir=frames_dir,
+                fps=cfg["fps"], fmt=cfg["frame_format"], quality=cfg["frame_quality"],
+            )
+        except RuntimeError as exc:
+            log.error("Frame extraction failed: %s", exc)
+            frames = []
+
+        changes = detector.detect_slide_changes(
+            frames=frames, fps=cfg["fps"], threshold=cfg["hash_threshold"],
+            algorithm=cfg["hash_algorithm"], min_slide_duration_sec=cfg["min_slide_duration_sec"],
+        ) if frames else []
+
+        if not changes:
+            log.warning("No slide changes detected - skipping slide report.")
+        elif cfg["dry_run"]:
+            log.info("--- DRY RUN: slide timestamps ---")
+            for c in changes:
+                log.info("  t=%.1fs  frame=%d  dist=%d", c.timestamp_sec, c.frame_index, c.hamming_distance)
+        else:
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            for change in changes:
+                dest = snapshot_dir / (change.frame_path.stem + ".png")
+                try:
+                    from PIL import Image
+                    with Image.open(change.frame_path) as img:
+                        img.save(dest, format="PNG")
+                except Exception as exc:
+                    log.warning("Could not save snapshot %s: %s", dest, exc)
+
+            if cfg["enable_vlm"]:
+                log.info("Running VLM annotation with model: %s", cfg["ollama_vlm_model"])
+                slides_annotated = annotator.annotate_batch(
+                    slides=changes, snapshot_dir=snapshot_dir,
+                    model=cfg["ollama_vlm_model"],
+                    ollama_url=cfg["ollama_base_url"].rstrip("/") + "/api/generate",
+                    prompt=cfg["vlm_prompt"], timeout_sec=cfg["vlm_timeout_sec"],
+                )
+            else:
+                slides_annotated = [
+                    {
+                        "frame_index": c.frame_index, "timestamp_sec": c.timestamp_sec,
+                        "snapshot_path": str(snapshot_dir / (c.frame_path.stem + ".png")),
+                        "hash_value": c.hash_value, "hamming_distance": c.hamming_distance,
+                        "title": "", "bullets": [], "slide_type": "",
+                    }
+                    for c in changes
+                ]
+
+            # Copy each snapshot under a friendlier, sequential filename.
+            # The ffmpeg-derived frame_NNNNNN.png names are hard to work
+            # with once copied out of context (e.g. "copy image" from the
+            # HTML report gives a cryptic file:// path). The original
+            # frame_NNNNNN.png stays where it is; this adds a second,
+            # human-readable copy and points the report/CSV/JSON/DB at it.
+            video_stem = Path(file).stem
+            for idx, slide in enumerate(slides_annotated, start=1):
+                original = Path(slide.get("snapshot_path", ""))
+                if not original.exists():
+                    continue
+                friendly = snapshot_dir / f"{video_stem}_slide{idx:03d}.png"
+                try:
+                    if not friendly.exists():
+                        shutil.copy2(original, friendly)
+                    slide["snapshot_path"] = str(friendly)
+                except Exception as exc:
+                    log.warning("Could not create friendly snapshot name for slide %d: %s", idx, exc)
+
+            if segments:
+                slide_ts = [s["timestamp_sec"] for s in slides_annotated]
+                aligned = transcriber.align_transcript_to_slides(segments, slide_ts)
+                speaker_map = transcriber.get_speaker_map(segments)
+                for slide, text in zip(slides_annotated, aligned):
+                    slide["transcript_seg"] = text
+                    if speaker_map:
+                        slide["speaker"] = _dominant_speaker(speaker_map, slide["timestamp_sec"])
+
+            conn = db.get_connection(cfg["db_path"])
+            for slide in slides_annotated:
+                db.insert_slide(conn, {
+                    "video_path": file,
+                    "timestamp_sec": slide["timestamp_sec"],
+                    "snapshot_path": slide.get("snapshot_path", ""),
+                    "hash_value": slide.get("hash_value", ""),
+                    "title": slide.get("title", ""),
+                    "bullets": json.dumps(slide.get("bullets", []), ensure_ascii=False),
+                    "slide_type": slide.get("slide_type", ""),
+                    "transcript_seg": slide.get("transcript_seg", ""),
+                    "speaker": slide.get("speaker", ""),
+                })
+            db.insert_run_log(conn, file, "video", len(slides_annotated), "success")
+            conn.close()
+
+            stem = Path(file).stem
+            if cfg["report_csv"]:
+                reporter.save_csv(slides_annotated, slides_dir / f"{stem}_slides.csv")
+            if cfg["report_json"]:
+                reporter.save_json(slides_annotated, slides_dir / f"{stem}_slides.json")
+            if cfg["report_html"]:
+                reporter.save_html(slides_annotated, slides_dir / f"{stem}_report.html", filename)
+            if cfg["report_pdf"]:
+                pdf_html = slides_dir / f"{stem}_report_pdf.html"
+                reporter.save_html_for_pdf(slides_annotated, pdf_html, filename)
+                reporter.save_pdf_from_html(pdf_html, slides_dir / f"{stem}_report.pdf")
+            if cfg.get("report_slide_timing", True):
+                reporter.save_slide_timing_summary(
+                    slides_annotated, slides_dir / f"{stem}_slide_timing.txt", filename)
+
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+    # -----------------------------------------------------------------
+    # Step 3: Notes / summary generation
+    # -----------------------------------------------------------------
+    if cfg["enable_notes"] and not cfg.get("no_summary", False) and segments:
+        try:
+            prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, cfg["prompt_template"])
+        except FileNotFoundError as exc:
+            log.error(str(exc))
+            prompt_path = None
+
+        if prompt_path:
+            log.info("STAGE:notes")
+            if enable_slides:
+                transcript_text = notes.build_transcript_text_from_segments(segments)
+            else:
+                speakers_file = transcriber.transcript_cache_paths(output_prefix)["speakers"]
+                transcript_text = transcriber.read_transcript_text(speakers_file)
+
+            notes_text = notes.generate_notes(
+                transcript_text=transcript_text,
+                prompt_path=prompt_path,
+                llm_backend=cfg["llm_backend"],
+                ollama_base_url=cfg["ollama_base_url"],
+                ollama_notes_model=cfg["ollama_notes_model"],
+                anthropic_api_key=cfg["anthropic_api_key"],
+                claude_model=cfg["claude_model"],
+                filename=filename,
+                single_pass_limit=cfg["single_pass_limit"],
+                chunk_size=cfg["chunk_size"],
+                meeting_title=cfg.get("meeting_title", ""),
+                meeting_date=cfg.get("meeting_date", ""),
+            )
+            if notes_text:
+                title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
+                event_date = cfg.get("meeting_date", "")
+                model_label = (cfg["ollama_notes_model"] if cfg["llm_backend"] == "ollama"
+                              else cfg["claude_model"])
+
+                notes_html_path = None
+                if cfg.get("notes_format_txt", True):
+                    reporter.save_notes_txt(notes_text, output_prefix + "_notes.txt",
+                                            filename, cfg["llm_backend"], model_label,
+                                            event_date=event_date)
+                if cfg.get("notes_format_html", True):
+                    notes_html_path = reporter.save_notes_html(
+                        notes_text, output_prefix + "_notes.html", filename,
+                        title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                    )
+                if cfg.get("notes_format_docx", False):
+                    reporter.save_notes_docx(
+                        notes_text, output_prefix + "_notes.docx", filename,
+                        title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                    )
+                # Notes PDF: explicit toggle, or automatic when this was a
+                # video-with-slides run and slide-report PDFs are enabled
+                # (matches the original Video_Transkription_Notes_Pipeline
+                # behaviour of always producing a summary PDF alongside HTML).
+                want_pdf = cfg.get("notes_format_pdf", False) or (enable_slides and cfg["report_pdf"])
+                if want_pdf:
+                    if notes_html_path is None:
+                        notes_html_path = reporter.save_notes_html(
+                            notes_text, output_prefix + "_notes.html", filename,
+                            title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                        )
+                    reporter.save_pdf_from_html(notes_html_path, Path(output_prefix + "_notes.pdf"))
+
+                conn = db.get_connection(cfg["db_path"])
+                db.upsert_transcript(
+                    conn, file, cfg["whisper_model"], cfg["whisper_language"] or "auto",
+                    len(segments), segments[-1].get("end", 0) if segments else 0,
+                    notes_generated=True, notes_backend=cfg["llm_backend"],
+                    prompt_template=Path(prompt_path).name, notes_text=notes_text,
+                )
+                conn.close()
+    elif cfg.get("no_summary"):
+        log.info("Notes generation disabled (--no-summary).")
+
+    log.info("STAGE:done")
+    log.info("DONE: %s", filename)
+    return True
+
+
+def _dominant_speaker(speaker_map: dict, timestamp: float) -> str:
+    best, best_dist = "", float("inf")
+    for spk, times in speaker_map.items():
+        for t in times:
+            d = abs(t - timestamp)
+            if d < best_dist:
+                best_dist = d
+                best = spk
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Batch modes
+# ---------------------------------------------------------------------------
+
+def write_log(log_file: Path, entry: str) -> None:
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+
+
+def run_file_list(list_file: str, overrides: dict) -> None:
+    """Batch-process every file listed in list_file (one path per line,
+    optional |language suffix). Works for audio and video files alike -
+    slide detection still runs per line exactly as configured.
+
+    Resume/retry: mirrors run_notes_batch's skip behaviour. Before
+    processing a line, checks the database for a completed run (notes
+    already generated) for that exact file path and skips it, unless
+    force_retranscribe is set in overrides. This makes an interrupted
+    batch safe to simply re-run from the same list.txt / paste box."""
+    entries = []
+    with open(list_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|", 1)
+            entries.append((parts[0].strip(), parts[1].strip() if len(parts) > 1 else None))
+
+    cfg = build_run_config(overrides)
+    force = bool(cfg.get("force_retranscribe"))
+    db.validate_schema(cfg["db_path"])
+
+    log_file = Path(list_file).parent / f"batch_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    log.info("BATCH (file list): %d file(s)", len(entries))
+    write_log(log_file, f"Batch: {datetime.now()} | {list_file} | {len(entries)} files")
+    ok, errors, skipped = 0, 0, 0
+    for i, (file, lang) in enumerate(entries, 1):
+        if not force:
+            conn = db.get_connection(cfg["db_path"])
+            done = db.get_completed_transcript(conn, str(Path(file)))
+            conn.close()
+            if done:
+                log.info("[%d/%d] SKIPPED (already processed on %s): %s",
+                         i, len(entries), done.get("processed_at", "?"), file)
+                write_log(log_file, f"[{i}] SKIPPED (already done {done.get('processed_at','?')}): {file}")
+                skipped += 1
+                continue
+
+        log.info("[%d/%d] %s", i, len(entries), file)
+        t_start = datetime.now()
+        run_overrides = dict(overrides)
+        if lang:
+            run_overrides["whisper_language"] = lang
+        try:
+            success = process_file(file, run_overrides)
+            dur = (datetime.now() - t_start).seconds
+            write_log(log_file, f"[{i}] {'OK' if success else 'NOT FOUND'} ({dur}s): {file}")
+            ok += 1 if success else 0
+            errors += 0 if success else 1
+        except Exception as e:
+            dur = (datetime.now() - t_start).seconds
+            log.error("ERROR: %s", e)
+            write_log(log_file, f"[{i}] ERROR ({dur}s): {file} -- {e}")
+            write_log(log_file, traceback.format_exc())
+            errors += 1
+    write_log(log_file, f"Done: OK={ok} Errors={errors} Skipped={skipped}")
+    log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
+
+
+def run_batch_folder(folder: str, overrides: dict, recursive: bool = False) -> None:
+    """
+    Process every supported audio/video file found directly in folder
+    (or recursively with recursive=True), without needing a hand-written
+    list.txt. Skips a file if its *_transcript_speakers.txt already exists
+    and --force-retranscribe was not requested, same cache rule as a
+    single run.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        log.error("Not a folder: %s", folder)
+        return
+
+    pattern_fn = folder.rglob if recursive else folder.glob
+    files = sorted(
+        p for ext in SUPPORTED_EXTENSIONS for p in pattern_fn(f"*{ext}")
+    )
+    if not files:
+        log.info("No supported audio/video files found in: %s", folder)
+        return
+
+    log_file = folder / f"batch_folder_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    log.info("BATCH (folder): %d file(s) in %s", len(files), folder)
+    write_log(log_file, f"Batch folder: {datetime.now()} | {folder} | {len(files)} files")
+    ok, errors = 0, 0
+    for i, file in enumerate(files, 1):
+        log.info("[%d/%d] %s", i, len(files), file.name)
+        t_start = datetime.now()
+        try:
+            success = process_file(str(file), overrides)
+            dur = (datetime.now() - t_start).seconds
+            write_log(log_file, f"[{i}] {'OK' if success else 'FAILED'} ({dur}s): {file.name}")
+            ok += 1 if success else 0
+            errors += 0 if success else 1
+        except Exception as e:
+            dur = (datetime.now() - t_start).seconds
+            log.error("ERROR: %s", e)
+            write_log(log_file, f"[{i}] ERROR ({dur}s): {file.name} -- {e}")
+            write_log(log_file, traceback.format_exc())
+            errors += 1
+    write_log(log_file, f"Done: OK={ok} Errors={errors}")
+    log.info("BATCH FOLDER DONE: OK=%d  Errors=%d  Log: %s", ok, errors, log_file)
+
+
+def run_notes_batch(folder: str, overrides: dict) -> None:
+    folder = Path(folder)
+    if not folder.is_dir():
+        log.error("Not a folder: %s", folder)
+        return
+    transcripts = sorted(folder.glob("*_transcript_speakers.txt"))
+    if not transcripts:
+        log.info("No *_transcript_speakers.txt files found in: %s", folder)
+        return
+    log_file = folder / f"notes_batch_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    log.info("NOTES BATCH: %d transcript(s)", len(transcripts))
+    write_log(log_file, f"Notes batch: {datetime.now()} | {folder}")
+    ok, errors = 0, 0
+    for i, tf in enumerate(transcripts, 1):
+        log.info("[%d/%d] %s", i, len(transcripts), tf.name)
+        notes_file = Path(str(tf).replace("_transcript_speakers.txt", "_notes.txt"))
+        if notes_file.exists():
+            log.info("Skipped: _notes.txt already exists.")
+            write_log(log_file, f"[{i}] SKIPPED: {tf.name}")
+            continue
+        t_start = datetime.now()
+        try:
+            run_notes_only(str(tf), overrides)
+            dur = (datetime.now() - t_start).seconds
+            write_log(log_file, f"[{i}] OK ({dur}s): {tf.name}")
+            ok += 1
+        except Exception as e:
+            dur = (datetime.now() - t_start).seconds
+            log.error("ERROR: %s", e)
+            write_log(log_file, f"[{i}] ERROR ({dur}s): {tf.name} -- {e}")
+            write_log(log_file, traceback.format_exc())
+            errors += 1
+    write_log(log_file, f"Done: OK={ok} Errors={errors}")
+    log.info("NOTES BATCH DONE: OK=%d  Errors=%d  Log: %s", ok, errors, log_file)
+
+
+def run_notes_only(transcript_file: str, overrides: dict) -> None:
+    """Generate notes from an existing *_transcript_speakers.txt (no whisperx)."""
+    cfg = build_run_config(overrides)
+    stem = Path(transcript_file).stem.replace("_transcript_speakers", "")
+    output_prefix = resolve_output_prefix(str(Path(transcript_file).with_name(stem)), cfg)
+    filename = Path(transcript_file).name
+    transcript_text = transcriber.read_transcript_text(transcript_file)
+
+    prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, cfg["prompt_template"])
+    notes_text = notes.generate_notes(
+        transcript_text=transcript_text, prompt_path=prompt_path,
+        llm_backend=cfg["llm_backend"], ollama_base_url=cfg["ollama_base_url"],
+        ollama_notes_model=cfg["ollama_notes_model"], anthropic_api_key=cfg["anthropic_api_key"],
+        claude_model=cfg["claude_model"], filename=filename,
+        single_pass_limit=cfg["single_pass_limit"], chunk_size=cfg["chunk_size"],
+        meeting_title=cfg.get("meeting_title", ""), meeting_date=cfg.get("meeting_date", ""),
+    )
+    if not notes_text:
+        raise RuntimeError("Notes generation failed (see log above).")
+
+    title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
+    event_date = cfg.get("meeting_date", "")
+    model_label = cfg["ollama_notes_model"] if cfg["llm_backend"] == "ollama" else cfg["claude_model"]
+    notes_html_path = None
+    if cfg.get("notes_format_txt", True):
+        reporter.save_notes_txt(notes_text, output_prefix + "_notes.txt", filename,
+                                cfg["llm_backend"], model_label, event_date=event_date)
+    if cfg.get("notes_format_html", True):
+        notes_html_path = reporter.save_notes_html(notes_text, output_prefix + "_notes.html", filename,
+                                                    title=title, generated_by=cfg["llm_backend"],
+                                                    event_date=event_date)
+    if cfg.get("notes_format_docx", False):
+        reporter.save_notes_docx(notes_text, output_prefix + "_notes.docx", filename,
+                                 title=title, generated_by=cfg["llm_backend"], event_date=event_date)
+    if cfg.get("notes_format_pdf", False):
+        if notes_html_path is None:
+            notes_html_path = reporter.save_notes_html(notes_text, output_prefix + "_notes.html", filename,
+                                                        title=title, generated_by=cfg["llm_backend"],
+                                                        event_date=event_date)
+        reporter.save_pdf_from_html(notes_html_path, Path(output_prefix + "_notes.pdf"))
+
+    # notes-only mode has no fresh whisperx segment count (transcript
+    # already existed). Key the db row on the original media file if it
+    # can still be found next to the transcript (same file_path used
+    # during transcription, so this updates that row rather than
+    # creating a duplicate); otherwise fall back to the transcript path
+    # itself so the notes are still searchable via FTS5.
+    media_dir = Path(transcript_file).parent
+    db_key = transcript_file
+    for candidate in media_dir.glob(f"{stem}.*"):
+        if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+            db_key = str(candidate)
+            break
+    segment_count = transcript_text.count("\n") if transcript_text else 0
+    conn = db.get_connection(cfg["db_path"])
+    db.upsert_transcript(
+        conn, db_key, cfg.get("whisper_model", ""), cfg["whisper_language"] or "auto",
+        segment_count, 0, notes_generated=True, notes_backend=cfg["llm_backend"],
+        prompt_template=Path(prompt_path).name, notes_text=notes_text,
+    )
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# GUI file picker fallback (tkinter, no file argument given)
+# ---------------------------------------------------------------------------
+
+def select_file_gui() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        patterns = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXTENSIONS))
+        file = filedialog.askopenfilename(
+            title="Select audio or video file",
+            filetypes=[("Audio/Video", patterns), ("All files", "*.*")],
+        )
+        root.destroy()
+        return file
+    except Exception:
+        print("GUI not available. Provide the file path as a command-line argument.")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Transkription_Notes_Pipeline: transcription + AI notes, "
+                     "with optional slide detection for recorded webinars."
+    )
+    p.add_argument("file", nargs="?", help="Path to audio/video file (omit for GUI file picker).")
+    p.add_argument("language", nargs="?",
+                   help="Legacy positional language override: de, en, auto.")
+    p.add_argument("--gui", action="store_true", help="Launch the parameter GUI instead of the CLI.")
+    p.add_argument("--prompt-template", type=str,
+                   help="Name of a .md file in prompts/ (e.g. meeting, webinar, or a custom template).")
+    p.add_argument("--mode", choices=["meeting", "webinar", "audio_transcript", "video_transcript"],
+                   help="Recording-type shortcut: sets --prompt-template and, unless --no-slides/"
+                        "--no-vlm is also given, sensible slide-detection defaults (audio_transcript/"
+                        "meeting = no slides, video_transcript/webinar = slides + VLM).")
+    p.add_argument("--meeting-title", type=str, metavar="TITLE",
+                   help="Meeting/event title, used as the notes document title.")
+    p.add_argument("--meeting-date", type=str, metavar="YYYY-MM-DD",
+                   help="Meeting/event date, shown in the notes document header.")
+    p.add_argument("--ics", type=str, metavar="FILE",
+                   help="Read --meeting-title/--meeting-date from the first VEVENT in an .ics file "
+                        "(explicit --meeting-title/--meeting-date still take precedence).")
+    p.add_argument("--whisper-model", type=str, help="tiny|base|small|medium|large-v2|large-v3.")
+    p.add_argument("--language", dest="language_flag", type=str, help="de|en|auto (flag form).")
+    p.add_argument("--llm-backend", choices=["ollama", "anthropic"])
+    p.add_argument("--no-slides", action="store_true", help="Skip slide detection/VLM even for a video file.")
+    p.add_argument("--no-vlm", action="store_true", help="Detect slides but skip VLM annotation.")
+    p.add_argument("--no-whisper", action="store_true", help="Skip transcription.")
+    p.add_argument("--no-summary", action="store_true", help="Skip notes/summary generation.")
+    p.add_argument("--force-retranscribe", action="store_true", help="Ignore transcript cache.")
+    p.add_argument("--dry-run", action="store_true", help="Slide timestamps only, no annotation/whisper/reports.")
+    p.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires HF_TOKEN).")
+    p.add_argument("--threshold", type=int, help="Slide-change hash threshold override.")
+    p.add_argument("--fps", type=int, help="Frame extraction fps override.")
+    p.add_argument("--output-dir", type=str, metavar="DIR",
+                   help="Write all outputs for this run into DIR instead of next to the source file.")
+    p.add_argument("--pdf", action="store_true", help="Also write notes as PDF (independent of slide mode).")
+    p.add_argument("--docx", action="store_true", help="Also write notes as a Word .docx document.")
+    p.add_argument("--notes-only", metavar="TRANSCRIPT_FILE",
+                   help="Generate notes from an existing *_transcript_speakers.txt.")
+    p.add_argument("--notes-batch", metavar="FOLDER",
+                   help="Generate notes for every *_transcript_speakers.txt in FOLDER.")
+    p.add_argument("--file-list", metavar="LIST_FILE",
+                   help="Batch-process every file listed in LIST_FILE (one path per line).")
+    p.add_argument("--batch-folder", metavar="FOLDER",
+                   help="Batch-process every supported audio/video file found directly in FOLDER.")
+    p.add_argument("--search", metavar="QUERY",
+                   help="Full-text search notes and slide titles/bullets in the database, then exit.")
+    p.add_argument("--log-file", action="store_true",
+                   help="Also write this run's log to a timestamped file under log_dir (see config.py).")
+    return p.parse_args()
+
+
+def overrides_from_args(args: argparse.Namespace) -> dict:
+    prompt_template = args.prompt_template
+    if args.mode and not prompt_template:
+        prompt_template = args.mode  # "meeting"/"webinar"/"audio_transcript"/"video_transcript" -> <name>.md
+
+    language = args.language_flag or args.language
+
+    # Recording-type slide/VLM defaults, same presets as the GUI's
+    # "Recording type" dropdown. Only applied when --mode is given and
+    # not overridden by an explicit --no-slides/--no-vlm flag.
+    mode_defaults = {
+        "audio_transcript": (False, False),
+        "video_transcript": (True, True),
+        "meeting":           (False, False),
+        "webinar":           (True, True),
+    }
+    mode_slides, mode_vlm = mode_defaults.get(args.mode, (None, None))
+
+    meeting_title = args.meeting_title
+    meeting_date = args.meeting_date
+    if args.ics:
+        try:
+            import ics_utils
+            parsed = ics_utils.parse_ics(args.ics)
+            meeting_title = meeting_title or parsed.get("title") or None
+            meeting_date = meeting_date or parsed.get("date") or None
+        except Exception as exc:
+            log.warning("Could not read --ics %s: %s", args.ics, exc)
+
+    overrides = {
+        "prompt_template":     prompt_template,
+        "whisper_model":       args.whisper_model,
+        "whisper_language":    language,
+        "llm_backend":         args.llm_backend,
+        "enable_slides":       False if args.no_slides else mode_slides,
+        "enable_vlm":          False if args.no_vlm else mode_vlm,
+        "enable_whisper":      False if args.no_whisper else None,
+        "no_summary":          True if args.no_summary else None,
+        "force_retranscribe":  True if args.force_retranscribe else None,
+        "dry_run":             True if args.dry_run else None,
+        "enable_diarization":  True if args.diarize else None,
+        "hash_threshold":      args.threshold,
+        "fps":                 args.fps,
+        "output_dir_override": args.output_dir,
+        "notes_format_pdf":    True if args.pdf else None,
+        "notes_format_docx":   True if args.docx else None,
+        "meeting_title":       meeting_title,
+        "meeting_date":        meeting_date,
+    }
+    return {k: v for k, v in overrides.items() if v is not None}
+
+
+def main() -> int:
+    args = parse_args()
+    setup_logging(
+        CONFIG.get("log_level", "INFO"),
+        log_to_file=args.log_file or CONFIG.get("log_to_file", False),
+        log_dir=CONFIG.get("log_dir"),
+    )
+
+    if args.gui:
+        import gui
+        gui.launch()
+        return 0
+
+    if args.search:
+        db.print_search_results(CONFIG["db_path"], args.search)
+        return 0
+
+    overrides = overrides_from_args(args)
+
+    if args.notes_batch:
+        run_notes_batch(args.notes_batch, overrides)
+        return 0
+
+    if args.notes_only:
+        run_notes_only(args.notes_only, overrides)
+        return 0
+
+    if args.file_list:
+        run_file_list(args.file_list, overrides)
+        return 0
+
+    if args.batch_folder:
+        run_batch_folder(args.batch_folder, overrides)
+        return 0
+
+    file = args.file or select_file_gui()
+    if not file:
+        log.info("No file selected.")
+        return 0
+
+    ok = process_file(file, overrides)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

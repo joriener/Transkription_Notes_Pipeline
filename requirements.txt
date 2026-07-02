@@ -1,0 +1,86 @@
+# =============================================================
+#  Transkription_Notes_Pipeline - requirements.txt
+#  Merged from Audio_Transkription_Notes_Pipeline and
+#  Video_Transkription_Notes_Pipeline, plus V1.1 additions
+#  (Playwright PDF backend, python-docx notes export).
+#
+#  Install: C:\Python\Python311\python.exe -m pip install -r requirements.txt
+#  Or:      .\install.ps1        (handles torch/CUDA variant selection)
+#
+#  Runtime: Python 3.11  (C:\Python\Python311\python.exe)
+#  External: ffmpeg must be installed and available in PATH
+#            Ollama must be running locally (https://ollama.com) for the
+#            "ollama" LLM backend and VLM slide annotation
+#
+#  Ollama models to pull (run once):
+#    ollama pull qwen3:14b        # notes/summary generation (default, see keys.cfg.example)
+#    ollama pull qwen2.5vl:7b     # VLM slide annotation (video mode only)
+# =============================================================
+
+# ---------------------------------------------------------------
+# GUI (parameter form, file picker)
+# ---------------------------------------------------------------
+# tkinter ships with the standard python.org Windows installer.
+# No pip package needed.
+
+# ---------------------------------------------------------------
+# Speech transcription
+# ---------------------------------------------------------------
+# whisperx: word-level timestamps, forced alignment, speaker diarization.
+# Uses faster-whisper as ASR backend (auto-installed).
+whisperx==3.8.5
+
+# PyTorch: required by whisperx alignment models.
+# CPU variant installed here by default. For CUDA GPU:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch>=2.2.0
+torchaudio>=2.2.0
+
+# ---------------------------------------------------------------
+# Slide-change detection (video mode)
+# ---------------------------------------------------------------
+Pillow>=10.4.0
+ImageHash==4.3.2
+numpy>=1.26.0
+scipy>=1.12.0
+PyWavelets>=1.6.0
+
+# ---------------------------------------------------------------
+# VLM slide annotation + Ollama notes backend (requests HTTP client)
+# ---------------------------------------------------------------
+requests>=2.32.0
+
+# ---------------------------------------------------------------
+# Notes generation - Anthropic backend (optional)
+# ---------------------------------------------------------------
+# Required only when LLM_BACKEND=anthropic in keys.cfg.
+# anthropic>=0.40.0
+
+# ---------------------------------------------------------------
+# Speaker diarization (optional, needs HuggingFace token)
+# ---------------------------------------------------------------
+# pyannote.audio is installed automatically as a whisperx dependency.
+# To enable: set HF_TOKEN in keys.cfg and --diarize / GUI checkbox,
+# after accepting https://huggingface.co/pyannote/speaker-diarization-3.1
+
+# ---------------------------------------------------------------
+# PDF export - Playwright/Chromium preferred (recommended)
+# ---------------------------------------------------------------
+# No native GTK dependency, avoids the weasyprint/Tesseract-OCR DLL
+# conflict some machines hit on Windows. After pip install, run once:
+#   playwright install chromium
+playwright>=1.45.0
+
+# Fallbacks, only used if Playwright/Chromium is not installed:
+weasyprint>=62.0
+# pdfkit>=1.0.0   # needs wkhtmltopdf binary in PATH
+
+# ---------------------------------------------------------------
+# Notes export - real Word document (optional, --docx / GUI checkbox)
+# ---------------------------------------------------------------
+python-docx>=1.1.0
+
+# ---------------------------------------------------------------
+# Development and testing
+# ---------------------------------------------------------------
+pytest>=8.0.0

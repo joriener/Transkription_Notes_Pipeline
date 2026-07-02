@@ -1,0 +1,175 @@
+# =============================================================
+#  Transkription_Notes_Pipeline - vocabulary.py.example
+#  Domain vocabulary for whisperx initial_prompt.
+#  Merged from Audio_Transkription_Notes_Pipeline and
+#  Video_Transkription_Notes_Pipeline (superset of both).
+#
+#  Words and phrases listed here bias the Whisper decoder towards
+#  correct spelling and recognition of technical terms without
+#  any retraining.
+#
+#  How to use:
+#    Copy this file to vocabulary.py and extend with your own terms.
+#    - Add terms to the relevant section below.
+#    - Acronyms: list the acronym AND its expansion (Whisper may hear either).
+#    - Instrument model numbers: include spaces and hyphens as spoken.
+#    - Multi-word phrases are more powerful than single words.
+#    - Keep the total prompt under ~200 words; longer prompts give
+#      diminishing returns and can be truncated (see build_initial_prompt).
+#
+#  Language: the pipeline picks VOCAB_EN or VOCAB_DE automatically
+#  based on the detected/selected transcription language.
+# =============================================================
+
+# ---------------------------------------------------------------------------
+# English vocabulary — GC, GC-MS, analytical instrumentation
+# ---------------------------------------------------------------------------
+VOCAB_EN: dict[str, list[str]] = {
+    "instruments": [
+        "GC", "GC-MS", "GC-MS/MS", "GC-FID", "GC-ECD", "GC-NPD", "GC-FPD",
+        "GC-TCD", "GC-QTOF", "GC-Orbitrap", "GCxGC",
+        "Agilent 8890", "Agilent 7890", "Agilent 7820", "Agilent 990",
+        "Agilent 5977C", "Agilent 7010D", "Agilent 7250", "Agilent 7697A",
+        "Intuvo 9000", "MassHunter", "OpenLab CDS", "PAL3 RTC", "SPME Arrow",
+        "Shimadzu Nexis GC-2060", "PerkinElmer Clarus Nova",
+        "Thermo Scientific DFS", "Scion Instruments",
+    ],
+    "ms_terms": [
+        "mass spectrometry", "mass spectrum", "mass spectra",
+        "single quadrupole", "triple quadrupole", "quadrupole time-of-flight",
+        "Q-TOF", "Orbitrap", "magnetic sector",
+        "MRM", "SRM", "SIM", "TIC", "EIC", "BPC",
+        "electron ionization", "chemical ionization", "EI", "CI",
+        "selected ion monitoring", "multiple reaction monitoring",
+        "full scan", "scan range", "mass range",
+        "fragmentation", "precursor ion", "product ion", "daughter ion",
+        "collision energy", "collision cell", "ion source", "ion trap",
+        "resolving power", "mass accuracy", "mass resolution",
+        "signal-to-noise ratio", "S/N ratio", "HydroInert", "HES",
+    ],
+    "gc_terms": [
+        "split", "splitless", "split ratio", "split vent",
+        "inlet temperature", "injector temperature", "oven temperature",
+        "temperature program", "temperature ramp", "isothermal",
+        "carrier gas", "hydrogen carrier gas", "helium carrier gas",
+        "head pressure", "constant flow", "constant pressure",
+        "column flow", "linear velocity", "hold-up time",
+        "retention time", "relative retention time", "retention index",
+        "capillary column", "DB-5", "DB-1", "HP-5MS", "DB-WAX",
+        "film thickness", "inner diameter", "column length",
+        "flame ionization detector", "thermal conductivity detector",
+        "electron capture detector", "nitrogen phosphorus detector",
+        "flame photometric detector",
+        "purge and trap", "headspace", "SPME", "thermal desorption",
+        "solvent delay", "tune", "autotune", "air and water check",
+    ],
+    "applications": [
+        "pesticide", "pesticide residue", "SANTE guideline",
+        "PAH", "polycyclic aromatic hydrocarbon",
+        "PCB", "polychlorinated biphenyl",
+        "VOC", "volatile organic compound",
+        "SVOC", "semi-volatile organic compound",
+        "dioxin", "furan", "EN 1948", "EPA 1613",
+        "drinking water", "Trinkwasserverordnung", "TrinkwV",
+        "soil analysis", "BBodSchV", "groundwater",
+        "water framework directive", "WRRL",
+        "food safety", "food analysis",
+        "LOD", "LOQ", "limit of detection", "limit of quantification",
+        "linearity", "dynamic range", "matrix effect",
+        "recovery", "repeatability", "reproducibility",
+        "method validation", "calibration curve", "internal standard",
+        "surrogate standard", "isotope dilution",
+    ],
+    "software": [
+        "MassHunter", "Qualitative Analysis", "Quantitative Analysis",
+        "Data Acquisition", "Unknown Analysis", "NIST library",
+        "deconvolution", "spectral library search",
+        "OpenLab CDS", "ChemStation", "Chromeleon",
+        "retention time locking", "RTL", "method transfer",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# German vocabulary — same categories, DACH webinar/meeting context
+# ---------------------------------------------------------------------------
+VOCAB_DE: dict[str, list[str]] = {
+    "instrumente": [
+        "Gaschromatograph", "Gaschromatographie", "Massenspektrometrie",
+        "Massenspektrometer", "Flammionisationsdetektor",
+        "Elektroneneinfangdetektor", "Wärmeleitfähigkeitsdetektor",
+        "Headspace", "Thermaldesorption", "Trinkwasserverordnung",
+        "Bundesbodenschutzverordnung", "BBodSchV",
+    ],
+    "ms_begriffe": [
+        "Einzelquadrupol", "Tripelquadrupol", "Ionenfalle",
+        "Elektronenstoßionisation", "chemische Ionisation",
+        "Ausgewählte Ionenüberwachung", "Mehrfachreaktionsüberwachung",
+        "Nachweisgrenzen", "Bestimmungsgrenze", "Wiederfindung",
+        "Linearität", "Matrixeffekt", "Kalibrierung", "interner Standard",
+    ],
+    "gc_begriffe": [
+        "Splitinjektion", "Splitlos-Injektion", "Trägergas",
+        "Wasserstoff als Trägergas", "Helium als Trägergas",
+        "Temperaturprogramm", "Retentionszeit", "Kapillarsäule",
+        "Detektorsignal", "Rauschen", "Signal-Rausch-Verhältnis",
+    ],
+    "anwendungen": [
+        "Pestizidrückstände", "SANTE-Leitlinie",
+        "polyzyklische aromatische Kohlenwasserstoffe",
+        "polychlorierte Biphenyle", "flüchtige organische Verbindungen",
+        "schwerflüchtige organische Verbindungen",
+        "Trinkwasseranalyse", "Bodenanalyse", "Lebensmittelanalytik",
+        "Methodenvalidierung", "Wiederfindungsrate", "Nachweisgrenze",
+    ],
+}
+
+# Languages with confirmed whisperx alignment model support.
+SUPPORTED_LANGUAGES = {"en", "de", "fr", "es", "it", "ja", "zh", "nl", "uk", "pt"}
+
+
+def build_initial_prompt(language: str | None = None) -> str:
+    """
+    Build a compact initial_prompt string for whisperx from the vocabulary.
+    Joins all terms with comma-space separation. Whisper processes this as
+    preceding spoken context, biasing its decoder towards the listed terms.
+
+    Args:
+        language: "en", "de", or None (returns English prompt as default).
+
+    Returns:
+        A plain string of comma-separated terms, capped at ~180 words to
+        stay within Whisper's 224-token context window.
+    """
+    if language and language.lower().startswith("de"):
+        vocab = VOCAB_DE
+    else:
+        vocab = VOCAB_EN
+
+    terms: list[str] = []
+    for category_terms in vocab.values():
+        terms.extend(category_terms)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+
+    prompt = ", ".join(unique)
+    words = prompt.split()
+    if len(words) > 180:
+        truncated = " ".join(words[:180])
+        last_comma = truncated.rfind(",")
+        prompt = truncated[:last_comma] if last_comma > 0 else truncated
+
+    return prompt
+
+
+if __name__ == "__main__":
+    # Quick test: print both prompts and word counts
+    for lang in ("en", "de"):
+        p = build_initial_prompt(lang)
+        print(f"\n--- {lang.upper()} prompt ({len(p.split())} words) ---")
+        print(p[:300], "...")
