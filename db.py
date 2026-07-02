@@ -142,7 +142,19 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    # DELETE journal mode instead of WAL (2026-07-02): WAL keeps a separate
+    # -wal/-shm file that must stay byte-for-byte in sync with the main .db
+    # between writes. This project's db lives in a folder that is mirrored
+    # by an external sync process (Cowork mount); if that process reads or
+    # copies the .db file mid-checkpoint, the -wal file goes out of sync
+    # with the main file and sqlite reports "database disk image is
+    # malformed" on the next open, exactly the corruption seen twice in
+    # this project already, including immediately after a fresh rebuild.
+    # DELETE mode removes the rollback journal after every commit instead
+    # of accumulating a separate WAL file, so there is nothing that can
+    # desync between writes. Slightly slower under heavy concurrent access,
+    # irrelevant for a single-user desktop GUI.
+    conn.execute("PRAGMA journal_mode=DELETE;")
     return conn
 
 
@@ -252,6 +264,23 @@ def insert_slide(conn: sqlite3.Connection, record: dict) -> int:
     )
     conn.commit()
     return cur.lastrowid
+
+
+def update_slide_annotation(conn: sqlite3.Connection, video_path: str, timestamp_sec: float,
+                            title: str, bullets_json: str, slide_type: str) -> bool:
+    """
+    Update title/bullets/slide_type for an existing slide row, matched on
+    (video_path, timestamp_sec) rather than inserting a new row. Used by
+    the "re-annotate failed slides" flow so a retry never creates a
+    duplicate slide entry. Returns True if a row was actually updated.
+    """
+    cur = conn.execute(
+        """UPDATE slides SET title = ?, bullets = ?, slide_type = ?
+           WHERE video_path = ? AND timestamp_sec = ?""",
+        (title, bullets_json, slide_type, video_path, timestamp_sec),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def get_slides_for_video(conn: sqlite3.Connection, video_path: str) -> list:

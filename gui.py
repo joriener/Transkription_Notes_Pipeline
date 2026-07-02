@@ -16,9 +16,11 @@
 # =============================================================
 
 import csv
+import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,8 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+from PIL import Image, ImageTk
 
 from config import CONFIG, PROMPTS_DIR, SUPPORTED_EXTENSIONS
 import db
@@ -60,8 +64,10 @@ RECORDING_TYPES = {
 STAGE_PROGRESS = [
     ("STAGE:start",      5,   "Starting"),
     ("STAGE:transcribe", 25,  "Transcribing"),
-    ("STAGE:slides",     55,  "Detecting / annotating slides"),
-    ("STAGE:notes",      80,  "Generating notes"),
+    ("STAGE:slides",     50,  "Detecting / annotating slides"),
+    ("STAGE:db",         60,  "Adding to database"),
+    ("STAGE:normalize",  70,  "Normalizing video to real-time speed"),
+    ("STAGE:notes",      85,  "Generating notes"),
     ("STAGE:done",       100, "Finishing"),
 ]
 
@@ -86,6 +92,7 @@ class PipelineGUI:
         self.log_queue: queue.Queue = queue.Queue()
         self.req_queue: queue.Queue = queue.Queue()
         self.worker_thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
         self._notes_result_paths: dict = {}
         self._slides_result_paths: dict = {}
         self._last_check_results: list = []
@@ -131,7 +138,24 @@ class PipelineGUI:
         self.dry_run_var = tk.BooleanVar(value=False)
 
         self.threshold_var = tk.IntVar(value=CONFIG["hash_threshold"])
+        self.animation_threshold_var = tk.IntVar(value=CONFIG.get("animation_threshold", 0))
         self.fps_var = tk.IntVar(value=CONFIG["fps"])
+        self.min_slide_duration_var = tk.DoubleVar(value=CONFIG["min_slide_duration_sec"])
+        self.recording_speed_var = tk.DoubleVar(value=CONFIG.get("recording_speed", 1.0))
+        self.convert_video_to_realtime_var = tk.BooleanVar(
+            value=CONFIG.get("convert_video_to_realtime", False))
+
+        # Title slide cover image (optional, shown before Slide 1 in the report)
+        self.title_slide_image_var = tk.StringVar(value=CONFIG.get("title_slide_image_path", ""))
+
+        # External tools: LosslessCut path (session override on top of config.py)
+        self.losslesscut_path_var = tk.StringVar(value=CONFIG.get("losslesscut_path", ""))
+
+        # Slide report content selection
+        self.report_show_image_var = tk.BooleanVar(value=CONFIG.get("report_show_image", True))
+        self.report_show_bullets_var = tk.BooleanVar(value=CONFIG.get("report_show_bullets", True))
+        self.report_show_transcript_var = tk.BooleanVar(value=CONFIG.get("report_show_transcript", True))
+        self.report_transcript_mode_var = tk.StringVar(value=CONFIG.get("report_transcript_mode", "full"))
 
         # Notes output formats
         self.notes_txt_var = tk.BooleanVar(value=CONFIG["notes_format_txt"])
@@ -146,6 +170,7 @@ class PipelineGUI:
         self.report_srt_var = tk.BooleanVar(value=CONFIG["report_srt"])
         self.report_pdf_var = tk.BooleanVar(value=CONFIG["report_pdf"])
         self.report_slide_timing_var = tk.BooleanVar(value=CONFIG.get("report_slide_timing", True))
+        self.zip_snapshots_var = tk.BooleanVar(value=CONFIG.get("zip_snapshots", False))
 
         top = ttk.Frame(parent)
         top.pack(fill="x", **pad)
@@ -168,6 +193,12 @@ class PipelineGUI:
         ttk.Label(top, text="Blank = write next to the source file (default).",
                  foreground="#666").grid(row=3, column=1, sticky="w")
 
+        self.output_basename_var = tk.StringVar()
+        ttk.Label(top, text="Output filename (optional):").grid(row=4, column=0, sticky="w")
+        ttk.Entry(top, textvariable=self.output_basename_var, width=60).grid(row=4, column=1, sticky="we")
+        ttk.Label(top, text="Blank = use the source filename for every output file (default).",
+                 foreground="#666").grid(row=5, column=1, sticky="w")
+
         top.columnconfigure(1, weight=1)
 
         # --- Recording type preset ---
@@ -188,6 +219,7 @@ class PipelineGUI:
         self._meeting_frame = meeting_frame
         self.meeting_title_var = tk.StringVar()
         self.meeting_date_var = tk.StringVar()
+        self.meeting_comments_var = tk.StringVar()
         ttk.Label(meeting_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(meeting_frame, textvariable=self.meeting_title_var, width=45).grid(
             row=0, column=1, sticky="w", columnspan=2)
@@ -195,10 +227,23 @@ class PipelineGUI:
         ttk.Entry(meeting_frame, textvariable=self.meeting_date_var, width=16).grid(row=1, column=1, sticky="w")
         ttk.Button(meeting_frame, text="Load from .ics...", command=self._load_ics).grid(
             row=1, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(meeting_frame, text="Comments:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(meeting_frame, textvariable=self.meeting_comments_var, width=60).grid(
+            row=2, column=1, sticky="we", columnspan=2)
         ttk.Label(meeting_frame,
                  text="Pre-fills Title/Date from an Outlook/Google/Teams .ics invite. "
-                      "Shown in the notes header and used as the report title.",
-                 foreground="#666").grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+                      "Shown in the notes header and used as the report title. "
+                      "Comments are shown in the notes and slide report headers too.",
+                 foreground="#666").grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(meeting_frame, text="Title slide image:").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(meeting_frame, textvariable=self.title_slide_image_var, width=45).grid(
+            row=4, column=1, sticky="w")
+        ttk.Button(meeting_frame, text="Browse...", command=self._browse_title_slide_image).grid(
+            row=4, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(meeting_frame,
+                 text="Optional cover image (jpg/png) shown as a title page before Slide 1 "
+                      "in the HTML/PDF slide report.",
+                 foreground="#666").grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
 
         # --- Batch list paste box (File list (batch) mode only) ---
         self.batch_frame = ttk.LabelFrame(
@@ -245,9 +290,43 @@ class PipelineGUI:
         ttk.Spinbox(params, from_=0, to=64, textvariable=self.threshold_var, width=6).grid(
             row=2, column=3, sticky="w")
 
+        ttk.Label(params, text="Animation threshold:").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Spinbox(params, from_=0, to=64, textvariable=self.animation_threshold_var, width=6).grid(
+            row=3, column=1, sticky="w")
+
         ttk.Label(params, text="Slide fps:").grid(row=3, column=2, sticky="w", **pad)
         ttk.Spinbox(params, from_=1, to=10, textvariable=self.fps_var, width=6).grid(
             row=3, column=3, sticky="w")
+
+        ttk.Label(params, text="Min. slide duration (sec):").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Spinbox(params, from_=0.0, to=30.0, increment=0.5, textvariable=self.min_slide_duration_var,
+                   width=6).grid(row=4, column=1, sticky="w")
+        ttk.Label(params, text="How long a slide must stay on screen to count as a real change "
+                              "(filters out animations/transitions). Default: 2.0.",
+                 foreground="#666").grid(row=4, column=2, columnspan=3, sticky="w", **pad)
+
+        ttk.Label(params, text="Recording speed:").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Spinbox(params, from_=0.1, to=10.0, increment=0.1, textvariable=self.recording_speed_var,
+                   width=6).grid(row=5, column=1, sticky="w")
+        ttk.Label(params, text="If the recording plays faster/slower than real time, set the factor here: "
+                              "every timestamp everywhere (transcript, .srt, slide report) is converted as "
+                              "real_time = video_time / speed. Default: 1.0 (no change).",
+                 foreground="#666").grid(row=5, column=2, columnspan=3, sticky="w", **pad)
+
+        ttk.Checkbutton(params, text="Also create a real-time-speed video copy",
+                        variable=self.convert_video_to_realtime_var).grid(
+            row=6, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(params, text="Re-encodes a <stem>_realtime.mp4 that plays at actual 1x speed, so it "
+                              "stays in sync with the already-converted .srt/transcript. Only runs when "
+                              "Recording speed above is not 1.0. Slow for long videos (full ffmpeg re-encode).",
+                 foreground="#666").grid(row=6, column=2, columnspan=3, sticky="w", **pad)
+
+        ttk.Label(params, text="0 = disabled (default). When set (must be lower than Hash threshold), a "
+                              "change below Hash threshold but at/above this value is treated as the "
+                              "current slide still building (e.g. bullets appearing one at a time): the "
+                              "slide's snapshot updates to the more complete frame, but its start "
+                              "timestamp stays the same, instead of creating a duplicate slide.",
+                 foreground="#666").grid(row=7, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
 
         # --- Toggles ---
         toggles = ttk.LabelFrame(parent, text="Stages")
@@ -282,12 +361,39 @@ class PipelineGUI:
         ttk.Checkbutton(formats, text="srt", variable=self.report_srt_var).grid(row=1, column=5, sticky="w")
         ttk.Checkbutton(formats, text="timing summary (txt)",
                         variable=self.report_slide_timing_var).grid(row=1, column=6, sticky="w")
+        ttk.Checkbutton(formats, text="zip snapshots",
+                        variable=self.zip_snapshots_var).grid(row=1, column=7, sticky="w")
+        ttk.Button(formats, text="Zip an existing snapshots folder...",
+                  command=self._zip_existing_snapshots).grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 0))
+
+        ttk.Label(formats, text="Report content:").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Checkbutton(formats, text="image", variable=self.report_show_image_var).grid(
+            row=3, column=1, sticky="w")
+        ttk.Checkbutton(formats, text="bullet points", variable=self.report_show_bullets_var).grid(
+            row=3, column=2, sticky="w")
+        ttk.Checkbutton(formats, text="transcript", variable=self.report_show_transcript_var).grid(
+            row=3, column=3, sticky="w")
+        ttk.Label(formats, text="Transcript:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Combobox(formats, textvariable=self.report_transcript_mode_var,
+                    values=["full", "first_sentence"], state="readonly", width=16).grid(
+            row=4, column=1, sticky="w", columnspan=2)
+        ttk.Label(formats, text="'full' = complete transcript segment per slide. "
+                              "'first_sentence' = first sentence only, so it fits on one page.",
+                 foreground="#666").grid(row=5, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 4))
 
         # --- Run button + progress ---
         run_frame = ttk.Frame(parent)
         run_frame.pack(fill="x", **pad)
         self.run_button = ttk.Button(run_frame, text="Run", command=self._on_run)
         self.run_button.pack(side="left")
+        self.stop_button = ttk.Button(run_frame, text="Stop", command=self._on_stop, state="disabled")
+        self.stop_button.pack(side="left", padx=(6, 0))
+        ttk.Button(run_frame, text="Re-annotate failed slides...",
+                  command=self._on_reannotate_failed).pack(side="left", padx=(6, 0))
+        ttk.Button(run_frame, text="Open in LosslessCut...",
+                  command=self._open_in_losslesscut).pack(side="left", padx=(6, 0))
+        ttk.Button(run_frame, text="Review / Edit Slides...",
+                  command=self._open_slide_review).pack(side="left", padx=(6, 0))
         self.status_label = ttk.Label(run_frame, text="Ready.")
         self.status_label.pack(side="left", padx=12)
 
@@ -351,6 +457,14 @@ class PipelineGUI:
         if not parsed.get("title") and not parsed.get("date"):
             messagebox.showinfo("Nothing found", "No title or date found in this .ics file.")
 
+    def _browse_title_slide_image(self):
+        path = filedialog.askopenfilename(
+            title="Select title slide cover image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")],
+        )
+        if path:
+            self.title_slide_image_var.set(path)
+
     def _refresh_prompt_templates(self):
         templates = notes_mod.list_prompt_templates(PROMPTS_DIR)
         names = list(templates.keys())
@@ -388,6 +502,78 @@ class PipelineGUI:
         path = filedialog.askdirectory(title="Select output folder")
         if path:
             self.output_dir_var.set(path)
+
+    def _find_losslesscut(self) -> str:
+        """Return a usable LosslessCut.exe path, or "" if none can be
+        found. Checks (in order): a path already browsed for this
+        session, config.py's losslesscut_path, PATH, and the standard
+        Windows per-user install location for the LosslessCut installer."""
+        for candidate in (
+            self.losslesscut_path_var.get().strip(),
+            CONFIG.get("losslesscut_path", "").strip(),
+        ):
+            if candidate and Path(candidate).exists():
+                return candidate
+        found = shutil.which("LosslessCut")
+        if found:
+            return found
+        default = Path.home() / "AppData" / "Local" / "Programs" / "losslesscut-win" / "LosslessCut.exe"
+        if default.exists():
+            return str(default)
+        return ""
+
+    def _open_in_losslesscut(self):
+        """Launch LosslessCut (free, MIT-licensed lossless cut/mute editor,
+        https://github.com/mifi/lossless-cut) with the currently selected
+        source file preloaded, for manual video editing. Does not touch
+        the pipeline in any way - purely a convenience launcher."""
+        path = self.path_var.get().strip()
+        if not path or not Path(path).exists():
+            messagebox.showwarning("No file selected", "Select a source file above first.")
+            return
+        exe = self._find_losslesscut()
+        if not exe:
+            messagebox.showinfo(
+                "LosslessCut not found",
+                "Could not auto-detect LosslessCut.exe. Free download:\n"
+                "https://github.com/mifi/lossless-cut/releases\n\n"
+                "Select LosslessCut.exe on the next screen.")
+            exe = filedialog.askopenfilename(
+                title="Select LosslessCut.exe",
+                filetypes=[("LosslessCut", "LosslessCut.exe"), ("All files", "*.*")])
+            if not exe:
+                return
+            self.losslesscut_path_var.set(exe)
+        try:
+            subprocess.Popen([exe, path])
+        except Exception as exc:
+            messagebox.showerror("Could not launch LosslessCut", str(exc))
+
+    def _open_slide_review(self):
+        """Open the slide review/reprocess window (task #58): mark
+        detected slides to omit or merge, then rebuild the report
+        outputs without re-running transcription/detection/VLM."""
+        SlideReviewDialog(self.root, self)
+
+    def _zip_existing_snapshots(self):
+        """Zip an already-existing snapshots/ folder on demand (e.g. from
+        a run made before the "zip snapshots" checkbox existed), without
+        re-running the pipeline."""
+        folder = filedialog.askdirectory(title="Select a snapshots folder to zip")
+        if not folder:
+            return
+        folder_path = Path(folder)
+        default_name = folder_path.parent.name or "snapshots"
+        zip_path = filedialog.asksaveasfilename(
+            title="Save zip as", defaultextension=".zip",
+            initialfile=f"{default_name}.zip", filetypes=[("Zip archive", "*.zip")])
+        if not zip_path:
+            return
+        ok = run_pipeline.zip_snapshot_dir(folder_path, Path(zip_path))
+        if ok:
+            messagebox.showinfo("Done", f"Snapshots zipped:\n{zip_path}")
+        else:
+            messagebox.showwarning("Nothing to zip", f"No files found directly in:\n{folder}")
 
     # -----------------------------------------------------------------
     # Batch paste box (File list (batch) mode)
@@ -456,7 +642,12 @@ class PipelineGUI:
             "force_retranscribe": self.force_retranscribe_var.get(),
             "dry_run":            self.dry_run_var.get(),
             "hash_threshold":     self.threshold_var.get(),
+            "animation_threshold": self.animation_threshold_var.get(),
             "fps":                self.fps_var.get(),
+            "min_slide_duration_sec": self.min_slide_duration_var.get(),
+            "recording_speed":     self.recording_speed_var.get(),
+            "convert_video_to_realtime": self.convert_video_to_realtime_var.get(),
+            "title_slide_image_path": self.title_slide_image_var.get().strip(),
             "output_dir_override": self.output_dir_var.get().strip(),
             "notes_format_txt":   self.notes_txt_var.get(),
             "notes_format_html":  self.notes_html_var.get(),
@@ -468,8 +659,15 @@ class PipelineGUI:
             "report_srt":         self.report_srt_var.get(),
             "report_pdf":         self.report_pdf_var.get(),
             "report_slide_timing": self.report_slide_timing_var.get(),
+            "zip_snapshots":       self.zip_snapshots_var.get(),
+            "report_show_image":      self.report_show_image_var.get(),
+            "report_show_bullets":    self.report_show_bullets_var.get(),
+            "report_show_transcript": self.report_show_transcript_var.get(),
+            "report_transcript_mode": self.report_transcript_mode_var.get(),
             "meeting_title":      self.meeting_title_var.get().strip(),
             "meeting_date":       self.meeting_date_var.get().strip(),
+            "meeting_comments":   self.meeting_comments_var.get().strip(),
+            "output_basename_override": self.output_basename_var.get().strip(),
             "db_path":            self.db_path_var.get().strip() or None,
         }
 
@@ -506,6 +704,8 @@ class PipelineGUI:
 
         self._clear_log()
         self.run_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.stop_event.clear()
         self.status_label.config(text="Running...")
         self.progress_var.set(0)
         self.stage_label.config(text="")
@@ -516,6 +716,63 @@ class PipelineGUI:
             target=self._run_worker, args=(mode, path, overrides), daemon=True
         )
         self.worker_thread.start()
+
+    def _on_stop(self):
+        """Request a cooperative stop (see run_pipeline.process_file's
+        stop_check parameter). The current pipeline stage or VLM call in
+        progress always finishes first; the run then halts at the next
+        safe checkpoint instead of terminating mid-write."""
+        self.stop_event.set()
+        self.stop_button.config(state="disabled")
+        self.status_label.config(text="Stopping (finishing current step)...")
+
+    def _on_reannotate_failed(self):
+        """Pick an existing *_slides.json and re-run VLM annotation only for
+        the slides that failed to parse (empty title/bullets), reusing the
+        snapshots already on disk. See run_pipeline.reannotate_failed_slides."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Busy", "A run is already in progress.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select *_slides.json",
+            filetypes=[("Slides JSON", "*_slides.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        self._clear_log()
+        self.run_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.stop_event.clear()
+        self.status_label.config(text="Re-annotating failed slides...")
+        self.progress_var.set(0)
+        self.stage_label.config(text="")
+
+        overrides = self._build_overrides()
+
+        self.worker_thread = threading.Thread(
+            target=self._reannotate_worker, args=(path, overrides), daemon=True
+        )
+        self.worker_thread.start()
+
+    def _reannotate_worker(self, slides_json_path: str, overrides: dict):
+        handler = QueueLogHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        level = getattr(logging, self.log_level_var.get().upper(), logging.INFO)
+        root_logger.setLevel(level)
+        try:
+            retried, still_failed = run_pipeline.reannotate_failed_slides(
+                slides_json_path, overrides, stop_check=self.stop_event.is_set)
+            self.log_queue.put(f"=== RE-ANNOTATE DONE: {retried} fixed, {still_failed} still failed ===")
+        except Exception as exc:
+            self.log_queue.put(f"FATAL ERROR: {exc}")
+            import traceback
+            self.log_queue.put(traceback.format_exc())
+        finally:
+            root_logger.removeHandler(handler)
+            self.log_queue.put("__RUN_COMPLETE__")
 
     def _run_worker(self, mode: str, path: str, overrides: dict):
         handler = QueueLogHandler(self.log_queue)
@@ -541,13 +798,13 @@ class PipelineGUI:
 
         try:
             if mode == MODES[0]:
-                ok = run_pipeline.process_file(path, overrides)
-                self.log_queue.put("=== DONE (success) ===" if ok else "=== DONE (failed) ===")
+                ok = run_pipeline.process_file(path, overrides, stop_check=self.stop_event.is_set)
+                self.log_queue.put("=== DONE (success) ===" if ok else "=== DONE (failed/stopped) ===")
             elif mode == MODES[1]:
-                run_pipeline.run_file_list(path, overrides)
+                run_pipeline.run_file_list(path, overrides, stop_check=self.stop_event.is_set)
                 self.log_queue.put("=== BATCH DONE ===")
             elif mode == MODES[2]:
-                run_pipeline.run_batch_folder(path, overrides)
+                run_pipeline.run_batch_folder(path, overrides, stop_check=self.stop_event.is_set)
                 self.log_queue.put("=== BATCH FOLDER DONE ===")
             elif mode == MODES[3]:
                 run_pipeline.run_notes_only(path, overrides)
@@ -577,6 +834,8 @@ class PipelineGUI:
                 line = self.log_queue.get_nowait()
                 if line == "__RUN_COMPLETE__":
                     self.run_button.config(state="normal")
+                    self.stop_button.config(state="disabled")
+                    self.stop_event.clear()
                     self.status_label.config(text="Ready.")
                     self.progress_var.set(0)
                     self.stage_label.config(text="")
@@ -958,6 +1217,258 @@ class PipelineGUI:
             return
         self.db_path_var.set(new_path)
         self._refresh_db_stats()
+
+
+class SlideReviewDialog(tk.Toplevel):
+    """
+    Modal window (task #58): review the slides detected in a run, mark
+    any to omit or merge with the next slide, and rebuild the CSV/HTML/
+    PDF/timing-summary reports from those edits without re-running
+    transcription/detection/VLM annotation. Works for a single video, or
+    for switching between multiple videos from the same batch run via
+    the "recently loaded" dropdown. Edits are saved to a separate
+    "<stem>_slides_edits.json" next to the original *_slides.json, which
+    is never modified - always safe to reload and start over. See
+    run_pipeline.apply_slide_edits / rebuild_outputs for the edit
+    semantics and rebuild logic.
+
+    Includes a preview panel (task #60): selecting a row shows that
+    slide's snapshot image plus title/bullets/transcript, so slides can
+    be identified visually before deciding to omit/merge them.
+    """
+
+    def __init__(self, master, overrides_source):
+        super().__init__(master)
+        self.title("Review / Edit Slides")
+        self.geometry("1180x560")
+        self._overrides_source = overrides_source  # PipelineGUI instance, for meeting_title/etc.
+        self.slides_json_path: Path | None = None
+        self.slides: list = []
+        self.omit_indices: set = set()
+        self.merge_next_indices: set = set()
+        self._recent_paths: list = []
+        self._preview_photo = None  # keep a reference, else Tk garbage-collects the image
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=8)
+        ttk.Button(top, text="Load *_slides.json...", command=self._load_file).pack(side="left")
+        self.recent_var = tk.StringVar()
+        self.recent_box = ttk.Combobox(top, textvariable=self.recent_var, state="readonly", width=50)
+        self.recent_box.pack(side="left", padx=(8, 0))
+        self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._switch_to_recent())
+        ttk.Label(top, text="Switch between videos loaded this session (batch runs).",
+                 foreground="#666").pack(side="left", padx=(8, 0))
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(side="left", fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            tree_frame, columns=("num", "time", "title", "bullets", "status"),
+            show="headings", selectmode="extended", height=16)
+        for col, text, w in (("num", "#", 40), ("time", "Time", 70), ("title", "Title", 160),
+                             ("bullets", "First bullet", 220), ("status", "Status", 120)):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=w, anchor="w")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # Preview panel: snapshot image + title + bullets/transcript for
+        # whichever row was selected last, so slides can be identified
+        # visually before deciding to omit/merge them.
+        preview = ttk.Frame(body, width=360)
+        preview.pack(side="right", fill="y", padx=(10, 0))
+        preview.pack_propagate(False)
+        ttk.Label(preview, text="Preview", font=("", 9, "bold")).pack(anchor="w")
+        self.preview_image_label = ttk.Label(preview, text="(select a slide to preview)",
+                                             foreground="#666", anchor="center",
+                                             justify="center", relief="groove")
+        self.preview_image_label.pack(fill="x", pady=(4, 6), ipady=40)
+        self.preview_title_var = tk.StringVar()
+        ttk.Label(preview, textvariable=self.preview_title_var, font=("", 10, "bold"),
+                 wraplength=340, justify="left").pack(fill="x", anchor="w")
+        self.preview_text = tk.Text(preview, width=42, wrap="word", state="disabled",
+                                    relief="flat", bg=self.cget("background"))
+        self.preview_text.pack(fill="both", expand=True, pady=(6, 0))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btn_row, text="Toggle Omit", command=self._toggle_omit).pack(side="left")
+        ttk.Button(btn_row, text="Toggle Merge with next", command=self._toggle_merge).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Clear all edits", command=self._clear_edits).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Rebuild outputs", command=self._rebuild).pack(side="right")
+        self.status_label = ttk.Label(btn_row, text="")
+        self.status_label.pack(side="right", padx=(0, 12))
+
+        ttk.Label(self, text="Select one or more rows, then Toggle Omit / Toggle Merge with next. "
+                            "\"Rebuild outputs\" regenerates CSV/HTML/PDF/timing summary only - "
+                            "no re-transcription, re-detection, or VLM calls.",
+                 foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 8))
+
+    def _load_file(self):
+        path = filedialog.askopenfilename(
+            title="Select *_slides.json",
+            filetypes=[("Slides JSON", "*_slides.json"), ("All files", "*.*")])
+        if not path:
+            return
+        self._load_path(path)
+
+    def _switch_to_recent(self):
+        path = self.recent_var.get()
+        if path:
+            self._load_path(path, remember=False)
+
+    def _load_path(self, path: str, remember: bool = True):
+        try:
+            slides = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("Could not load", str(exc))
+            return
+        self.slides = slides
+        self.slides_json_path = Path(path)
+        self.omit_indices = set()
+        self.merge_next_indices = set()
+
+        # Load any previously saved edits for this file, so re-opening
+        # the review picks up where you left off.
+        edits_path = self._edits_path()
+        if edits_path.exists():
+            try:
+                edits = json.loads(edits_path.read_text(encoding="utf-8"))
+                self.omit_indices = set(edits.get("omit_indices", []) or [])
+                self.merge_next_indices = set(edits.get("merge_next_indices", []) or [])
+            except Exception:
+                pass
+
+        if remember and path not in self._recent_paths:
+            self._recent_paths.append(path)
+            self.recent_box["values"] = self._recent_paths
+        self.recent_var.set(path)
+        self._refresh_tree()
+        self.status_label.config(text=f"{len(self.slides)} slide(s) loaded.")
+
+    def _edits_path(self) -> Path:
+        stem = self.slides_json_path.stem.replace("_slides", "")
+        return self.slides_json_path.parent / f"{stem}_slides_edits.json"
+
+    def _refresh_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self._show_preview(None)
+        for idx, slide in enumerate(self.slides):
+            bullets = slide.get("bullets") or []
+            first_bullet = bullets[0] if bullets else ""
+            status_parts = []
+            if idx in self.omit_indices:
+                status_parts.append("OMIT")
+            if idx in self.merge_next_indices:
+                status_parts.append("MERGE->next")
+            self.tree.insert("", "end", iid=str(idx), values=(
+                idx + 1, f"{slide.get('timestamp_sec', 0):.1f}s",
+                slide.get("title", ""), first_bullet, " + ".join(status_parts)))
+
+    def _selected_indices(self) -> list:
+        return [int(iid) for iid in self.tree.selection()]
+
+    def _on_select(self, event=None):
+        sel = self._selected_indices()
+        if not sel or sel[0] >= len(self.slides):
+            self._show_preview(None)
+            return
+        self._show_preview(self.slides[sel[0]])
+
+    def _show_preview(self, slide: dict | None):
+        self._preview_photo = None
+        if slide is None:
+            self.preview_image_label.config(image="", text="(select a slide to preview)")
+            self.preview_title_var.set("")
+            self._set_preview_text("")
+            return
+
+        snap = slide.get("snapshot_path", "")
+        loaded = False
+        if snap and Path(snap).exists():
+            try:
+                with Image.open(snap) as img:
+                    img = img.copy()
+                img.thumbnail((340, 260))
+                self._preview_photo = ImageTk.PhotoImage(img)
+                self.preview_image_label.config(image=self._preview_photo, text="")
+                loaded = True
+            except Exception:
+                loaded = False
+        if not loaded:
+            self.preview_image_label.config(image="", text="(snapshot image not found)")
+
+        self.preview_title_var.set(
+            f"{slide.get('timestamp_sec', 0):.1f}s   {slide.get('title', '(no title)')}")
+        bullets = slide.get("bullets") or []
+        body = "\n".join(f"- {b}" for b in bullets)
+        transcript = slide.get("transcript_seg", "")
+        if transcript:
+            body += ("\n\n" if body else "") + "Transcript:\n" + transcript
+        self._set_preview_text(body)
+
+    def _set_preview_text(self, text: str):
+        self.preview_text.config(state="normal")
+        self.preview_text.delete("1.0", "end")
+        self.preview_text.insert("1.0", text)
+        self.preview_text.config(state="disabled")
+
+    def _toggle_omit(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        for idx in sel:
+            if idx in self.omit_indices:
+                self.omit_indices.discard(idx)
+            else:
+                self.omit_indices.add(idx)
+        self._refresh_tree()
+
+    def _toggle_merge(self):
+        sel = self._selected_indices()
+        if not sel:
+            return
+        for idx in sel:
+            if idx >= len(self.slides) - 1:
+                continue  # last slide can't merge with a next one
+            if idx in self.merge_next_indices:
+                self.merge_next_indices.discard(idx)
+            else:
+                self.merge_next_indices.add(idx)
+        self._refresh_tree()
+
+    def _clear_edits(self):
+        self.omit_indices = set()
+        self.merge_next_indices = set()
+        self._refresh_tree()
+
+    def _rebuild(self):
+        if not self.slides_json_path:
+            messagebox.showwarning("No file loaded", "Load a *_slides.json first.")
+            return
+        edits = {
+            "omit_indices": sorted(self.omit_indices),
+            "merge_next_indices": sorted(self.merge_next_indices),
+        }
+        overrides = {}
+        if hasattr(self._overrides_source, "_build_overrides"):
+            try:
+                overrides = self._overrides_source._build_overrides()
+            except Exception:
+                overrides = {}
+        try:
+            ok = run_pipeline.rebuild_outputs(str(self.slides_json_path), edits, overrides)
+        except Exception as exc:
+            messagebox.showerror("Rebuild failed", str(exc))
+            return
+        if ok:
+            messagebox.showinfo("Done", f"Outputs rebuilt in:\n{self.slides_json_path.parent}")
+            self.status_label.config(text="Rebuild complete.")
+        else:
+            messagebox.showerror("Rebuild failed", "See log for details.")
 
 
 def launch():

@@ -56,6 +56,44 @@ CONFIG = {
     "enable_notes":    True,
 
     # =========================================================
+    # RECORDING SPEED  (applies to every timestamp everywhere:
+    # slide report, timing summary, transcript .txt, .srt, and DB)
+    # =========================================================
+    # Some screen recorders capture at a different speed than real
+    # time (e.g. frame-skipping to shrink the file). Set this to the
+    # recording's speed factor so every timestamp in every output
+    # reflects the actual wall-clock time of the event instead of
+    # the video's own internal clock:
+    #   real_time_sec = video_time_sec / recording_speed
+    # 1.0 = no change (default). Example: recording_speed = 1.5 means
+    # the video plays 1.5x faster than real life, so a slide detected
+    # at 0:10:00 in the video is shown as 0:06:40 everywhere.
+    # Applied once, right after a fresh transcription/slide-detection
+    # pass; a cached transcript is NOT re-scaled, so use
+    # --force-retranscribe if you change this after the first run.
+    "recording_speed": 1.0,
+
+    # Optional, opt-in: when recording_speed != 1.0, also produce a
+    # re-encoded copy of the video that plays at actual real-time (1x)
+    # speed, so it stays in sync with the already-converted .srt/transcript
+    # instead of drifting. Written as <stem>_realtime.mp4 next to the other
+    # outputs; the original source file is never modified. Off by default
+    # because it requires a full ffmpeg re-encode (slow for long videos).
+    # Set via --normalize-speed or the GUI checkbox next to Recording speed.
+    "convert_video_to_realtime": False,
+
+    # =========================================================
+    # TITLE SLIDE  (optional cover image for the slide report)
+    # =========================================================
+    # Path to an image file (jpg/png) shown as a cover page before
+    # Slide 1 in the HTML/PDF slide report, captioned with
+    # meeting_title/meeting_date below. Purely cosmetic: not counted
+    # in "Slides detected" and never written to the CSV/JSON slide
+    # index. Blank (default) = no cover page. Set via --title-image
+    # or the GUI "Title slide image" field.
+    "title_slide_image_path": "",
+
+    # =========================================================
     # FRAME EXTRACTION  (ffmpeg, video mode only)
     # =========================================================
     "fps":            1,      # frames/sec extracted; raise to 2 for fast slide decks
@@ -67,7 +105,25 @@ CONFIG = {
     # =========================================================
     "hash_threshold":          8,        # 0=identical .. 64=max; raise to 10-12 for webcam overlay
     "hash_algorithm":          "phash",  # phash | dhash | whash | ahash
-    "min_slide_duration_sec":  2.0,      # debounce for rapid transitions/animations
+    "min_slide_duration_sec":  2.0,      # debounce for rapid transitions/animations; also the noise
+                                          # filter window: a change must stay on screen this long to
+                                          # count as real, so a brief flash/glitch is discarded.
+    "animation_threshold":     4,        # 0=disabled. Must be < hash_threshold. Distances in this
+                                          # band are treated as "same slide still building" (e.g.
+                                          # bullets appearing one at a time): no new slide is recorded,
+                                          # the current slide's snapshot is updated to the more complete
+                                          # frame, but its start timestamp stays the same. Default: half
+                                          # of hash_threshold.
+
+    # =========================================================
+    # EXTERNAL TOOLS
+    # =========================================================
+    "losslesscut_path": "",  # Full path to LosslessCut.exe (free, MIT licence,
+                              # https://github.com/mifi/lossless-cut). Used by the GUI's
+                              # "Open in LosslessCut" button to launch it with the selected source
+                              # file preloaded, for manual cut/mute editing. Leave blank to
+                              # auto-detect common install locations, or browse for it once when
+                              # prompted (remembered for the session).
 
     # =========================================================
     # VLM SLIDE ANNOTATION  (Ollama vision model, video mode only)
@@ -150,6 +206,12 @@ CONFIG = {
     # the same <stem>_... naming inside it.
     "output_dir_override": "",
 
+    # Base filename used for every output file instead of the source
+    # file's stem (transcript, notes, *_slides/ folder, snapshots, CSV/
+    # JSON/HTML/PDF). Blank (default) keeps the source filename. Set via
+    # --output-name or the GUI "Output filename" field.
+    "output_basename_override": "",
+
     # Legacy internal path, used only as a fallback base for the video-mode
     # temp frame extraction directory when no per-run output dir is set.
     "output_dir":      str(_HERE / "output"),
@@ -168,6 +230,25 @@ CONFIG = {
     "report_srt":  True,   # SRT subtitle file from whisperx segments
     "report_pdf":  True,   # PDF versions (Playwright preferred, weasyprint/pdfkit fallback)
     "report_slide_timing": True,  # plain slide-number + timestamp list (txt), no images/bullets
+
+    # Zip the snapshots/ folder into <stem>_snapshots.zip after a video
+    # run. Off by default (report_html/report_pdf already embed the
+    # images); useful when sharing just the slide images with someone
+    # who does not need the full report.
+    "zip_snapshots": False,
+
+    # Slide report content selection (report_html/report_pdf only; CSV/
+    # JSON always contain the full data regardless of these flags). Lets
+    # a review-only report be built without images, or a slide-timing
+    # style report without a wall of transcript text.
+    "report_show_image":      True,
+    "report_show_bullets":    True,
+    "report_show_transcript": True,
+
+    # "full" = complete aligned transcript segment per slide.
+    # "first_sentence" = only the first sentence, so a slide with a long
+    # spoken segment still fits on one PDF page.
+    "report_transcript_mode": "full",
 
     # =========================================================
     # DATABASE
@@ -204,6 +285,11 @@ CONFIG = {
     # the filename and today's date, see notes.py/reporter.py).
     "meeting_title": "",
     "meeting_date": "",
+
+    # Free-text notes added by the user (e.g. context not captured by
+    # the recording itself). Shown in the notes header and the slide
+    # report header, alongside title/date. Blank by default.
+    "meeting_comments": "",
 }
 
 # ---------------------------------------------------------------------------

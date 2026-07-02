@@ -43,18 +43,51 @@ def detect_slide_changes(
     threshold: int = 8,
     algorithm: str = "phash",
     min_slide_duration_sec: float = 2.0,
+    animation_threshold: int = 0,
 ) -> list[SlideChange]:
     """
     Walk through frames and return a SlideChange for each detected transition.
     First frame is always included as the opening slide.
+
+    Noise filter (confirm-then-commit debounce): a frame is only accepted as
+    a real change once it has stayed visually different from the current
+    confirmed baseline for at least min_slide_duration_sec. A transient
+    difference that reverts back to the baseline before that (e.g. a brief
+    flash of any colour, covering the whole screen, lasting a second or
+    less) is discarded as noise and never appears in the output.
+
+    Animation vs. new slide (optional; active when 0 < animation_threshold
+    < threshold): once a change is confirmed stable, its distance from the
+    baseline decides what it means:
+      - distance >= threshold: a genuine new slide. A new SlideChange is
+        appended and the baseline resets to this frame (previous behavior).
+      - animation_threshold <= distance < threshold: the current slide is
+        still building (e.g. bullets appearing one at a time, a build
+        animation). No new SlideChange is appended. Instead the CURRENT
+        slide's stored snapshot (frame_path, hash_value) is updated to
+        this more complete frame, while its recorded start timestamp is
+        left unchanged, so the final report shows the fully-built slide
+        at the time it first appeared. The baseline updates to this frame
+        so later animation steps are measured incrementally from here.
+    When animation_threshold is 0 (default) or >= threshold, this
+    distinction is disabled and every confirmed change is a new slide,
+    identical to the previous behavior.
+
+    Compares every candidate frame against the last CONFIRMED baseline's
+    hash (not the immediately preceding frame), so a single-frame outlier
+    cannot silently become the new comparison baseline the way frame-to-
+    frame comparison would allow.
     """
     if not frames:
         log.warning("No frames provided to detector.")
         return []
 
+    animation_enabled = 0 < animation_threshold < threshold
+    low_threshold = animation_threshold if animation_enabled else threshold
+
     changes: list[SlideChange] = []
-    prev_hash = None
-    last_change_frame = -1
+    baseline_hash = None
+    candidate = None  # (hash, start_idx, start_frame_path, start_distance)
     min_gap_frames = max(1, int(min_slide_duration_sec * fps))
 
     for idx, frame_path in enumerate(frames):
@@ -66,7 +99,7 @@ def detect_slide_changes(
             log.warning("Skipping frame %d (%s): %s", idx, frame_path.name, exc)
             continue
 
-        if prev_hash is None:
+        if baseline_hash is None:
             changes.append(SlideChange(
                 frame_path=frame_path,
                 frame_index=idx,
@@ -75,29 +108,101 @@ def detect_slide_changes(
                 hamming_distance=0,
                 is_first=True,
             ))
-            last_change_frame = idx
-            prev_hash = current_hash
+            baseline_hash = current_hash
             continue
 
-        distance = current_hash - prev_hash
-        gap = idx - last_change_frame
+        distance_to_baseline = current_hash - baseline_hash
 
-        if distance >= threshold and gap >= min_gap_frames:
+        if candidate is None:
+            if distance_to_baseline >= low_threshold:
+                # Tentative change starts here - not yet confirmed.
+                candidate = (current_hash, idx, frame_path, distance_to_baseline)
+            # else: still matches the confirmed baseline, nothing to do.
+            continue
+
+        cand_hash, cand_start_idx, cand_frame_path, cand_distance = candidate
+
+        if distance_to_baseline < low_threshold:
+            # Reverted back to the confirmed baseline before the candidate
+            # was ever confirmed - it was noise (flash/glitch). Drop it.
             log.debug(
-                "Slide change at frame %d (t=%.1fs) distance=%d",
-                idx, timestamp, distance,
+                "Discarded noise candidate starting at frame %d (t=%.1fs): "
+                "reverted to previous state after %d frame(s).",
+                cand_start_idx, cand_start_idx / fps, idx - cand_start_idx,
+            )
+            candidate = None
+            continue
+
+        if idx - cand_start_idx + 1 >= min_gap_frames:
+            # Candidate has now persisted long enough to count as real.
+            if animation_enabled and cand_distance < threshold and changes:
+                # Same slide, still building - update the current slide's
+                # snapshot to the more complete frame, but its recorded
+                # start timestamp stays unchanged.
+                log.debug(
+                    "Animation update on current slide at frame %d (t=%.1fs) "
+                    "distance=%d (stable for %d frame(s)); start timestamp "
+                    "unchanged.",
+                    cand_start_idx, cand_start_idx / fps, cand_distance, idx - cand_start_idx + 1,
+                )
+                changes[-1].frame_path = cand_frame_path
+                changes[-1].hash_value = str(cand_hash)
+                baseline_hash = cand_hash
+                candidate = None
+            else:
+                # Genuine new slide. Record it using the FIRST frame of the
+                # stable window (when the change actually began), not the
+                # confirmation frame, so the reported timestamp matches
+                # when the slide actually appeared.
+                log.debug(
+                    "Slide change confirmed at frame %d (t=%.1fs) distance=%d "
+                    "(stable for %d frame(s)).",
+                    cand_start_idx, cand_start_idx / fps, cand_distance, idx - cand_start_idx + 1,
+                )
+                changes.append(SlideChange(
+                    frame_path=cand_frame_path,
+                    frame_index=cand_start_idx,
+                    timestamp_sec=cand_start_idx / fps,
+                    hash_value=str(cand_hash),
+                    hamming_distance=cand_distance,
+                ))
+                baseline_hash = current_hash
+                candidate = None
+        else:
+            # Still waiting for confirmation; track the latest hash so a
+            # slow fade-in/transition doesn't get stuck comparing against
+            # its own first, possibly unrepresentative, frame.
+            candidate = (current_hash, cand_start_idx, cand_frame_path, distance_to_baseline)
+
+    # A candidate still pending when the video ends never had the chance to
+    # either revert (proving it was noise) or reach min_slide_duration_sec
+    # (proving it was real). It never reverted within the observed frames,
+    # so it is trusted and recorded rather than silently dropped - a slide
+    # or animation step that appears right at the end of a recording should
+    # still show up.
+    if candidate is not None:
+        cand_hash, cand_start_idx, cand_frame_path, cand_distance = candidate
+        if animation_enabled and cand_distance < threshold and changes:
+            log.debug(
+                "Animation update on current slide at end of video, frame %d "
+                "(t=%.1fs) distance=%d (never reverted).",
+                cand_start_idx, cand_start_idx / fps, cand_distance,
+            )
+            changes[-1].frame_path = cand_frame_path
+            changes[-1].hash_value = str(cand_hash)
+        else:
+            log.debug(
+                "Slide change at frame %d (t=%.1fs) confirmed at end of video "
+                "(never reverted, but video ended before min_slide_duration_sec elapsed).",
+                cand_start_idx, cand_start_idx / fps,
             )
             changes.append(SlideChange(
-                frame_path=frame_path,
-                frame_index=idx,
-                timestamp_sec=timestamp,
-                hash_value=str(current_hash),
-                hamming_distance=distance,
+                frame_path=cand_frame_path,
+                frame_index=cand_start_idx,
+                timestamp_sec=cand_start_idx / fps,
+                hash_value=str(cand_hash),
+                hamming_distance=cand_distance,
             ))
-            last_change_frame = idx
-            prev_hash = current_hash
-        else:
-            prev_hash = current_hash
 
     log.info("Detected %d slide changes in %d frames", len(changes), len(frames))
     return changes

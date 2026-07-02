@@ -40,6 +40,10 @@
 #    python run_pipeline.py --mode video_transcript "demo.mp4"  (generic video transcript, slides on)
 #    python run_pipeline.py --meeting-title "Q3 Roadmap" --meeting-date 2026-07-03 "call.mp4"
 #    python run_pipeline.py --ics "invite.ics" "call.mp4"       (meeting title/date from a calendar invite)
+#    python run_pipeline.py --comments "Follow-up needed on pricing" "call.mp4"
+#    python run_pipeline.py --output-name "2026-07-03_Q3-Kickoff" "call.mp4"  (custom base filename)
+#    python run_pipeline.py --reannotate-failed "file_slides/file_slides.json"  (retry failed VLM slides only)
+#    python run_pipeline.py --min-slide-duration 3.5 "webinar.mp4"  (animation debounce override)
 #    python run_pipeline.py --gui                             (parameter GUI)
 #
 #  FORMAT list.txt (pipe separator for language is optional):
@@ -130,8 +134,11 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     Return the "<dir>/<stem>" prefix used to name every output file.
     Honors output_dir_override (--output-dir / GUI field): when set, ALL
     outputs for this run go there instead of next to the source file.
+    Honors output_basename_override (--output-name / GUI field): when
+    set, ALL output files use this name instead of the source file's stem
+    (e.g. "2026-07-02_Q3-Kickoff" instead of "Video_2026-07-02_100348").
     """
-    stem = Path(source_file).stem
+    stem = (cfg.get("output_basename_override") or "").strip() or Path(source_file).stem
     override = (cfg.get("output_dir_override") or "").strip()
     if override:
         out_dir = Path(override)
@@ -140,18 +147,127 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     return str(Path(source_file).parent / stem)
 
 
+def _unique_snapshot_path(snapshot_dir: Path, base_name: str, slide_idx: int) -> Path:
+    """
+    Build "<base_name>_slideNNN.png" under snapshot_dir. If that exact
+    filename already exists (e.g. this output name was already used for
+    a different source file in the same folder), append "_2", "_3", ...
+    until a free filename is found, instead of overwriting.
+    """
+    candidate = snapshot_dir / f"{base_name}_slide{slide_idx:03d}.png"
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        candidate = snapshot_dir / f"{base_name}_slide{slide_idx:03d}_{n}.png"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def zip_snapshot_dir(snapshot_dir: Path, zip_path: Path) -> bool:
+    """Zip every file directly inside snapshot_dir into zip_path. Returns
+    True on success, False if snapshot_dir has no files to zip."""
+    import zipfile
+    files = [p for p in snapshot_dir.iterdir() if p.is_file()] if snapshot_dir.exists() else []
+    if not files:
+        return False
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, arcname=f.name)
+    log.info("Snapshots zipped: %s", zip_path)
+    return True
+
+
+def _rescale_segments(segments: list[dict], speed: float) -> list[dict]:
+    """
+    Convert every timestamp in transcript segments (and their word-level
+    alignments) from the recording's own internal clock to real
+    wall-clock time: real_time = video_time / speed. Mutates and returns
+    the same list. speed == 1.0 is a no-op.
+
+    Applied once, immediately after a fresh whisperx transcription, before
+    the segments are cached or written to any file (SRT, transcript .txt,
+    JSON cache), so every downstream consumer sees consistent, already-
+    converted times without needing its own conversion logic.
+    """
+    if speed == 1.0:
+        return segments
+    for seg in segments:
+        seg["start"] = round(seg.get("start", 0.0) / speed, 3)
+        seg["end"] = round(seg.get("end", 0.0) / speed, 3)
+        for w in seg.get("words", []) or []:
+            if "start" in w:
+                w["start"] = round(w["start"] / speed, 3)
+            if "end" in w:
+                w["end"] = round(w["end"] / speed, 3)
+    return segments
+
+
+def _rescale_slide_changes(changes: list, speed: float) -> list:
+    """
+    Convert every detected slide's timestamp from the recording's own
+    internal clock to real wall-clock time (see _rescale_segments).
+    Mutates and returns the same list. speed == 1.0 is a no-op.
+    """
+    if speed == 1.0:
+        return changes
+    for c in changes:
+        c.timestamp_sec = round(c.timestamp_sec / speed, 3)
+    return changes
+
+
+def _build_title_slide(cfg: dict, snapshot_dir: Path, stem: str) -> dict | None:
+    """
+    Copy the optional title-slide cover image (title_slide_image_path)
+    into snapshot_dir and return the {"image_path", "title", "subtitle"}
+    dict reporter.save_html/save_html_for_pdf expect, or None if not
+    configured/found. Purely cosmetic: never written to CSV/JSON, never
+    counted as a detected slide.
+    """
+    src = (cfg.get("title_slide_image_path") or "").strip()
+    if not src:
+        return None
+    src_path = Path(src)
+    if not src_path.exists():
+        log.warning("Title slide image not found: %s", src_path)
+        return None
+    dest = snapshot_dir / f"{stem}_titleslide{src_path.suffix or '.png'}"
+    try:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dest)
+    except Exception as exc:
+        log.warning("Could not copy title slide image: %s", exc)
+        return None
+    return {
+        "image_path": str(dest),
+        "title": cfg.get("meeting_title") or "Title",
+        "subtitle": cfg.get("meeting_date", ""),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Single-file processing
 # ---------------------------------------------------------------------------
 
-def process_file(file: str, overrides: dict | None = None) -> bool:
+def process_file(file: str, overrides: dict | None = None, stop_check=None) -> bool:
     """
     Run the full pipeline on a single audio or video file.
     overrides: dict of CONFIG keys to override for this run (from CLI or GUI).
-    Returns True on success.
+    stop_check: optional callable returning True once the user has requested
+    a stop (see gui.py's Stop button, backed by a threading.Event). This is
+    a COOPERATIVE stop, checked between pipeline stages and between VLM
+    slide calls, not a hard kill: a stage already in progress (e.g. one
+    whisperx transcription call, one Ollama request) always finishes first,
+    so partial output is never corrupted. Returns True on success, False
+    on failure or if stopped before any stage completed.
     """
     overrides = overrides or {}
     cfg = build_run_config(overrides)
+
+    def stopped() -> bool:
+        return stop_check is not None and stop_check()
 
     file = str(Path(file))
     if not Path(file).exists():
@@ -182,12 +298,20 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
     segments_cache = Path(output_prefix + "_segments.json")
     speakers_cache_exists = transcriber.transcript_cache_exists(output_prefix)
 
+    if stopped():
+        log.info("Stop requested before transcription - aborting run for %s.", filename)
+        return False
+
     if cfg["enable_whisper"]:
         log.info("STAGE:transcribe")
         if not cfg["force_retranscribe"] and speakers_cache_exists and segments_cache.exists():
             log.info("Transcript cache found - loading %s (use --force-retranscribe to redo).",
                      segments_cache.name)
             segments = json.loads(segments_cache.read_text(encoding="utf-8"))
+            if cfg.get("recording_speed", 1.0) != 1.0:
+                log.info("Using cached transcript - recording_speed is only applied on a fresh "
+                         "transcription. Use --force-retranscribe if you changed recording_speed "
+                         "since this cache was created.")
         else:
             segments = transcriber.transcribe(
                 file_path=file,
@@ -206,7 +330,9 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
                 log.error("Transcription returned no segments - aborting.")
                 return False
 
-            transcriber.write_transcript_files(file, segments, output_prefix)
+            segments = _rescale_segments(segments, cfg.get("recording_speed", 1.0))
+            transcriber.write_transcript_files(file, segments, output_prefix,
+                                               recording_speed=cfg.get("recording_speed", 1.0))
             segments_cache.write_text(
                 json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8"
             )
@@ -225,6 +351,9 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
     # Step 2: Slide detection + VLM annotation (video mode only)
     # -----------------------------------------------------------------
     slides_annotated: list[dict] = []
+    if enable_slides and stopped():
+        log.info("Stop requested before slide detection - skipping slides for %s.", filename)
+        enable_slides = False
     if enable_slides:
         log.info("STAGE:slides")
         import extractor
@@ -248,7 +377,9 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
         changes = detector.detect_slide_changes(
             frames=frames, fps=cfg["fps"], threshold=cfg["hash_threshold"],
             algorithm=cfg["hash_algorithm"], min_slide_duration_sec=cfg["min_slide_duration_sec"],
+            animation_threshold=cfg.get("animation_threshold", 0),
         ) if frames else []
+        changes = _rescale_slide_changes(changes, cfg.get("recording_speed", 1.0))
 
         if not changes:
             log.warning("No slide changes detected - skipping slide report.")
@@ -257,9 +388,17 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
             for c in changes:
                 log.info("  t=%.1fs  frame=%d  dist=%d", c.timestamp_sec, c.frame_index, c.hamming_distance)
         else:
+            # Snapshots are staged under a temp subfolder using the
+            # ffmpeg-derived frame_NNNNNN name (annotator.annotate_batch
+            # matches images to slides by that name). Once annotation is
+            # done, each snapshot is moved into snapshot_dir under its
+            # final, human-readable name and the temp copy is gone - the
+            # public snapshots/ folder never contains a frame_*.png file.
+            snap_tmp_dir = slides_dir / "_snap_tmp"
+            snap_tmp_dir.mkdir(parents=True, exist_ok=True)
             snapshot_dir.mkdir(parents=True, exist_ok=True)
             for change in changes:
-                dest = snapshot_dir / (change.frame_path.stem + ".png")
+                dest = snap_tmp_dir / (change.frame_path.stem + ".png")
                 try:
                     from PIL import Image
                     with Image.open(change.frame_path) as img:
@@ -270,40 +409,45 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
             if cfg["enable_vlm"]:
                 log.info("Running VLM annotation with model: %s", cfg["ollama_vlm_model"])
                 slides_annotated = annotator.annotate_batch(
-                    slides=changes, snapshot_dir=snapshot_dir,
+                    slides=changes, snapshot_dir=snap_tmp_dir,
                     model=cfg["ollama_vlm_model"],
                     ollama_url=cfg["ollama_base_url"].rstrip("/") + "/api/generate",
                     prompt=cfg["vlm_prompt"], timeout_sec=cfg["vlm_timeout_sec"],
+                    stop_check=stop_check,
                 )
             else:
                 slides_annotated = [
                     {
                         "frame_index": c.frame_index, "timestamp_sec": c.timestamp_sec,
-                        "snapshot_path": str(snapshot_dir / (c.frame_path.stem + ".png")),
+                        "snapshot_path": str(snap_tmp_dir / (c.frame_path.stem + ".png")),
                         "hash_value": c.hash_value, "hamming_distance": c.hamming_distance,
                         "title": "", "bullets": [], "slide_type": "",
                     }
                     for c in changes
                 ]
 
-            # Copy each snapshot under a friendlier, sequential filename.
-            # The ffmpeg-derived frame_NNNNNN.png names are hard to work
-            # with once copied out of context (e.g. "copy image" from the
-            # HTML report gives a cryptic file:// path). The original
-            # frame_NNNNNN.png stays where it is; this adds a second,
-            # human-readable copy and points the report/CSV/JSON/DB at it.
-            video_stem = Path(file).stem
+            # Move each snapshot into snapshot_dir under a unique,
+            # human-readable name: "<output basename>_slideNNN.png".
+            # Base name matches whatever the rest of this run's output
+            # files use (output_basename_override if set, else the video
+            # stem), so a "copy image" from the HTML report gives a
+            # meaningful filename instead of a cryptic frame_000123.png.
+            # If that name is already taken (e.g. re-running the same
+            # output name against a different source video into the same
+            # folder), a numeric suffix is appended rather than silently
+            # overwriting the existing file.
+            base_name = Path(output_prefix).name
             for idx, slide in enumerate(slides_annotated, start=1):
-                original = Path(slide.get("snapshot_path", ""))
-                if not original.exists():
+                staged = Path(slide.get("snapshot_path", ""))
+                if not staged.exists():
                     continue
-                friendly = snapshot_dir / f"{video_stem}_slide{idx:03d}.png"
+                final_dest = _unique_snapshot_path(snapshot_dir, base_name, idx)
                 try:
-                    if not friendly.exists():
-                        shutil.copy2(original, friendly)
-                    slide["snapshot_path"] = str(friendly)
+                    shutil.move(str(staged), str(final_dest))
+                    slide["snapshot_path"] = str(final_dest)
                 except Exception as exc:
-                    log.warning("Could not create friendly snapshot name for slide %d: %s", idx, exc)
+                    log.warning("Could not finalize snapshot name for slide %d: %s", idx, exc)
+            shutil.rmtree(snap_tmp_dir, ignore_errors=True)
 
             if segments:
                 slide_ts = [s["timestamp_sec"] for s in slides_annotated]
@@ -314,6 +458,7 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
                     if speaker_map:
                         slide["speaker"] = _dominant_speaker(speaker_map, slide["timestamp_sec"])
 
+            log.info("STAGE:db")
             conn = db.get_connection(cfg["db_path"])
             for slide in slides_annotated:
                 db.insert_slide(conn, {
@@ -330,28 +475,72 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
             db.insert_run_log(conn, file, "video", len(slides_annotated), "success")
             conn.close()
 
-            stem = Path(file).stem
+            stem = base_name  # matches the snapshot filenames set above
+            m_title = cfg.get("meeting_title", "")
+            m_date = cfg.get("meeting_date", "")
+            m_comments = cfg.get("meeting_comments", "")
             if cfg["report_csv"]:
                 reporter.save_csv(slides_annotated, slides_dir / f"{stem}_slides.csv")
             if cfg["report_json"]:
                 reporter.save_json(slides_annotated, slides_dir / f"{stem}_slides.json")
+            show_image = cfg.get("report_show_image", True)
+            show_bullets = cfg.get("report_show_bullets", True)
+            show_transcript = cfg.get("report_show_transcript", True)
+            transcript_mode = cfg.get("report_transcript_mode", "full")
+            title_slide = _build_title_slide(cfg, snapshot_dir, stem)
+            rec_speed = cfg.get("recording_speed", 1.0)
             if cfg["report_html"]:
-                reporter.save_html(slides_annotated, slides_dir / f"{stem}_report.html", filename)
+                reporter.save_html(slides_annotated, slides_dir / f"{stem}_report.html", filename,
+                                   meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                                   show_image=show_image, show_bullets=show_bullets,
+                                   show_transcript=show_transcript, transcript_mode=transcript_mode,
+                                   title_slide=title_slide, recording_speed=rec_speed)
             if cfg["report_pdf"]:
                 pdf_html = slides_dir / f"{stem}_report_pdf.html"
-                reporter.save_html_for_pdf(slides_annotated, pdf_html, filename)
+                reporter.save_html_for_pdf(slides_annotated, pdf_html, filename,
+                                           meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                                           show_image=show_image, show_bullets=show_bullets,
+                                           show_transcript=show_transcript, transcript_mode=transcript_mode,
+                                           title_slide=title_slide, recording_speed=rec_speed)
                 reporter.save_pdf_from_html(pdf_html, slides_dir / f"{stem}_report.pdf")
             if cfg.get("report_slide_timing", True):
                 reporter.save_slide_timing_summary(
-                    slides_annotated, slides_dir / f"{stem}_slide_timing.txt", filename)
+                    slides_annotated, slides_dir / f"{stem}_slide_timing.txt", filename,
+                    meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                    recording_speed=rec_speed)
+            if cfg.get("zip_snapshots", False):
+                zip_snapshot_dir(snapshot_dir, slides_dir / f"{stem}_snapshots.zip")
 
         if frames_dir.exists():
             shutil.rmtree(frames_dir, ignore_errors=True)
 
     # -----------------------------------------------------------------
+    # Step 2b: Real-time (1x) speed video conversion (optional, opt-in)
+    # -----------------------------------------------------------------
+    # Independent of enable_slides: even a plain audio/talking-head-style
+    # video run may want the sped-up recording normalized back to real time.
+    if not audio_only and not stopped() and cfg.get("convert_video_to_realtime", False):
+        speed = cfg.get("recording_speed", 1.0)
+        if speed == 1.0:
+            log.info("convert_video_to_realtime is on, but recording_speed is 1.0 - "
+                     "nothing to convert.")
+        else:
+            log.info("STAGE:normalize")
+            import extractor
+            realtime_path = Path(output_prefix + "_realtime.mp4")
+            ok = extractor.convert_to_realtime_speed(file, realtime_path, speed)
+            if ok:
+                log.info("Real-time-speed video saved: %s (matches the already-converted "
+                         ".srt/transcript timestamps, safe to play together).", realtime_path)
+            else:
+                log.error("Video speed normalization failed - see ffmpeg output above.")
+
+    # -----------------------------------------------------------------
     # Step 3: Notes / summary generation
     # -----------------------------------------------------------------
-    if cfg["enable_notes"] and not cfg.get("no_summary", False) and segments:
+    if stopped():
+        log.info("Stop requested before notes generation - skipping notes for %s.", filename)
+    elif cfg["enable_notes"] and not cfg.get("no_summary", False) and segments:
         try:
             prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, cfg["prompt_template"])
         except FileNotFoundError as exc:
@@ -383,6 +572,7 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
             if notes_text:
                 title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
                 event_date = cfg.get("meeting_date", "")
+                comments = cfg.get("meeting_comments", "")
                 model_label = (cfg["ollama_notes_model"] if cfg["llm_backend"] == "ollama"
                               else cfg["claude_model"])
 
@@ -390,16 +580,18 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
                 if cfg.get("notes_format_txt", True):
                     reporter.save_notes_txt(notes_text, output_prefix + "_notes.txt",
                                             filename, cfg["llm_backend"], model_label,
-                                            event_date=event_date)
+                                            event_date=event_date, comments=comments)
                 if cfg.get("notes_format_html", True):
                     notes_html_path = reporter.save_notes_html(
                         notes_text, output_prefix + "_notes.html", filename,
                         title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                        comments=comments,
                     )
                 if cfg.get("notes_format_docx", False):
                     reporter.save_notes_docx(
                         notes_text, output_prefix + "_notes.docx", filename,
                         title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                        comments=comments,
                     )
                 # Notes PDF: explicit toggle, or automatic when this was a
                 # video-with-slides run and slide-report PDFs are enabled
@@ -411,6 +603,7 @@ def process_file(file: str, overrides: dict | None = None) -> bool:
                         notes_html_path = reporter.save_notes_html(
                             notes_text, output_prefix + "_notes.html", filename,
                             title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                            comments=comments,
                         )
                     reporter.save_pdf_from_html(notes_html_path, Path(output_prefix + "_notes.pdf"))
 
@@ -441,6 +634,268 @@ def _dominant_speaker(speaker_map: dict, timestamp: float) -> str:
     return best
 
 
+def reannotate_failed_slides(slides_json_path: str, overrides: dict | None = None,
+                             stop_check=None) -> tuple[int, int]:
+    """
+    Re-run VLM annotation only for slides whose title AND bullets are both
+    empty (the signature of a VLM JSON parse failure, see
+    annotator._safe_parse_json), using the snapshot images already on disk.
+    Does not re-run frame extraction, slide-change detection, or
+    transcription. Updates the slide JSON in place, regenerates
+    CSV/HTML/PDF/timing reports, and updates the matching rows in the
+    database via db.update_slide_annotation (matched on video_path +
+    timestamp_sec, so a retry never creates duplicate DB rows).
+    Returns (retried_count, still_failed_count).
+    """
+    overrides = overrides or {}
+    cfg = build_run_config(overrides)
+    slides_json_path = Path(slides_json_path)
+    if not slides_json_path.exists():
+        log.error("Slides JSON not found: %s", slides_json_path)
+        return (0, 0)
+
+    slides = json.loads(slides_json_path.read_text(encoding="utf-8"))
+    failed_idx = [i for i, s in enumerate(slides) if not s.get("title") and not s.get("bullets")]
+    if not failed_idx:
+        log.info("No failed slides found in %s - nothing to re-annotate.", slides_json_path.name)
+        return (0, 0)
+
+    log.info("STAGE:slides")
+    log.info("Re-annotating %d failed slide(s) of %d total, model=%s.",
+             len(failed_idx), len(slides), cfg["ollama_vlm_model"])
+
+    import annotator
+    retried, still_failed = 0, 0
+    for count, idx in enumerate(failed_idx, 1):
+        if stop_check is not None and stop_check():
+            log.info("Stop requested, re-annotation halted at %d/%d.", count, len(failed_idx))
+            break
+        slide = slides[idx]
+        snap = Path(slide.get("snapshot_path", ""))
+        if not snap.exists():
+            log.warning("Snapshot missing for slide %d (%s) - cannot re-annotate.", idx + 1, snap)
+            still_failed += 1
+            continue
+        annotation = annotator.annotate_slide(
+            snap, model=cfg["ollama_vlm_model"],
+            ollama_url=cfg["ollama_base_url"].rstrip("/") + "/api/generate",
+            prompt=cfg["vlm_prompt"], timeout_sec=cfg["vlm_timeout_sec"],
+        )
+        if annotation.get("title") or annotation.get("bullets"):
+            slide["title"] = annotation.get("title", "")
+            slide["bullets"] = annotation.get("bullets", [])
+            slide["slide_type"] = annotation.get("slide_type", "")
+            retried += 1
+        else:
+            still_failed += 1
+
+    slides_json_path.write_text(json.dumps(slides, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Updated JSON: %s (retried=%d, still_failed=%d)", slides_json_path.name, retried, still_failed)
+
+    # Derive the original video and output stem from the slides folder
+    # naming convention (<stem>_slides/<stem>_slides.json), so CSV/HTML/
+    # PDF/timing reports and the DB update use the same paths the original
+    # run would have used.
+    slides_dir = slides_json_path.parent
+    stem = slides_json_path.stem.replace("_slides", "")
+    video_path = None
+    for candidate in slides_dir.parent.glob(f"{stem}.*"):
+        if candidate.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}:
+            video_path = str(candidate)
+            break
+    video_name = Path(video_path).name if video_path else stem
+
+    if retried and video_path:
+        log.info("STAGE:db")
+        db.validate_schema(cfg["db_path"])
+        conn = db.get_connection(cfg["db_path"])
+        for idx in failed_idx:
+            slide = slides[idx]
+            if not (slide.get("title") or slide.get("bullets")):
+                continue
+            db.update_slide_annotation(
+                conn, video_path, slide["timestamp_sec"],
+                slide.get("title", ""), json.dumps(slide.get("bullets", []), ensure_ascii=False),
+                slide.get("slide_type", ""),
+            )
+        conn.close()
+    elif retried:
+        log.warning("Could not locate source video next to %s - DB not updated "
+                    "(JSON/reports were still refreshed).", slides_dir)
+
+    m_title = cfg.get("meeting_title", "")
+    m_date = cfg.get("meeting_date", "")
+    m_comments = cfg.get("meeting_comments", "")
+    show_image = cfg.get("report_show_image", True)
+    show_bullets = cfg.get("report_show_bullets", True)
+    show_transcript = cfg.get("report_show_transcript", True)
+    transcript_mode = cfg.get("report_transcript_mode", "full")
+    title_slide = _build_title_slide(cfg, slides_dir / "snapshots", stem)
+    rec_speed = cfg.get("recording_speed", 1.0)
+
+    if cfg["report_csv"]:
+        reporter.save_csv(slides, slides_dir / f"{stem}_slides.csv")
+    if cfg["report_html"]:
+        reporter.save_html(slides, slides_dir / f"{stem}_report.html", video_name,
+                           meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                           show_image=show_image, show_bullets=show_bullets,
+                           show_transcript=show_transcript, transcript_mode=transcript_mode,
+                           title_slide=title_slide, recording_speed=rec_speed)
+    if cfg["report_pdf"]:
+        pdf_html = slides_dir / f"{stem}_report_pdf.html"
+        reporter.save_html_for_pdf(slides, pdf_html, video_name,
+                                   meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                                   show_image=show_image, show_bullets=show_bullets,
+                                   show_transcript=show_transcript, transcript_mode=transcript_mode,
+                                   title_slide=title_slide, recording_speed=rec_speed)
+        reporter.save_pdf_from_html(pdf_html, slides_dir / f"{stem}_report.pdf")
+    if cfg.get("report_slide_timing", True):
+        reporter.save_slide_timing_summary(slides, slides_dir / f"{stem}_slide_timing.txt", video_name,
+                                           meeting_title=m_title, meeting_date=m_date,
+                                           meeting_comments=m_comments, recording_speed=rec_speed)
+
+    log.info("STAGE:done")
+    log.info("Re-annotation done: %d fixed, %d still failed.", retried, still_failed)
+    return (retried, still_failed)
+
+
+# ---------------------------------------------------------------------------
+# Slide review/reprocess (task #58): omit or merge detected slides after
+# the fact, then rebuild only the report outputs, without re-running
+# transcription, frame extraction, slide-change detection, or VLM
+# annotation. Used by gui.py's SlideReviewDialog.
+# ---------------------------------------------------------------------------
+
+def apply_slide_edits(slides: list[dict], edits: dict) -> list[dict]:
+    """
+    Apply omit/merge edits to a list of slide dicts loaded from an
+    existing *_slides.json, returning a new, rebuilt list. Does not
+    mutate slides or edits.
+
+    edits schema (also the on-disk format of <stem>_slides_edits.json):
+      {"omit_indices": [1, 4], "merge_next_indices": [6, 7]}
+    omit_indices: 0-based indices into the ORIGINAL slides list to drop
+    entirely from the rebuilt output.
+    merge_next_indices: 0-based indices whose slide is merged INTO the
+    next non-omitted slide: the group's earliest timestamp/frame_index
+    wins (so timing stays anchored to when the content first appeared),
+    bullets are concatenated in order (duplicates dropped), transcript
+    segments are concatenated, and the LAST slide's title/snapshot/type
+    are kept (normally the most complete view of that content). Chaining
+    (e.g. both 6 and 7 marked) merges 6, 7, 8 into a single entry.
+    """
+    omit = set(edits.get("omit_indices", []) or [])
+    merge_next = set(edits.get("merge_next_indices", []) or [])
+    n = len(slides)
+    result: list[dict] = []
+    i = 0
+    while i < n:
+        if i in omit:
+            i += 1
+            continue
+        group = [i]
+        cur = i
+        while cur in merge_next:
+            nxt = cur + 1
+            while nxt in omit and nxt < n:
+                nxt += 1
+            if nxt >= n:
+                break
+            group.append(nxt)
+            cur = nxt
+        result.append(_merge_slide_group([slides[j] for j in group]))
+        i = group[-1] + 1
+    return result
+
+
+def _merge_slide_group(group: list[dict]) -> dict:
+    if len(group) == 1:
+        return dict(group[0])
+    merged = dict(group[-1])
+    merged["timestamp_sec"] = min(s.get("timestamp_sec", 0) for s in group)
+    merged["frame_index"] = min(s.get("frame_index", 0) for s in group)
+    bullets: list[str] = []
+    for s in group:
+        for b in s.get("bullets", []) or []:
+            if b not in bullets:
+                bullets.append(b)
+    merged["bullets"] = bullets
+    transcript_parts = [s.get("transcript_seg", "") for s in group if s.get("transcript_seg")]
+    merged["transcript_seg"] = " ".join(transcript_parts)
+    return merged
+
+
+def rebuild_outputs(slides_json_path: str, edits: dict, overrides: dict | None = None) -> bool:
+    """
+    Re-run only the report-generation stage (CSV/HTML/PDF/timing summary)
+    from an existing *_slides.json plus a set of omit/merge edits (see
+    apply_slide_edits), WITHOUT re-running frame extraction, slide-change
+    detection, VLM annotation, or transcription. Fast: typically seconds
+    even for a long recording. The original *_slides.json is never
+    modified; edits are written to a separate <stem>_slides_edits.json,
+    and the rebuilt full slide list is written to
+    <stem>_slides_rebuilt.json (report_json only) so the raw detection
+    data always stays recoverable. Returns True on success.
+    """
+    overrides = overrides or {}
+    cfg = build_run_config(overrides)
+    slides_json_path = Path(slides_json_path)
+    if not slides_json_path.exists():
+        log.error("Slides JSON not found: %s", slides_json_path)
+        return False
+
+    original = json.loads(slides_json_path.read_text(encoding="utf-8"))
+    slides = apply_slide_edits(original, edits)
+    log.info("Rebuilding outputs: %d slide(s) -> %d after edits.", len(original), len(slides))
+
+    slides_dir = slides_json_path.parent
+    stem = slides_json_path.stem.replace("_slides", "")
+    video_path = None
+    for candidate in slides_dir.parent.glob(f"{stem}.*"):
+        if candidate.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}:
+            video_path = str(candidate)
+            break
+    video_name = Path(video_path).name if video_path else stem
+
+    m_title = cfg.get("meeting_title", "")
+    m_date = cfg.get("meeting_date", "")
+    m_comments = cfg.get("meeting_comments", "")
+    show_image = cfg.get("report_show_image", True)
+    show_bullets = cfg.get("report_show_bullets", True)
+    show_transcript = cfg.get("report_show_transcript", True)
+    transcript_mode = cfg.get("report_transcript_mode", "full")
+    title_slide = _build_title_slide(cfg, slides_dir / "snapshots", stem)
+    rec_speed = cfg.get("recording_speed", 1.0)
+
+    if cfg["report_csv"]:
+        reporter.save_csv(slides, slides_dir / f"{stem}_slides.csv")
+    if cfg["report_json"]:
+        reporter.save_json(slides, slides_dir / f"{stem}_slides_rebuilt.json")
+    if cfg["report_html"]:
+        reporter.save_html(slides, slides_dir / f"{stem}_report.html", video_name,
+                           meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                           show_image=show_image, show_bullets=show_bullets,
+                           show_transcript=show_transcript, transcript_mode=transcript_mode,
+                           title_slide=title_slide, recording_speed=rec_speed)
+    if cfg["report_pdf"]:
+        pdf_html = slides_dir / f"{stem}_report_pdf.html"
+        reporter.save_html_for_pdf(slides, pdf_html, video_name,
+                                   meeting_title=m_title, meeting_date=m_date, meeting_comments=m_comments,
+                                   show_image=show_image, show_bullets=show_bullets,
+                                   show_transcript=show_transcript, transcript_mode=transcript_mode,
+                                   title_slide=title_slide, recording_speed=rec_speed)
+        reporter.save_pdf_from_html(pdf_html, slides_dir / f"{stem}_report.pdf")
+    if cfg.get("report_slide_timing", True):
+        reporter.save_slide_timing_summary(slides, slides_dir / f"{stem}_slide_timing.txt", video_name,
+                                           meeting_title=m_title, meeting_date=m_date,
+                                           meeting_comments=m_comments, recording_speed=rec_speed)
+
+    edits_path = slides_dir / f"{stem}_slides_edits.json"
+    edits_path.write_text(json.dumps(edits, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Rebuild complete. Edits saved: %s", edits_path)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Batch modes
 # ---------------------------------------------------------------------------
@@ -450,7 +905,7 @@ def write_log(log_file: Path, entry: str) -> None:
         f.write(entry + "\n")
 
 
-def run_file_list(list_file: str, overrides: dict) -> None:
+def run_file_list(list_file: str, overrides: dict, stop_check=None) -> None:
     """Batch-process every file listed in list_file (one path per line,
     optional |language suffix). Works for audio and video files alike -
     slide detection still runs per line exactly as configured.
@@ -478,6 +933,10 @@ def run_file_list(list_file: str, overrides: dict) -> None:
     write_log(log_file, f"Batch: {datetime.now()} | {list_file} | {len(entries)} files")
     ok, errors, skipped = 0, 0, 0
     for i, (file, lang) in enumerate(entries, 1):
+        if stop_check is not None and stop_check():
+            log.info("Stop requested - halting batch after %d/%d file(s).", i - 1, len(entries))
+            write_log(log_file, f"Stopped by user before [{i}]: {file}")
+            break
         if not force:
             conn = db.get_connection(cfg["db_path"])
             done = db.get_completed_transcript(conn, str(Path(file)))
@@ -495,7 +954,7 @@ def run_file_list(list_file: str, overrides: dict) -> None:
         if lang:
             run_overrides["whisper_language"] = lang
         try:
-            success = process_file(file, run_overrides)
+            success = process_file(file, run_overrides, stop_check=stop_check)
             dur = (datetime.now() - t_start).seconds
             write_log(log_file, f"[{i}] {'OK' if success else 'NOT FOUND'} ({dur}s): {file}")
             ok += 1 if success else 0
@@ -510,7 +969,7 @@ def run_file_list(list_file: str, overrides: dict) -> None:
     log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
 
 
-def run_batch_folder(folder: str, overrides: dict, recursive: bool = False) -> None:
+def run_batch_folder(folder: str, overrides: dict, recursive: bool = False, stop_check=None) -> None:
     """
     Process every supported audio/video file found directly in folder
     (or recursively with recursive=True), without needing a hand-written
@@ -536,10 +995,14 @@ def run_batch_folder(folder: str, overrides: dict, recursive: bool = False) -> N
     write_log(log_file, f"Batch folder: {datetime.now()} | {folder} | {len(files)} files")
     ok, errors = 0, 0
     for i, file in enumerate(files, 1):
+        if stop_check is not None and stop_check():
+            log.info("Stop requested - halting batch after %d/%d file(s).", i - 1, len(files))
+            write_log(log_file, f"Stopped by user before [{i}]: {file.name}")
+            break
         log.info("[%d/%d] %s", i, len(files), file.name)
         t_start = datetime.now()
         try:
-            success = process_file(str(file), overrides)
+            success = process_file(str(file), overrides, stop_check=stop_check)
             dur = (datetime.now() - t_start).seconds
             write_log(log_file, f"[{i}] {'OK' if success else 'FAILED'} ({dur}s): {file.name}")
             ok += 1 if success else 0
@@ -612,23 +1075,26 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
 
     title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
     event_date = cfg.get("meeting_date", "")
+    comments = cfg.get("meeting_comments", "")
     model_label = cfg["ollama_notes_model"] if cfg["llm_backend"] == "ollama" else cfg["claude_model"]
     notes_html_path = None
     if cfg.get("notes_format_txt", True):
         reporter.save_notes_txt(notes_text, output_prefix + "_notes.txt", filename,
-                                cfg["llm_backend"], model_label, event_date=event_date)
+                                cfg["llm_backend"], model_label, event_date=event_date,
+                                comments=comments)
     if cfg.get("notes_format_html", True):
         notes_html_path = reporter.save_notes_html(notes_text, output_prefix + "_notes.html", filename,
                                                     title=title, generated_by=cfg["llm_backend"],
-                                                    event_date=event_date)
+                                                    event_date=event_date, comments=comments)
     if cfg.get("notes_format_docx", False):
         reporter.save_notes_docx(notes_text, output_prefix + "_notes.docx", filename,
-                                 title=title, generated_by=cfg["llm_backend"], event_date=event_date)
+                                 title=title, generated_by=cfg["llm_backend"], event_date=event_date,
+                                 comments=comments)
     if cfg.get("notes_format_pdf", False):
         if notes_html_path is None:
             notes_html_path = reporter.save_notes_html(notes_text, output_prefix + "_notes.html", filename,
                                                         title=title, generated_by=cfg["llm_backend"],
-                                                        event_date=event_date)
+                                                        event_date=event_date, comments=comments)
         reporter.save_pdf_from_html(notes_html_path, Path(output_prefix + "_notes.pdf"))
 
     # notes-only mode has no fresh whisperx segment count (transcript
@@ -698,6 +1164,21 @@ def parse_args() -> argparse.Namespace:
                    help="Meeting/event title, used as the notes document title.")
     p.add_argument("--meeting-date", type=str, metavar="YYYY-MM-DD",
                    help="Meeting/event date, shown in the notes document header.")
+    p.add_argument("--comments", type=str, metavar="TEXT",
+                   help="Free-text comments, shown in the notes and slide report headers.")
+    p.add_argument("--output-name", type=str, metavar="NAME",
+                   help="Base filename for every output file instead of the source file's stem.")
+    p.add_argument("--title-image", type=str, metavar="FILE",
+                   help="Image file (jpg/png) shown as a cover page before Slide 1 in the "
+                        "HTML/PDF slide report.")
+    p.add_argument("--recording-speed", type=float, metavar="FACTOR",
+                   help="Recording speed factor; every timestamp in every output is converted "
+                        "as real_time = video_time / FACTOR. Default: 1.0 (no change).")
+    p.add_argument("--normalize-speed", action="store_true",
+                   help="When --recording-speed is not 1.0, also produce a re-encoded "
+                        "<stem>_realtime.mp4 that plays at actual real-time (1x) speed, "
+                        "staying in sync with the already-converted .srt/transcript. "
+                        "Requires a full ffmpeg re-encode (slow for long videos).")
     p.add_argument("--ics", type=str, metavar="FILE",
                    help="Read --meeting-title/--meeting-date from the first VEVENT in an .ics file "
                         "(explicit --meeting-title/--meeting-date still take precedence).")
@@ -712,6 +1193,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="Slide timestamps only, no annotation/whisper/reports.")
     p.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires HF_TOKEN).")
     p.add_argument("--threshold", type=int, help="Slide-change hash threshold override.")
+    p.add_argument("--min-slide-duration", type=float, metavar="SEC",
+                   help="Minimum seconds a slide must be shown to count as a real change "
+                        "(debounce for animations/transitions). Default: 2.0.")
+    p.add_argument("--animation-threshold", type=int, metavar="N",
+                   help="Distances between this and --threshold are treated as the current slide "
+                        "still building (e.g. bullets appearing one at a time), instead of a new "
+                        "slide: the slide's snapshot updates to the more complete frame, its start "
+                        "timestamp stays the same, and no new slide is added. 0 disables this "
+                        "(default). Must be less than --threshold.")
     p.add_argument("--fps", type=int, help="Frame extraction fps override.")
     p.add_argument("--output-dir", type=str, metavar="DIR",
                    help="Write all outputs for this run into DIR instead of next to the source file.")
@@ -727,6 +1217,10 @@ def parse_args() -> argparse.Namespace:
                    help="Batch-process every supported audio/video file found directly in FOLDER.")
     p.add_argument("--search", metavar="QUERY",
                    help="Full-text search notes and slide titles/bullets in the database, then exit.")
+    p.add_argument("--reannotate-failed", metavar="SLIDES_JSON_FILE",
+                   help="Re-run VLM annotation only for slides with empty title/bullets "
+                        "(failed JSON parse) in an existing *_slides.json, using the "
+                        "snapshots already on disk. Updates JSON/CSV/HTML/PDF/DB in place.")
     p.add_argument("--log-file", action="store_true",
                    help="Also write this run's log to a timestamped file under log_dir (see config.py).")
     return p.parse_args()
@@ -774,12 +1268,19 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "dry_run":             True if args.dry_run else None,
         "enable_diarization":  True if args.diarize else None,
         "hash_threshold":      args.threshold,
+        "min_slide_duration_sec": args.min_slide_duration,
+        "animation_threshold": args.animation_threshold,
+        "recording_speed":     args.recording_speed,
+        "convert_video_to_realtime": True if args.normalize_speed else None,
+        "title_slide_image_path": args.title_image,
         "fps":                 args.fps,
         "output_dir_override": args.output_dir,
         "notes_format_pdf":    True if args.pdf else None,
         "notes_format_docx":   True if args.docx else None,
         "meeting_title":       meeting_title,
         "meeting_date":        meeting_date,
+        "meeting_comments":    args.comments,
+        "output_basename_override": args.output_name,
     }
     return {k: v for k, v in overrides.items() if v is not None}
 
@@ -802,6 +1303,10 @@ def main() -> int:
         return 0
 
     overrides = overrides_from_args(args)
+
+    if args.reannotate_failed:
+        retried, still_failed = reannotate_failed_slides(args.reannotate_failed, overrides)
+        return 0 if still_failed == 0 else 1
 
     if args.notes_batch:
         run_notes_batch(args.notes_batch, overrides)

@@ -148,13 +148,40 @@ def _safe_parse_json(text: str) -> dict:
     return {"title": "", "bullets": [], "slide_type": "unknown"}
 
 
+def _flatten_bullet(item) -> str:
+    """
+    Coerce one bullet entry to a plain string. Weaker/quantized VLMs
+    (observed with qwen2.5vl:3b) sometimes ignore the "list of strings"
+    instruction and nest bullets as {"text": "..."} objects or as
+    sub-lists (["a", "b"]) instead of flat strings. Normalising here
+    keeps every downstream consumer (CSV, HTML report, PDF, DB) safe
+    without needing its own defensive isinstance checks.
+    """
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        for value in item.values():
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+    if isinstance(item, list):
+        parts = [_flatten_bullet(sub) for sub in item]
+        return " ".join(p for p in parts if p)
+    return str(item).strip()
+
+
 def _extract_fields(data: dict) -> dict:
     bullets = data.get("bullets", [])
     if isinstance(bullets, str):
         bullets = [b.strip() for b in bullets.split(",") if b.strip()]
+    elif isinstance(bullets, list):
+        bullets = [_flatten_bullet(b) for b in bullets]
+    else:
+        bullets = []
+    bullets = [b for b in bullets if b][:5]
     return {
         "title": str(data.get("title", "")),
-        "bullets": bullets[:5],
+        "bullets": bullets,
         "slide_type": str(data.get("slide_type", "content")),
     }
 
@@ -211,6 +238,9 @@ def annotate_batch(
     ollama_url: str = "http://localhost:11434/api/generate",
     prompt: str = DEFAULT_PROMPT,
     timeout_sec: int = 60,
+    stop_check=None,       # optional callable, checked between slides for a
+                           # cooperative stop (see run_pipeline.py process_file);
+                           # remaining slides are returned unannotated, not lost.
 ) -> list[dict]:
     """
     Annotate all slides and return enriched dicts.
@@ -218,6 +248,18 @@ def annotate_batch(
     """
     results = []
     for slide in slides:
+        if stop_check is not None and stop_check():
+            log.info("Stop requested, VLM annotation halted at slide %d/%d.",
+                     len(results) + 1, len(slides))
+            for r in slides[len(results):]:
+                snap = snapshot_dir / r.frame_path.name.replace(r.frame_path.suffix, ".png")
+                results.append({
+                    "frame_index": r.frame_index, "timestamp_sec": r.timestamp_sec,
+                    "snapshot_path": str(snap), "hash_value": r.hash_value,
+                    "hamming_distance": r.hamming_distance,
+                    "title": "", "bullets": [], "slide_type": "",
+                })
+            break
         snap = snapshot_dir / slide.frame_path.name.replace(
             slide.frame_path.suffix, ".png"
         )

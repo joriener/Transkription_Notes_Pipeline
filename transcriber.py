@@ -294,10 +294,17 @@ def _fmt_srt(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_transcript_files(source_file: str, segments: list[dict], output_prefix: str) -> dict:
+def write_transcript_files(source_file: str, segments: list[dict], output_prefix: str,
+                           recording_speed: float = 1.0) -> dict:
     """
     Write *_transcript_speakers.txt, *_text.txt and *_transcript.srt from a
     flat list of segment dicts ({start, end, text, speaker}).
+    recording_speed: if not 1.0, every timestamp in these files has already
+    been converted (real_time = video_time / recording_speed, see
+    run_pipeline._rescale_segments). A note to that effect is written into
+    the *_transcript_speakers.txt header only; the plain *_text.txt has no
+    timestamps and the *_transcript.srt format has no header/comment field,
+    so neither is annotated.
     Returns the dict of written paths (see transcript_cache_paths).
     """
     paths = transcript_cache_paths(output_prefix)
@@ -305,6 +312,10 @@ def write_transcript_files(source_file: str, segments: list[dict], output_prefix
     with open(paths["speakers"], "w", encoding="utf-8") as f:
         f.write(f"Transcript: {Path(source_file).name}\n")
         f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        if recording_speed != 1.0:
+            f.write(f"Recording speed: {recording_speed}x (all timestamps in this file, "
+                    f"the .srt, and the slide report are converted: "
+                    f"real_time = video_time / {recording_speed})\n")
         f.write("=" * 60 + "\n\n")
         current_speaker = None
         for seg in segments:

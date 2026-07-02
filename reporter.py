@@ -23,20 +23,40 @@ def format_ts(seconds: float) -> str:
     return str(timedelta(seconds=int(seconds)))
 
 
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _first_sentence(text: str) -> str:
+    """Return just the first sentence of text (split on . ! ?), or the
+    whole string if no sentence boundary is found. Used by the slide
+    report's "first sentence only" transcript mode so a slide with a
+    long spoken segment still fits on one page."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    parts = _SENTENCE_END.split(text, maxsplit=1)
+    return parts[0].strip()
+
+
 # ---------------------------------------------------------------------------
 # Notes / summary output (meeting or webinar mode, any prompt template)
 # ---------------------------------------------------------------------------
 
 def save_notes_txt(notes_text: str, output_path: Path, filename: str,
-                   llm_backend: str, model_name: str = "", event_date: str = "") -> None:
+                   llm_backend: str, model_name: str = "", event_date: str = "",
+                   comments: str = "") -> None:
     """Write the raw LLM notes output as plain text with a header.
     event_date (optional): meeting/event date, shown alongside the
-    generation timestamp when set via the GUI's Meeting info fields."""
+    generation timestamp when set via the GUI's Meeting info fields.
+    comments (optional): free-text from the GUI's Meeting info
+    "Comments" field, shown right below the date."""
     output_path = Path(output_path)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(f"Notes: {filename}\n")
         if event_date:
             f.write(f"Meeting date: {event_date}\n")
+        if comments:
+            f.write(f"Comments: {comments}\n")
         f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
         f.write(f"LLM backend: {llm_backend}")
         if model_name:
@@ -131,13 +151,16 @@ def _markdown_to_html(md: str) -> str:
 
 def save_notes_html(notes_text: str, output_path: Path, filename: str,
                     title: str = "MEETING NOTES", generated_by: str = "",
-                    event_date: str = "") -> Path:
+                    event_date: str = "", comments: str = "") -> Path:
     """Write LLM notes/summary as a styled, print-friendly HTML document.
     event_date (optional): meeting/event date, shown in the meta bar
-    alongside the filename when set via the GUI's Meeting info fields."""
+    alongside the filename when set via the GUI's Meeting info fields.
+    comments (optional): free-text from the GUI's Meeting info
+    "Comments" field, shown below the date."""
     output_path = Path(output_path)
     body = _markdown_to_html(notes_text)
     event_date_html = f'<div class="event-date">Meeting date: {event_date}</div>' if event_date else ""
+    comments_html = f'<div class="comments">Comments: {comments}</div>' if comments else ""
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -162,6 +185,7 @@ def save_notes_html(notes_text: str, output_path: Path, filename: str,
   .meta .filename {{ font-size: 18px; font-weight: bold; color: #333; }}
   .meta .date {{ font-size: 14px; color: #666; }}
   .event-date {{ font-size: 14px; color: #1F5C99; font-weight: bold; margin-top: 4px; }}
+  .comments {{ font-size: 13px; color: #555; margin-top: 4px; font-style: italic; }}
   h2 {{
     background-color: #D6E4F0; color: #1F5C99; font-size: 18px; font-weight: bold;
     padding: 8px 12px; margin: 24px 0 12px; border-left: 4px solid #1F5C99;
@@ -185,6 +209,7 @@ def save_notes_html(notes_text: str, output_path: Path, filename: str,
       <span class="date">{datetime.now().strftime("%Y-%m-%d %H:%M")}</span>
     </div>
     {event_date_html}
+    {comments_html}
   </div>
   <div class="content">
 {body}
@@ -201,13 +226,15 @@ def save_notes_html(notes_text: str, output_path: Path, filename: str,
 
 def save_notes_docx(notes_text: str, output_path: Path, filename: str,
                     title: str = "MEETING NOTES", generated_by: str = "",
-                    event_date: str = "") -> Path | None:
+                    event_date: str = "", comments: str = "") -> Path | None:
     """
     Write LLM notes/summary as a real Word document via python-docx.
     Mirrors save_notes_html's section/bullet parsing (_parse_notes_sections)
     so both formats always show the same structure.
     event_date (optional): meeting/event date, shown in the meta line
     when set via the GUI's Meeting info fields.
+    comments (optional): free-text from the GUI's Meeting info
+    "Comments" field, shown below the date.
     Returns the output path, or None if python-docx is not installed.
     """
     try:
@@ -238,6 +265,12 @@ def save_notes_docx(notes_text: str, output_path: Path, filename: str,
         event_run = event_p.add_run(f"Meeting date: {event_date}")
         event_run.bold = True
         event_run.font.color.rgb = RGBColor(0x1F, 0x5C, 0x99)
+
+    if comments:
+        comments_p = doc.add_paragraph()
+        comments_run = comments_p.add_run(f"Comments: {comments}")
+        comments_run.italic = True
+        comments_run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
 
     for section in _parse_notes_sections(notes_text):
         sh = doc.add_heading(section["title"], level=1)
@@ -284,14 +317,42 @@ def save_csv(slides: list[dict], output_path: Path) -> None:
             row["slide_id"] = i
             row["timestamp"] = format_ts(slide.get("timestamp_sec", 0))
             bullets = slide.get("bullets", [])
-            row["bullets"] = " | ".join(bullets) if isinstance(bullets, list) else str(bullets)
+            # Defensive: coerce every item to str regardless of source, so a
+            # malformed upstream value (e.g. a weaker VLM nesting bullets as
+            # objects/sub-lists) can never crash the whole run at export time.
+            row["bullets"] = " | ".join(str(b) for b in bullets) if isinstance(bullets, list) else str(bullets)
             writer.writerow(row)
     log.info("CSV saved: %s", output_path)
 
 
-def save_html(slides: list[dict], output_path: Path, video_name: str = "") -> None:
-    """Write a self-contained HTML report with slide thumbnails and annotations."""
+def save_html(slides: list[dict], output_path: Path, video_name: str = "",
+             meeting_title: str = "", meeting_date: str = "", meeting_comments: str = "",
+             show_image: bool = True, show_bullets: bool = True, show_transcript: bool = True,
+             transcript_mode: str = "full", title_slide: dict | None = None,
+             recording_speed: float = 1.0) -> None:
+    """Write a self-contained HTML report with slide thumbnails and annotations.
+    meeting_title/meeting_date/meeting_comments (optional): from the GUI's
+    Meeting info section, shown in the report header alongside the video name.
+    show_image/show_bullets/show_transcript: toggle which parts of each
+    slide card are rendered. transcript_mode: "full" or "first_sentence".
+    title_slide (optional): {"image_path", "title", "subtitle"} dict for an
+    optional cover page shown before Slide 1. Not counted in "Slides
+    detected". See run_pipeline._build_title_slide().
+    recording_speed: if not 1.0, every timestamp shown was already converted
+    (real_time = video_time / recording_speed); noted in the meta-bar."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cover_html = ""
+    if title_slide and title_slide.get("image_path"):
+        cover_img = Path(title_slide["image_path"]).name
+        cover_html = f"""
+<div class="cover-slide">
+    <img src="snapshots/{cover_img}" alt="Title slide">
+    <div class="cover-text">
+        <h2>{title_slide.get('title', '')}</h2>
+        <p>{title_slide.get('subtitle', '')}</p>
+    </div>
+</div>"""
 
     cards = ""
     for i, slide in enumerate(slides, start=1):
@@ -302,26 +363,36 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "") -> No
         if isinstance(bullets, str):
             bullets = [bullets]
         transcript = slide.get("transcript_seg", "") or ""
+        if transcript_mode == "first_sentence":
+            transcript = _first_sentence(transcript)
         snap = slide.get("snapshot_path", "")
 
-        try:
-            snap_rel = Path(snap).name
-            img_tag = f'<img src="snapshots/{snap_rel}" alt="Slide {i}" loading="lazy">'
-        except Exception:
-            img_tag = '<div class="no-img">No snapshot</div>'
+        img_tag = ""
+        if show_image:
+            try:
+                snap_rel = Path(snap).name
+                img_tag = f'<img src="snapshots/{snap_rel}" alt="Slide {i}" loading="lazy">'
+            except Exception:
+                img_tag = '<div class="no-img">No snapshot</div>'
+        thumb_html = f'<div class="thumb">{img_tag}</div>' if show_image else ""
 
-        bullet_html = "".join(f"<li>{b}</li>" for b in bullets[:5])
-        transcript_html = f'<p class="transcript">{transcript[:300]}</p>' if transcript else ""
+        bullet_html = ""
+        if show_bullets:
+            bullet_html = "<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:5]) + "</ul>"
+        transcript_html = (
+            f'<p class="transcript">{transcript[:300]}</p>'
+            if show_transcript and transcript else ""
+        )
 
         cards += f"""
         <div class="card">
-            <div class="thumb">{img_tag}</div>
+            {thumb_html}
             <div class="meta">
                 <span class="num">Slide {i}</span>
                 <span class="ts">{ts}</span>
                 <span class="stype">{stype}</span>
                 <h3>{title}</h3>
-                <ul>{bullet_html}</ul>
+                {bullet_html}
                 {transcript_html}
             </div>
         </div>"""
@@ -348,14 +419,25 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "") -> No
   ul   {{ margin: 0.2rem 0; padding-left: 1.2rem; font-size: 0.83rem; color: #444; }}
   li   {{ margin: 0.1rem 0; }}
   .transcript {{ font-size: 0.78rem; color: #666; margin-top: 0.4rem; border-top: 1px solid #eee; padding-top: 0.4rem; }}
+  .meeting-info {{ font-size: 0.85rem; color: #1a56db; margin-bottom: 0.4rem; }}
+  .meeting-comments {{ font-size: 0.82rem; color: #666; font-style: italic; margin-bottom: 0.8rem; }}
+  .cover-slide {{ background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 1.5rem; }}
+  .cover-slide img {{ width: 100%; max-height: 420px; object-fit: contain; display: block; background: #111; }}
+  .cover-text {{ padding: 1rem 1.25rem; text-align: center; }}
+  .cover-text h2 {{ font-size: 1.15rem; font-weight: 600; margin: 0 0 0.2rem; }}
+  .cover-text p {{ font-size: 0.85rem; color: #666; margin: 0; }}
 </style>
 </head>
 <body>
-<h1>Slide Report</h1>
+<h1>{meeting_title or "Slide Report"}</h1>
+{f'<div class="meeting-info">{meeting_title + " &nbsp;|&nbsp; " if meeting_title else ""}{meeting_date}</div>' if (meeting_title or meeting_date) else ""}
+{f'<div class="meeting-comments">Comments: {meeting_comments}</div>' if meeting_comments else ""}
 <div class="meta-bar">
   Video: <strong>{video_name}</strong> &nbsp;|&nbsp;
   Slides detected: <strong>{len(slides)}</strong>
+  {f'&nbsp;|&nbsp; Recording speed: <strong>{recording_speed}x</strong> (timestamps converted: real_time = video_time / {recording_speed})' if recording_speed != 1.0 else ""}
 </div>
+{cover_html}
 <div class="grid">{cards}
 </div>
 </body>
@@ -366,15 +448,29 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "") -> No
     log.info("HTML report saved: %s", output_path)
 
 
-def save_slide_timing_summary(slides: list[dict], output_path: Path, video_name: str = "") -> None:
+def save_slide_timing_summary(slides: list[dict], output_path: Path, video_name: str = "",
+                              meeting_title: str = "", meeting_date: str = "",
+                              meeting_comments: str = "", recording_speed: float = 1.0) -> None:
     """
     Write a plain-text summary listing only the slide number and the
     timestamp it appeared at, one line per slide, no images/bullets/
     transcript. Companion to the full HTML/PDF report for a quick
     "when did slide N change" reference.
+    recording_speed: if not 1.0, every timestamp below was already converted
+    (real_time = video_time / recording_speed); noted in the header.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"Slide timing summary: {video_name}", f"Slides detected: {len(slides)}", ""]
+    lines = [f"Slide timing summary: {video_name}"]
+    if meeting_title:
+        lines.append(f"Meeting: {meeting_title}")
+    if meeting_date:
+        lines.append(f"Date: {meeting_date}")
+    if meeting_comments:
+        lines.append(f"Comments: {meeting_comments}")
+    if recording_speed != 1.0:
+        lines.append(f"Recording speed: {recording_speed}x (timestamps converted: "
+                     f"real_time = video_time / {recording_speed})")
+    lines += [f"Slides detected: {len(slides)}", ""]
     for i, slide in enumerate(slides, start=1):
         ts = format_ts(slide.get("timestamp_sec", 0))
         title = slide.get("title") or ""
@@ -411,12 +507,39 @@ def save_json(slides: list[dict], output_path: Path) -> None:
     log.info("JSON index saved: %s", output_path)
 
 
-def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "") -> None:
+def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "",
+                      meeting_title: str = "", meeting_date: str = "",
+                      meeting_comments: str = "", show_image: bool = True,
+                      show_bullets: bool = True, show_transcript: bool = True,
+                      transcript_mode: str = "full", title_slide: dict | None = None,
+                      recording_speed: float = 1.0) -> None:
     """
     Generate a PDF-optimised HTML file with exactly one slide per page.
     Used exclusively as input to save_pdf_from_html, not for browser viewing.
+    meeting_title/meeting_date/meeting_comments (optional): from the GUI's
+    Meeting info section, shown on the cover block.
+    show_image/show_bullets/show_transcript: toggle which parts of each
+    slide page are rendered. transcript_mode: "full" or "first_sentence"
+    (first sentence only, so the segment reliably fits on one page).
+    title_slide (optional): {"image_path", "title", "subtitle"} dict for an
+    optional full-page cover image shown as its own page before the meta
+    cover block / Slide 1. See run_pipeline._build_title_slide().
+    recording_speed: if not 1.0, every timestamp shown was already converted
+    (real_time = video_time / recording_speed); noted on the cover block.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cover_slide_page = ""
+    if title_slide and title_slide.get("image_path"):
+        cover_img = Path(title_slide["image_path"]).name
+        cover_slide_page = f"""
+<div class="slide-page cover-image-page" style="page-break-after: always;">
+  <div class="cover-image"><img src="snapshots/{cover_img}" alt="Title slide"></div>
+  <div class="cover-caption">
+    <h1>{title_slide.get('title', '')}</h1>
+    <p>{title_slide.get('subtitle', '')}</p>
+  </div>
+</div>"""
 
     pages = ""
     for i, slide in enumerate(slides, start=1):
@@ -426,19 +549,23 @@ def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "
         bullets = slide.get("bullets", [])
         if isinstance(bullets, str):
             bullets = [bullets]
-        transcript = (slide.get("transcript_seg", "") or "")[:400]
+        transcript = slide.get("transcript_seg", "") or ""
+        transcript = _first_sentence(transcript) if transcript_mode == "first_sentence" else transcript[:400]
         snap = slide.get("snapshot_path", "")
 
-        try:
-            snap_rel = Path(snap).name
-            img_html = f'<img src="snapshots/{snap_rel}" alt="Slide {i}">'
-        except Exception:
-            img_html = '<div class="no-snap">No snapshot</div>'
+        img_html = ""
+        if show_image:
+            try:
+                snap_rel = Path(snap).name
+                img_html = f'<img src="snapshots/{snap_rel}" alt="Slide {i}">'
+            except Exception:
+                img_html = '<div class="no-snap">No snapshot</div>'
+        snap_html = f'<div class="snap">{img_html}</div>' if show_image else ""
 
-        bullet_html = "".join(f"<li>{b}</li>" for b in bullets[:5])
+        bullet_html = ("<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:5]) + "</ul>") if show_bullets else ""
         transcript_html = (
             f'<div class="transcript"><strong>Transcript:</strong> {transcript}</div>'
-            if transcript else ""
+            if show_transcript and transcript else ""
         )
         page_break = "page-break-after: always;" if i < len(slides) else ""
 
@@ -449,10 +576,10 @@ def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "
     <span class="stype">{stype}</span>
     <span class="num">Slide {i} / {len(slides)}</span>
   </div>
-  <div class="snap">{img_html}</div>
+  {snap_html}
   <div class="annotation">
     <h2>{title}</h2>
-    <ul>{bullet_html}</ul>
+    {bullet_html}
     {transcript_html}
   </div>
 </div>"""
@@ -480,12 +607,24 @@ def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "
   .transcript {{ font-size: 8pt; color: #666; margin-top: 2mm; border-top: 1px solid #eee; padding-top: 2mm; line-height: 1.4; }}
   .cover {{ font-size: 9pt; color: #888; margin-bottom: 4mm; border-bottom: 2px solid #1a56db; padding-bottom: 3mm; }}
   .cover strong {{ color: #1a56db; font-size: 13pt; }}
+  .cover .comments {{ font-style: italic; color: #666; margin-top: 1mm; }}
+  .cover-image-page {{ align-items: center; justify-content: center; }}
+  .cover-image {{ flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }}
+  .cover-image img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
+  .cover-caption {{ text-align: center; padding: 4mm 0; }}
+  .cover-caption h1 {{ font-size: 16pt; color: #1a1a1a; margin-bottom: 1mm; }}
+  .cover-caption p {{ font-size: 10pt; color: #666; }}
 </style>
 </head>
 <body>
+{cover_slide_page}
 <div class="cover">
-  <strong>Slide Report: {video_name}</strong><br>
+  <strong>{meeting_title or ("Slide Report: " + video_name)}</strong><br>
+  {f"Video: {video_name}<br>" if meeting_title else ""}
+  {f"Date: {meeting_date}<br>" if meeting_date else ""}
   Slides detected: {len(slides)}
+  {f'<br>Recording speed: {recording_speed}x (timestamps converted: real_time = video_time / {recording_speed})' if recording_speed != 1.0 else ""}
+  {f'<div class="comments">Comments: {meeting_comments}</div>' if meeting_comments else ""}
 </div>
 {pages}
 </body>
