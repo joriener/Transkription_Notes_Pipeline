@@ -2263,6 +2263,17 @@ class SlideReviewDialog(tk.Toplevel):
     table with a Video column. Also adds "Edit Title..." for a
     non-destructive per-slide title override (edits schema extended with
     title_overrides, see run_pipeline.apply_slide_edits).
+
+    Task #78: "Thumbnail grid view" toggles the list (Treeview) between a
+    scrollable grid of slide snapshot thumbnails with a caption per cell
+    (video/number/time/title/status), sharing the same underlying
+    self._row_refs and edit dicts as the list view - Toggle Omit/Merge/
+    Edit Title/Rebuild all keep working unchanged in either view, via
+    _selected_refs() reading whichever view is active. Thumbnails are
+    decoded lazily: only when grid view is actually switched on, and only
+    once per snapshot path (cached in self._grid_photos) - a large batch
+    overview never decodes hundreds of images just from opening the
+    dialog or staying in list view.
     """
 
     def __init__(self, master, overrides_source):
@@ -2278,6 +2289,12 @@ class SlideReviewDialog(tk.Toplevel):
         self._row_refs: list = []               # tree row position -> (video, slide_idx)
         self._preview_photo = None  # keep a reference, else Tk garbage-collects the image
 
+        # Thumbnail grid view state (task #78).
+        self._view_mode_grid: bool = False
+        self._grid_photos: dict = {}    # snapshot_path -> PhotoImage cache, never evicted this session
+        self._grid_selected: set = set()  # selected indices into self._row_refs, grid mode only
+        self._grid_frames: dict = {}    # row index -> its cell Frame, for selection highlighting
+
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
         ttk.Button(top, text="Load *_slides.json...", command=self._load_file).pack(side="left")
@@ -2288,6 +2305,9 @@ class SlideReviewDialog(tk.Toplevel):
         self.batch_mode_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Batch overview (all loaded)", variable=self.batch_mode_var,
                        command=self._toggle_batch_view).pack(side="left", padx=(12, 0))
+        self.view_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Thumbnail grid view", variable=self.view_mode_var,
+                       command=self._toggle_view_mode).pack(side="left", padx=(12, 0))
         ttk.Label(top, text="Switch between videos loaded this session (batch runs).",
                  foreground="#666").pack(side="left", padx=(8, 0))
 
@@ -2307,6 +2327,32 @@ class SlideReviewDialog(tk.Toplevel):
         self.tree["displaycolumns"] = ("num", "time", "title", "bullets", "status")  # video hidden until batch mode
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # Thumbnail grid view (task #78): built into the same tree_frame,
+        # but not packed until "Thumbnail grid view" is checked, so its
+        # canvas/scrollbar simply don't exist on screen (and no image is
+        # decoded) in the default list view.
+        self.grid_canvas = tk.Canvas(tree_frame, highlightthickness=0)
+        self.grid_vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.grid_canvas.yview)
+        self.grid_canvas.configure(yscrollcommand=self.grid_vsb.set)
+        self.grid_inner = ttk.Frame(self.grid_canvas)
+        self._grid_inner_id = self.grid_canvas.create_window((0, 0), window=self.grid_inner, anchor="nw")
+
+        def _on_grid_inner_configure(event):
+            self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all"))
+
+        def _on_grid_canvas_configure(event):
+            self.grid_canvas.itemconfig(self._grid_inner_id, width=event.width)
+
+        self.grid_inner.bind("<Configure>", _on_grid_inner_configure)
+        self.grid_canvas.bind("<Configure>", _on_grid_canvas_configure)
+
+        def _on_grid_mousewheel(event):
+            self.grid_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        self.grid_canvas.bind("<Enter>", lambda e: self.grid_canvas.bind_all(
+            "<MouseWheel>", _on_grid_mousewheel))
+        self.grid_canvas.bind("<Leave>", lambda e: self.grid_canvas.unbind_all("<MouseWheel>"))
 
         # Preview panel: snapshot image + title + bullets/transcript for
         # whichever row was selected last, so slides can be identified
@@ -2382,6 +2428,23 @@ class SlideReviewDialog(tk.Toplevel):
             self.tree["displaycolumns"] = ("num", "time", "title", "bullets", "status")
         self._refresh_tree()
 
+    def _toggle_view_mode(self):
+        """Switch between the list (Treeview) and thumbnail grid views
+        (task #78). Swaps which widget is packed into tree_frame; the
+        underlying data (self._row_refs, self._slides_by_video,
+        self._edits_by_video) is shared, so edits made in one view are
+        immediately visible after switching to the other."""
+        self._view_mode_grid = self.view_mode_var.get()
+        if self._view_mode_grid:
+            self.tree.pack_forget()
+            self.grid_canvas.pack(side="left", fill="both", expand=True)
+            self.grid_vsb.pack(side="right", fill="y")
+        else:
+            self.grid_canvas.pack_forget()
+            self.grid_vsb.pack_forget()
+            self.tree.pack(fill="both", expand=True)
+        self._refresh_tree()
+
     def _load_path(self, path: str, remember: bool = True):
         try:
             slides = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -2416,6 +2479,7 @@ class SlideReviewDialog(tk.Toplevel):
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         self._row_refs = []
+        self._grid_selected = set()
         self._show_preview(None)
         videos = self._videos if self._batch_mode else ([self._current_video] if self._current_video else [])
         for video in videos:
@@ -2441,10 +2505,114 @@ class SlideReviewDialog(tk.Toplevel):
                 self.tree.insert("", "end", iid=row_id, values=(
                     video_label, idx + 1, f"{slide.get('timestamp_sec', 0):.1f}s",
                     title, first_bullet, " + ".join(status_parts)))
+        if self._view_mode_grid:
+            self._refresh_grid()
+
+    def _refresh_grid(self):
+        """Rebuild the thumbnail grid (task #78) from self._row_refs -
+        the same data the list view's rows come from, computed just above
+        in _refresh_tree. Only called while grid view is active: staying
+        in (or switching back to) list view never runs this, so a large
+        batch overview never decodes images it isn't showing. Thumbnails
+        that were already decoded this session are reused from
+        self._grid_photos rather than re-read from disk."""
+        for child in self.grid_inner.winfo_children():
+            child.destroy()
+        self._grid_frames = {}
+        cols = 4
+        for i, (video, idx) in enumerate(self._row_refs):
+            slides = self._slides_by_video.get(video, [])
+            if idx >= len(slides):
+                continue
+            slide = slides[idx]
+            edits = self._edits_by_video.get(video) or self._blank_edits()
+            title_overrides = edits["title_overrides"]
+            title = title_overrides.get(str(idx), slide.get("title", "") or "(no title)")
+            status_parts = []
+            if idx in edits["omit_indices"]:
+                status_parts.append("OMIT")
+            if idx in edits["merge_next_indices"]:
+                status_parts.append("MERGE->next")
+            if str(idx) in title_overrides:
+                status_parts.append("EDITED")
+
+            cell = ttk.Frame(self.grid_inner, relief="groove", borderwidth=2, padding=4)
+            cell.grid(row=i // cols, column=i % cols, padx=4, pady=4, sticky="n")
+
+            photo = self._grid_thumbnail(slide.get("snapshot_path", ""))
+            if photo is not None:
+                img_label = ttk.Label(cell, image=photo)
+            else:
+                img_label = ttk.Label(cell, text="(no image)", width=20, anchor="center",
+                                      relief="flat")
+            img_label.pack()
+
+            caption = f"#{idx + 1}   {slide.get('timestamp_sec', 0):.1f}s"
+            if self._batch_mode:
+                caption = f"{Path(video).stem}\n{caption}"
+            caption += f"\n{title[:44]}"
+            if status_parts:
+                caption += f"\n[{' + '.join(status_parts)}]"
+            cap_label = ttk.Label(cell, text=caption, wraplength=160, justify="center",
+                                  font=("", 8))
+            cap_label.pack()
+
+            for widget in (cell, img_label, cap_label):
+                widget.bind("<Button-1>", lambda e, row=i: self._on_grid_click(row, e))
+
+            self._grid_frames[i] = cell
+        self._apply_grid_highlight()
+
+    def _grid_thumbnail(self, snapshot_path: str):
+        """Return a cached PhotoImage for snapshot_path, decoding and
+        caching it on first use. Returns None if there is no path, the
+        file is missing, or it fails to decode (caller shows a text
+        placeholder instead)."""
+        if not snapshot_path:
+            return None
+        if snapshot_path in self._grid_photos:
+            return self._grid_photos[snapshot_path]
+        if not Path(snapshot_path).exists():
+            return None
+        try:
+            with Image.open(snapshot_path) as img:
+                img = img.copy()
+            img.thumbnail((160, 120))
+            photo = ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+        self._grid_photos[snapshot_path] = photo
+        return photo
+
+    def _on_grid_click(self, row: int, event=None):
+        """Plain click selects only this cell (matches a fresh Treeview
+        click); Ctrl-click toggles it into/out of a multi-selection, same
+        spirit as extended Treeview selection. Also drives the preview
+        panel, same as clicking a list row."""
+        ctrl_held = bool(event is not None and (event.state & 0x4))
+        if ctrl_held:
+            if row in self._grid_selected:
+                self._grid_selected.discard(row)
+            else:
+                self._grid_selected.add(row)
+        else:
+            self._grid_selected = {row}
+        self._apply_grid_highlight()
+        if row < len(self._row_refs):
+            video, idx = self._row_refs[row]
+            slides = self._slides_by_video.get(video, [])
+            self._show_preview(slides[idx] if idx < len(slides) else None)
+
+    def _apply_grid_highlight(self):
+        for row, frame in self._grid_frames.items():
+            frame.configure(relief="solid" if row in self._grid_selected else "groove")
 
     def _selected_refs(self) -> list:
         """Selected rows as (video_path, slide_index) pairs, valid in
-        both single-video and batch-overview mode."""
+        both single-video and batch-overview mode, and in both the list
+        and thumbnail grid views (task #78)."""
+        if self._view_mode_grid:
+            return [self._row_refs[i] for i in sorted(self._grid_selected) if i < len(self._row_refs)]
         refs = []
         for iid in self.tree.selection():
             i = int(iid)
