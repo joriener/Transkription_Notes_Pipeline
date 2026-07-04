@@ -6,7 +6,8 @@ Rules:
 - Mark unclear passages with [unclear].
 - Consolidate redundant or repeated statements.
 - Remove filler words, off-topic passages, and irrelevant dialogue.
-- Identify speakers consistently (e.g. Speaker A, Speaker B) if names are not mentioned.
+- Identify only the actual participants who have their own speaking turns in this transcript (as shown by the speaker labels at the start of each turn), using Speaker A, Speaker B, etc. only for labels with no real name given.
+- Do not add anyone to the speaker list who is merely mentioned or referred to by name within someone else's speech but never has their own turn in the transcript.
 - Use only simple Markdown headings and flat lists that render correctly in OneNote.
 - No tables, no nested lists, no special formatting.
 - If a section contains no information, output the standard placeholder shown below.
@@ -18,7 +19,8 @@ Format the output EXACTLY as follows (keep headings unchanged):
 [2-4 sentences summarizing the recording clearly and neutrally]
 
 ## SPEAKERS
-- [Speaker A / Name]
+- [Only people with their own speaking turns in this transcript, exact label/name as shown]
+- [Do not list people who are only mentioned by name within the conversation]
 [If not identifiable: "Not specified"]
 
 ## KEY POINTS
