@@ -226,8 +226,7 @@ def save_notes_html(notes_text: str, output_path: Path, filename: str,
 
 def save_notes_docx(notes_text: str, output_path: Path, filename: str,
                     title: str = "MEETING NOTES", generated_by: str = "",
-                    event_date: str = "", comments: str = "",
-                    transcript_text: str = "") -> Path | None:
+                    event_date: str = "", comments: str = "") -> Path | None:
     """
     Write LLM notes/summary as a real Word document via python-docx.
     Mirrors save_notes_html's section/bullet parsing (_parse_notes_sections)
@@ -236,9 +235,6 @@ def save_notes_docx(notes_text: str, output_path: Path, filename: str,
     when set via the GUI's Meeting info fields.
     comments (optional): free-text from the GUI's Meeting info
     "Comments" field, shown below the date.
-    transcript_text (optional): when non-empty (docx_include_transcript
-    config flag), the full raw transcript is appended as a final section
-    on a fresh page, after the LLM notes.
     Returns the output path, or None if python-docx is not installed.
     """
     try:
@@ -288,16 +284,6 @@ def save_notes_docx(notes_text: str, output_path: Path, filename: str,
                 run.italic = True
             else:
                 doc.add_paragraph(item["text"])
-
-    if transcript_text.strip():
-        doc.add_page_break()
-        th = doc.add_heading("Full Transcript", level=1)
-        th.runs[0].font.color.rgb = RGBColor(0x1F, 0x5C, 0x99)
-        for line in transcript_text.splitlines():
-            if line.strip():
-                doc.add_paragraph(line)
-            else:
-                doc.add_paragraph()
 
     footer_p = doc.add_paragraph()
     footer_run = footer_p.add_run(

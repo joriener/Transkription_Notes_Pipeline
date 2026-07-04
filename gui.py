@@ -1260,7 +1260,6 @@ class RunTabController:
         self.notes_html_var = tk.BooleanVar(value=CONFIG["notes_format_html"])
         self.notes_pdf_var = tk.BooleanVar(value=CONFIG["notes_format_pdf"])
         self.notes_docx_var = tk.BooleanVar(value=CONFIG["notes_format_docx"])
-        self.docx_transcript_var = tk.BooleanVar(value=CONFIG.get("docx_include_transcript", False))
 
         top = ttk.Frame(parent)
         top.pack(fill="x", **pad)
@@ -1531,7 +1530,6 @@ class RunTabController:
         ttk.Checkbutton(formats, text="html", variable=self.notes_html_var).grid(row=0, column=2, sticky="w")
         ttk.Checkbutton(formats, text="pdf", variable=self.notes_pdf_var).grid(row=0, column=3, sticky="w")
         ttk.Checkbutton(formats, text="docx", variable=self.notes_docx_var).grid(row=0, column=4, sticky="w")
-        ttk.Checkbutton(formats, text="incl. transcript", variable=self.docx_transcript_var).grid(row=0, column=5, sticky="w")
 
         if is_video:
             ttk.Label(formats, text="Slide report:").grid(row=1, column=0, sticky="w", **pad)
@@ -2142,7 +2140,6 @@ class RunTabController:
             "notes_format_html":  self.notes_html_var.get(),
             "notes_format_pdf":   self.notes_pdf_var.get(),
             "notes_format_docx":  self.notes_docx_var.get(),
-            "docx_include_transcript": self.docx_transcript_var.get(),
             "meeting_title":      self.meeting_title_var.get().strip(),
             "meeting_date":       self.meeting_date_var.get().strip(),
             "meeting_comments":   self.meeting_comments_var.get().strip(),

@@ -735,7 +735,6 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                         notes_text, output_prefix + "_notes.docx", filename,
                         title=title, generated_by=cfg["llm_backend"], event_date=event_date,
                         comments=comments,
-                        transcript_text=transcript_text if cfg.get("docx_include_transcript", False) else "",
                     )
                 # Notes PDF: explicit toggle, or automatic when this was a
                 # video-with-slides run and slide-report PDFs are enabled
@@ -1601,8 +1600,7 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
     if cfg.get("notes_format_docx", False):
         reporter.save_notes_docx(notes_text, output_prefix + "_notes.docx", filename,
                                  title=title, generated_by=cfg["llm_backend"], event_date=event_date,
-                                 comments=comments,
-                                 transcript_text=transcript_text if cfg.get("docx_include_transcript", False) else "")
+                                 comments=comments)
     if cfg.get("notes_format_pdf", False):
         if notes_html_path is None:
             notes_html_path = reporter.save_notes_html(notes_text, output_prefix + "_notes.html", filename,

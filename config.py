@@ -278,13 +278,6 @@ CONFIG = {
     "notes_format_pdf":  False,  # PDF via reporter.save_pdf_from_html (Playwright/weasyprint/pdfkit)
     "notes_format_docx": False,  # real Word document via python-docx
 
-    # Append the full raw transcript as a final section of the Word doc
-    # (after the LLM notes, on a fresh page). Off by default: most runs
-    # just want the notes, and the plain-text transcript is already
-    # written separately as *_transcript_speakers.txt regardless of this
-    # setting. Only takes effect when notes_format_docx is also on.
-    "docx_include_transcript": False,
-
     # Slide-report formats (video mode only, each independently toggleable).
     "report_html": True,   # slide-index HTML report with thumbnails
     "report_csv":  True,   # slide-index CSV (Excel-compatible)
