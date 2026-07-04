@@ -679,6 +679,11 @@ class RunTabController:
         self.log_queue: queue.Queue = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        # Batch Treeview iids for the run currently in progress, in the same
+        # order/index as the rows passed to run_pipeline.run_batch_rows, so
+        # a "__BATCH_STATUS__:<i>:<status>" message from the worker thread
+        # can be mapped back to the right row (task #74).
+        self._batch_run_iids: list = []
 
         self._build()
         self.root.after(100, self._poll_log_queue)
@@ -838,13 +843,19 @@ class RunTabController:
             self.batch_columns = ("file", "language", "title", "date", "comments", "qa_start", "qa_end")
         else:
             self.batch_columns = ("file", "language", "title", "date", "comments")
-        self.batch_tree = ttk.Treeview(self.batch_frame, columns=self.batch_columns,
+        # "status" (task #74) is a display-only column, not part of
+        # batch_columns: it never feeds into gui_logic.build_batch_row and
+        # is deliberately excluded from CSV export, so the data schema the
+        # batch table round-trips stays unchanged.
+        self.batch_display_columns = self.batch_columns + ("status",)
+        self.batch_tree = ttk.Treeview(self.batch_frame, columns=self.batch_display_columns,
                                        show="headings", height=8)
         _all_labels = {"file": "File", "language": "Lang", "title": "Title", "date": "Date",
-                      "comments": "Comments", "qa_start": "Q&A start", "qa_end": "Q&A end"}
+                      "comments": "Comments", "qa_start": "Q&A start", "qa_end": "Q&A end",
+                      "status": "Status"}
         _all_widths = {"file": 300, "language": 55, "title": 140, "date": 85,
-                      "comments": 160, "qa_start": 75, "qa_end": 75}
-        for col in self.batch_columns:
+                      "comments": 160, "qa_start": 75, "qa_end": 75, "status": 90}
+        for col in self.batch_display_columns:
             self.batch_tree.heading(col, text=_all_labels[col])
             self.batch_tree.column(col, width=_all_widths[col], anchor="w")
         self.batch_tree.pack(fill="both", expand=True, padx=8, pady=(6, 4))
@@ -1382,12 +1393,25 @@ class RunTabController:
         Meeting-tab tables have no qa_start/qa_end columns at all.
         The actual transform is gui_logic.build_batch_row (pure,
         unit-tested); this just walks the Treeview rows."""
-        rows = []
+        return self._batch_rows_with_iids()[0]
+
+    def _batch_rows_with_iids(self) -> tuple:
+        """Like _batch_rows, but also returns the matching Treeview iid for
+        each row, in lockstep (same index a row lands at in the returned
+        list is the same index its iid lands at). A row with a blank file
+        cell is skipped in both lists together, so index i in the rows
+        list passed to run_pipeline.run_batch_rows always corresponds to
+        iid i in the iids list here - used by the live batch status
+        column (task #74) to map a "row N" progress update back to the
+        right Treeview row without depending on the row's original
+        on-screen position."""
+        rows, iids = [], []
         for iid in self.batch_tree.get_children():
             row = gui_logic.build_batch_row(self.batch_columns, self.batch_tree.item(iid, "values"))
             if row is not None:
                 rows.append(row)
-        return rows
+                iids.append(iid)
+        return rows, iids
 
     def _batch_add_files(self):
         patterns = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXTENSIONS))
@@ -1484,7 +1508,10 @@ class RunTabController:
                 writer = csv.writer(f)
                 writer.writerow(list(self.batch_columns))
                 for iid in self.batch_tree.get_children():
-                    writer.writerow(self.batch_tree.item(iid, "values"))
+                    # Trim off the display-only "status" column (task #74):
+                    # the exported CSV must stay in the plain data schema
+                    # _batch_load_path already knows how to re-import.
+                    writer.writerow(self.batch_tree.item(iid, "values")[:len(self.batch_columns)])
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
             return
@@ -1568,13 +1595,21 @@ class RunTabController:
         path = self.path_var.get().strip()
         batch_rows = None
 
+        self._batch_run_iids = []
         if mode == MODES[1]:
-            batch_rows = self._batch_rows()
+            batch_rows, batch_iids = self._batch_rows_with_iids()
             if not batch_rows and not path:
                 messagebox.showwarning(
                     "Missing input",
                     "Add files to the batch table above, or choose an existing list.txt.")
                 return
+            if batch_rows:
+                # Reset the Status column for this run (task #74): a
+                # re-run after edits/removals should not show stale
+                # "done"/"failed" labels from a previous run.
+                self._batch_run_iids = batch_iids
+                for iid in batch_iids:
+                    self.batch_tree.set(iid, "status", "")
             if batch_rows and self.kind == "video":
                 for iid in self.batch_tree.get_children():
                     vals = dict(zip(self.batch_columns, self.batch_tree.item(iid, "values")))
@@ -1714,7 +1749,11 @@ class RunTabController:
                 self.log_queue.put("=== DONE (success) ===" if ok else "=== DONE (failed/stopped) ===")
             elif mode == MODES[1]:
                 if batch_rows:
-                    run_pipeline.run_batch_rows(batch_rows, overrides, stop_check=self.stop_event.is_set)
+                    run_pipeline.run_batch_rows(
+                        batch_rows, overrides, stop_check=self.stop_event.is_set,
+                        progress_callback=lambda i, status: self.log_queue.put(
+                            f"__BATCH_STATUS__:{i}:{status}"),
+                    )
                 else:
                     run_pipeline.run_file_list(path, overrides, stop_check=self.stop_event.is_set)
                 self.log_queue.put("=== BATCH DONE ===")
@@ -1754,6 +1793,21 @@ class RunTabController:
                     self.status_label.config(text="Ready.")
                     self.progress_var.set(0)
                     self.stage_label.config(text="")
+                    continue
+                if line.startswith("__BATCH_STATUS__:"):
+                    # "__BATCH_STATUS__:<i>:<status>" (task #74): <i> is the
+                    # row's 1-based position among rows actually passed to
+                    # run_pipeline.run_batch_rows, matching self._batch_run_iids
+                    # 1:1 (see _batch_rows_with_iids). Never shown in the log
+                    # text itself - it is purely a control message for the
+                    # Status column.
+                    try:
+                        _, idx_str, status = line.split(":", 2)
+                        idx = int(idx_str) - 1
+                        if 0 <= idx < len(self._batch_run_iids):
+                            self.batch_tree.set(self._batch_run_iids[idx], "status", status)
+                    except (ValueError, IndexError):
+                        pass
                     continue
                 for marker, pct, label in STAGE_PROGRESS:
                     if marker in line:

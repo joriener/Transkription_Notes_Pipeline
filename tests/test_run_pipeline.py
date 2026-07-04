@@ -226,3 +226,114 @@ class TestRunBatchRows:
         rows = [{"file": str(tmp_path / "bad.mp4")}, {"file": str(tmp_path / "good.mp4")}]
         run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
         assert len(calls) == 2
+
+
+# -----------------------------------------------------------------
+# run_batch_rows: progress_callback (task #74)
+# -----------------------------------------------------------------
+
+class TestRunBatchRowsProgressCallback:
+    def _patch_db(self, monkeypatch, completed_files=()):
+        monkeypatch.setattr(db, "validate_schema", lambda path: True)
+        monkeypatch.setattr(db, "get_connection", lambda path: FakeConn())
+
+        def fake_get_completed(conn, file_path):
+            if file_path in completed_files:
+                return {"processed_at": "2026-01-01T00:00:00"}
+            return None
+
+        monkeypatch.setattr(db, "get_completed_transcript", fake_get_completed)
+
+    def test_running_then_done_on_success(self, monkeypatch, tmp_path):
+        self._patch_db(monkeypatch)
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        events = []
+        rows = [{"file": str(tmp_path / "a.mp4")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
+                                    progress_callback=lambda i, status: events.append((i, status)))
+        assert events == [(1, "running"), (1, "done")]
+
+    def test_failed_status_when_process_file_returns_false(self, monkeypatch, tmp_path):
+        self._patch_db(monkeypatch)
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: False)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        events = []
+        rows = [{"file": str(tmp_path / "a.mp4")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
+                                    progress_callback=lambda i, status: events.append((i, status)))
+        assert events == [(1, "running"), (1, "failed")]
+
+    def test_skipped_status_for_already_done_row(self, monkeypatch, tmp_path):
+        done_file = str(tmp_path / "done.mp4")
+        self._patch_db(monkeypatch, completed_files={done_file})
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        events = []
+        rows = [{"file": done_file}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
+                                    progress_callback=lambda i, status: events.append((i, status)))
+        assert events == [(1, "skipped")]
+
+    def test_error_status_on_exception(self, monkeypatch, tmp_path):
+        self._patch_db(monkeypatch)
+
+        def fake_process_file(file, overrides, stop_check=None):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(run_pipeline, "process_file", fake_process_file)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        events = []
+        rows = [{"file": str(tmp_path / "a.mp4")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
+                                    progress_callback=lambda i, status: events.append((i, status)))
+        assert events == [(1, "running"), (1, "error")]
+
+    def test_index_matches_row_position_skipping_blank_files(self, monkeypatch, tmp_path):
+        """A blank-file row is skipped before ever reaching the loop body,
+        so it must not consume an index - the visible index always matches
+        enumerate(rows, 1) counting from the row's actual list position."""
+        self._patch_db(monkeypatch)
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        events = []
+        rows = [{"file": ""}, {"file": str(tmp_path / "a.mp4")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
+                                    progress_callback=lambda i, status: events.append((i, status)))
+        assert events == [(2, "running"), (2, "done")]
+
+    def test_none_callback_does_not_raise(self, monkeypatch, tmp_path):
+        self._patch_db(monkeypatch)
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        rows = [{"file": str(tmp_path / "a.mp4")}]
+        # No progress_callback given at all - must behave exactly like the
+        # pre-task-#74 signature, no exception.
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
+
+    def test_callback_exception_is_swallowed(self, monkeypatch, tmp_path):
+        """A GUI display glitch inside the callback must never take down
+        the batch run itself."""
+        self._patch_db(monkeypatch)
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        def bad_callback(i, status):
+            raise ValueError("boom from GUI")
+
+        rows = [{"file": str(tmp_path / "a.mp4")}]
+        # Must not raise, and process_file must still have been called.
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
+                                    progress_callback=bad_callback)

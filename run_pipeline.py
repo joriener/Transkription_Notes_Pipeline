@@ -1062,7 +1062,7 @@ def run_file_list(list_file: str, overrides: dict, stop_check=None) -> None:
     log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
 
 
-def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None) -> None:
+def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None, progress_callback=None) -> None:
     """
     Batch-process a list of per-file row dicts (task #62), built from the
     GUI's editable batch table. Unlike run_file_list's "path|lang" text
@@ -1078,7 +1078,23 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None) -> None:
     Resume/retry and logging mirror run_file_list: a file already fully
     processed (notes generated) is skipped unless force_retranscribe is
     set, and a per-run log is written next to the first file's folder.
+
+    progress_callback(index, status) (task #74), if given, is called with
+    the row's 1-based position in rows (matching enumerate(rows, 1) below,
+    i.e. counting only rows that reach this loop body - a row with a blank
+    "file" is skipped before ever incrementing the visible index) and one
+    of "running", "done", "failed", "error", "skipped". Used by the GUI to
+    drive a live Status column in the batch table; never raises on its
+    own account (any exception from the callback itself is swallowed, so
+    a GUI display glitch can't take down a batch run).
     """
+    def _report(index: int, status: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(index, status)
+            except Exception:
+                pass
+
     cfg = build_run_config(overrides)
     force = bool(cfg.get("force_retranscribe"))
     db.validate_schema(cfg["db_path"])
@@ -1114,9 +1130,11 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None) -> None:
                          i, len(rows), done.get("processed_at", "?"), file)
                 write_log(log_file, f"[{i}] SKIPPED (already done {done.get('processed_at','?')}): {file}")
                 skipped += 1
+                _report(i, "skipped")
                 continue
 
         log.info("[%d/%d] %s", i, len(rows), file)
+        _report(i, "running")
         t_start = datetime.now()
         run_overrides = dict(overrides)
         for key in row_override_keys:
@@ -1129,12 +1147,14 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None) -> None:
             write_log(log_file, f"[{i}] {'OK' if success else 'NOT FOUND'} ({dur}s): {file}")
             ok += 1 if success else 0
             errors += 0 if success else 1
+            _report(i, "done" if success else "failed")
         except Exception as e:
             dur = (datetime.now() - t_start).seconds
             log.error("ERROR: %s", e)
             write_log(log_file, f"[{i}] ERROR ({dur}s): {file} -- {e}")
             write_log(log_file, traceback.format_exc())
             errors += 1
+            _report(i, "error")
     write_log(log_file, f"Done: OK={ok} Errors={errors} Skipped={skipped}")
     log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
 
