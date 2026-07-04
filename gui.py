@@ -701,6 +701,9 @@ class RunTabController:
         rec_box.bind("<<ComboboxSelected>>", lambda e: self._apply_recording_type())
         ttk.Label(rec_frame, text="Sets the prompt template below; still editable afterward.",
                  foreground="#666").pack(side="left", padx=(12, 0))
+        other_tab_label = "Video/Webinar" if self.kind == "meeting" else "Meeting"
+        ttk.Button(rec_frame, text=f"Copy settings to {other_tab_label} tab...",
+                  command=self._copy_settings_to_other_tab).pack(side="right", padx=8)
 
         # --- Meeting info (optional) ---
         meeting_frame = ttk.LabelFrame(parent, text="Meeting info (optional)")
@@ -1027,6 +1030,28 @@ class RunTabController:
         meeting info/Q&A fields."""
         raw = {k: v.get() for k, v in self._state_vars.items()}
         return gui_logic.build_state_dict(self.kind, raw)
+
+    def _copy_settings_to_other_tab(self):
+        """Task #72: copy whisper model, language, LLM backend, and the
+        diarization/no-summary/force-retranscribe toggles to the other
+        tab (Meeting <-> Video/Webinar). Deliberately narrower than
+        gui_state.json's persisted keys - NOT the prompt template (each
+        tab has its own presets/recording types) and NOT meeting info,
+        path, or batch table contents (see gui_logic.COPYABLE_KEYS)."""
+        other = self.app.video_run if self.kind == "meeting" else self.app.meeting_run
+        raw = {k: v.get() for k, v in self._state_vars.items()}
+        settings = gui_logic.extract_copyable_settings(raw)
+        for key, value in settings.items():
+            var = other._state_vars.get(key)
+            if var is not None:
+                try:
+                    var.set(value)
+                except Exception:
+                    pass
+        other.status_label.config(text=f"Settings copied from the {self._label()} tab.")
+
+    def _label(self) -> str:
+        return "Video/Webinar" if self.kind == "video" else "Meeting"
 
     def _apply_recording_type(self):
         preset = self._recording_types.get(self.recording_type_var.get())

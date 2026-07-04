@@ -240,6 +240,28 @@ class TestLoadSaveStateFile:
         assert gui_logic.save_state_file(bad_path, {"meeting": {}}) is False
 
 
+class TestExtractCopyableSettings:
+    def test_keeps_only_copyable_keys(self):
+        raw = {
+            "whisper_model": "large-v3", "language": "de", "llm_backend": "ollama",
+            "enable_diarization": True, "no_summary": False, "force_retranscribe": False,
+            "prompt_template": "webinar", "recording_type": "Webinar Transcript",
+            "enable_slides": True, "output_dir": "/tmp/out",
+        }
+        out = gui_logic.extract_copyable_settings(raw)
+        assert out == {
+            "whisper_model": "large-v3", "language": "de", "llm_backend": "ollama",
+            "enable_diarization": True, "no_summary": False, "force_retranscribe": False,
+        }
+
+    def test_missing_keys_are_skipped(self):
+        out = gui_logic.extract_copyable_settings({"whisper_model": "base"})
+        assert out == {"whisper_model": "base"}
+
+    def test_empty_input_returns_empty(self):
+        assert gui_logic.extract_copyable_settings({}) == {}
+
+
 class TestCsvHeaderIndex:
     def test_recognized_header(self):
         idx = gui_logic.csv_header_index(

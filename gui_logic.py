@@ -202,3 +202,26 @@ def save_state_file(path, state: dict) -> bool:
         return True
     except OSError:
         return False
+
+
+# =============================================================
+# "Copy settings to other tab" (task #72)
+#
+# Deliberately narrower than the persisted-settings key set: only the
+# handful of values that make sense to share between a meeting run and a
+# video/webinar run of the SAME source material. Explicitly excluded:
+# prompt_template (each tab has its own presets), recording_type, every
+# video-only key, and of course path/batch table/meeting info/Q&A.
+# =============================================================
+
+COPYABLE_KEYS = (
+    "whisper_model", "language", "llm_backend",
+    "enable_diarization", "no_summary", "force_retranscribe",
+)
+
+
+def extract_copyable_settings(values: dict) -> dict:
+    """Filter a dict of {key: current_value} down to just COPYABLE_KEYS,
+    dropping anything else. Used by "Copy settings to other tab" to build
+    the value set copied from one RunTabController to the other."""
+    return {k: values[k] for k in COPYABLE_KEYS if k in values}
