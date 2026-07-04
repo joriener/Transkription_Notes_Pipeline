@@ -51,6 +51,14 @@ LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 MODES = ["Single file", "File list (batch)", "Folder (auto-discover)",
         "Notes-only (existing transcript)", "Notes-batch (folder)"]
 
+# Persisted GUI settings (task #71): last-used model/language/backend/
+# prompt template/thresholds/output folder/stage checkboxes per tab, so
+# reopening the GUI doesn't reset to config.py's defaults every time.
+# Gitignored; see gui_logic.py's "Persisted GUI settings" section for the
+# exact key list and what is deliberately excluded (path, batch table,
+# meeting info, Q&A times).
+STATE_PATH = Path(__file__).parent / gui_logic.STATE_FILENAME
+
 # Recording-type presets, split per tab (Meeting vs Video/Webinar): picking
 # one sets the prompt template. Slide detection/VLM are no longer part of
 # the preset since each tab already fixes that (Meeting tab never runs
@@ -132,7 +140,20 @@ class PipelineGUI:
         self.meeting_run = RunTabController(self.meeting_tab, "meeting", self)
         self.video_run = RunTabController(self.video_tab, "video", self)
 
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._poll_req_queue)
+
+    def _on_close(self):
+        """Persist both tabs' settings to gui_state.json (task #71)
+        before closing: whisper model, language, LLM backend, prompt
+        template, thresholds, output folder, and stage checkboxes. Never
+        blocks shutdown - save_state_file swallows I/O errors."""
+        state = {
+            "meeting": self.meeting_run._collect_persisted_state(),
+            "video": self.video_run._collect_persisted_state(),
+        }
+        gui_logic.save_state_file(STATE_PATH, state)
+        self.root.destroy()
 
     # -----------------------------------------------------------------
     # Scrollable tab helper (task #63), shared by both RunTabControllers
@@ -935,9 +956,77 @@ class RunTabController:
         self.log_text = scrolledtext.ScrolledText(log_frame, state="disabled", height=16, wrap="word")
         self.log_text.pack(fill="both", expand=True)
 
+        # --- Persisted settings (task #71) ---
+        # Maps each gui_logic.persisted_keys_for(self.kind) key to the
+        # tkinter Variable holding it, so _apply_persisted_state/
+        # _collect_persisted_state can read/write them generically.
+        self._state_vars = {
+            "recording_type":    self.recording_type_var,
+            "prompt_template":   self.prompt_var,
+            "whisper_model":     self.whisper_model_var,
+            "language":          self.language_var,
+            "llm_backend":       self.llm_backend_var,
+            "output_dir":        self.output_dir_var,
+            "enable_diarization": self.enable_diarization_var,
+            "no_summary":        self.no_summary_var,
+            "force_retranscribe": self.force_retranscribe_var,
+        }
+        if is_video:
+            self._state_vars.update({
+                "enable_slides":      self.enable_slides_var,
+                "enable_vlm":         self.enable_vlm_var,
+                "hash_threshold":     self.threshold_var,
+                "animation_threshold": self.animation_threshold_var,
+                "fps":                self.fps_var,
+                "min_slide_duration_sec": self.min_slide_duration_var,
+                "recording_speed":    self.recording_speed_var,
+                "convert_video_to_realtime": self.convert_video_to_realtime_var,
+                "report_html":        self.report_html_var,
+                "report_csv":         self.report_csv_var,
+                "report_json":        self.report_json_var,
+                "report_srt":         self.report_srt_var,
+                "report_pdf":         self.report_pdf_var,
+                "report_slide_timing": self.report_slide_timing_var,
+                "zip_snapshots":      self.zip_snapshots_var,
+                "report_show_image":      self.report_show_image_var,
+                "report_show_bullets":    self.report_show_bullets_var,
+                "report_show_transcript": self.report_show_transcript_var,
+                "report_transcript_mode": self.report_transcript_mode_var,
+            })
+
         self._apply_recording_type()
         self._refresh_prompt_templates()
+        self._apply_persisted_state()
         self._update_path_label()
+
+    def _apply_persisted_state(self):
+        """Task #71: restore this tab's last-used settings from
+        gui_state.json, if any. Called after _apply_recording_type/
+        _refresh_prompt_templates so a saved prompt_template correctly
+        wins over the recording-type preset's default. Missing file,
+        first run, or a corrupt gui_state.json are all silently treated
+        as "nothing saved yet" (see gui_logic.load_state_file)."""
+        state = gui_logic.load_state_file(STATE_PATH)
+        saved = state.get(self.kind) or {}
+        if not saved:
+            return
+        defaults = {k: v.get() for k, v in self._state_vars.items()}
+        merged = gui_logic.merge_persisted_state(self.kind, saved, defaults)
+        for key, var in self._state_vars.items():
+            if key == "recording_type" and merged[key] not in self._recording_types:
+                continue
+            try:
+                var.set(merged[key])
+            except Exception:
+                pass
+
+    def _collect_persisted_state(self) -> dict:
+        """Task #71: snapshot this tab's current settings for
+        gui_state.json, filtered to just the keys this tab kind persists
+        (gui_logic.build_state_dict) - never the path, batch table, or
+        meeting info/Q&A fields."""
+        raw = {k: v.get() for k, v in self._state_vars.items()}
+        return gui_logic.build_state_dict(self.kind, raw)
 
     def _apply_recording_type(self):
         preset = self._recording_types.get(self.recording_type_var.get())

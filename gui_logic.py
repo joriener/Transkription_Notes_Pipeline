@@ -7,6 +7,9 @@
 #  never the other way around).
 # =============================================================
 
+import json
+from pathlib import Path
+
 
 def parse_time_to_seconds(text: str) -> float | None:
     """
@@ -102,3 +105,100 @@ def csv_header_index(header, known_cols) -> dict:
     if not (known_cols & set(lowered)):
         return {}
     return {name: lowered.index(name) for name in known_cols if name in lowered}
+
+
+# =============================================================
+# Persisted GUI settings (task #71)
+#
+# gui_state.json (gitignored, lives next to gui.py) remembers the last
+# whisper model/language/LLM backend/prompt template/thresholds/output
+# folder/stage checkboxes used on each of the Meeting and Video/Webinar
+# tabs, so re-opening the GUI doesn't reset them to config.py's defaults
+# every time. Deliberately NOT persisted: the file/folder path, batch
+# table contents, or meeting title/date/comments/Q&A times - those
+# describe one specific run, not a lasting preference.
+# =============================================================
+
+STATE_FILENAME = "gui_state.json"
+
+# Keys persisted for every Run tab (Meeting and Video/Webinar).
+PERSISTED_KEYS_COMMON = (
+    "recording_type", "prompt_template", "whisper_model", "language",
+    "llm_backend", "output_dir", "enable_diarization", "no_summary",
+    "force_retranscribe",
+)
+
+# Additional keys persisted only for the Video/Webinar tab.
+PERSISTED_KEYS_VIDEO_ONLY = (
+    "enable_slides", "enable_vlm", "hash_threshold", "animation_threshold",
+    "fps", "min_slide_duration_sec", "recording_speed",
+    "convert_video_to_realtime", "report_html", "report_csv", "report_json",
+    "report_srt", "report_pdf", "report_slide_timing", "zip_snapshots",
+    "report_show_image", "report_show_bullets", "report_show_transcript",
+    "report_transcript_mode",
+)
+
+
+def persisted_keys_for(kind: str) -> tuple:
+    """Which settings keys get saved/restored for this tab kind ("meeting"
+    or "video")."""
+    if kind == "video":
+        return PERSISTED_KEYS_COMMON + PERSISTED_KEYS_VIDEO_ONLY
+    return PERSISTED_KEYS_COMMON
+
+
+def build_state_dict(kind: str, values: dict) -> dict:
+    """
+    Filter a dict of {key: current_value} down to only the keys this tab
+    kind persists, dropping anything else (e.g. a key that doesn't apply
+    to this kind, or isn't meant to be persisted at all). Used when
+    snapshotting a tab's settings to write into gui_state.json.
+    """
+    keys = persisted_keys_for(kind)
+    return {k: values[k] for k in keys if k in values}
+
+
+def merge_persisted_state(kind: str, saved: dict, defaults: dict) -> dict:
+    """
+    Return defaults with any matching, persistable key from saved applied
+    on top. Keys in saved that this kind doesn't persist (e.g. left over
+    from an older gui_state.json, or a video-only key under "meeting")
+    are ignored rather than applied.
+    """
+    keys = set(persisted_keys_for(kind))
+    merged = dict(defaults)
+    for k, v in (saved or {}).items():
+        if k in keys:
+            merged[k] = v
+    return merged
+
+
+def load_state_file(path) -> dict:
+    """
+    Read gui_state.json. Returns {} if the file is missing, empty, or not
+    valid JSON, and if its top level isn't an object - persisted settings
+    are a convenience, never a reason to fail GUI startup.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state_file(path, state: dict) -> bool:
+    """
+    Write gui_state.json (pretty-printed for easy manual inspection/
+    editing). Returns False instead of raising on failure (e.g. a
+    read-only folder) - losing persisted settings should never block
+    closing the app.
+    """
+    try:
+        Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
+    except OSError:
+        return False

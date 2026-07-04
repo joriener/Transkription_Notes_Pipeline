@@ -154,6 +154,92 @@ class TestParseListLine:
 # csv_header_index
 # -----------------------------------------------------------------
 
+class TestPersistedKeysFor:
+    def test_video_includes_common_and_video_only(self):
+        keys = gui_logic.persisted_keys_for("video")
+        assert "whisper_model" in keys
+        assert "enable_slides" in keys
+        assert "hash_threshold" in keys
+
+    def test_meeting_excludes_video_only(self):
+        keys = gui_logic.persisted_keys_for("meeting")
+        assert "whisper_model" in keys
+        assert "enable_slides" not in keys
+        assert "hash_threshold" not in keys
+
+
+class TestBuildStateDict:
+    def test_drops_unpersisted_keys(self):
+        raw = {"whisper_model": "large-v3", "path_var": "/tmp/a.mp4", "enable_slides": True}
+        out = gui_logic.build_state_dict("meeting", raw)
+        assert out == {"whisper_model": "large-v3"}
+
+    def test_video_keeps_video_only_keys(self):
+        raw = {"whisper_model": "large-v3", "enable_slides": True, "fps": 3}
+        out = gui_logic.build_state_dict("video", raw)
+        assert out == {"whisper_model": "large-v3", "enable_slides": True, "fps": 3}
+
+    def test_missing_keys_are_skipped_not_defaulted(self):
+        out = gui_logic.build_state_dict("meeting", {"whisper_model": "base"})
+        assert out == {"whisper_model": "base"}
+
+
+class TestMergePersistedState:
+    def test_saved_overrides_defaults(self):
+        defaults = {"whisper_model": "base", "language": "auto"}
+        saved = {"whisper_model": "large-v3"}
+        merged = gui_logic.merge_persisted_state("meeting", saved, defaults)
+        assert merged == {"whisper_model": "large-v3", "language": "auto"}
+
+    def test_unrecognized_saved_key_ignored(self):
+        defaults = {"whisper_model": "base"}
+        saved = {"whisper_model": "large-v3", "some_future_key": "x"}
+        merged = gui_logic.merge_persisted_state("meeting", saved, defaults)
+        assert "some_future_key" not in merged
+
+    def test_video_only_key_ignored_for_meeting_kind(self):
+        """A gui_state.json that somehow has a video-only key under
+        "meeting" (e.g. hand-edited, or a downgrade from a future
+        version) must not leak into the meeting tab's settings."""
+        defaults = {"whisper_model": "base"}
+        saved = {"whisper_model": "large-v3", "enable_slides": True}
+        merged = gui_logic.merge_persisted_state("meeting", saved, defaults)
+        assert "enable_slides" not in merged
+
+    def test_empty_saved_returns_defaults_unchanged(self):
+        defaults = {"whisper_model": "base", "language": "auto"}
+        assert gui_logic.merge_persisted_state("meeting", {}, defaults) == defaults
+        assert gui_logic.merge_persisted_state("meeting", None, defaults) == defaults
+
+
+class TestLoadSaveStateFile:
+    def test_load_missing_file_returns_empty_dict(self, tmp_path):
+        assert gui_logic.load_state_file(tmp_path / "nope.json") == {}
+
+    def test_load_corrupt_json_returns_empty_dict(self, tmp_path):
+        p = tmp_path / "gui_state.json"
+        p.write_text("not valid json{{{", encoding="utf-8")
+        assert gui_logic.load_state_file(p) == {}
+
+    def test_load_non_object_json_returns_empty_dict(self, tmp_path):
+        p = tmp_path / "gui_state.json"
+        p.write_text("[1, 2, 3]", encoding="utf-8")
+        assert gui_logic.load_state_file(p) == {}
+
+    def test_save_then_load_round_trip(self, tmp_path):
+        p = tmp_path / "gui_state.json"
+        state = {"meeting": {"whisper_model": "large-v3"}, "video": {"fps": 3}}
+        assert gui_logic.save_state_file(p, state) is True
+        assert gui_logic.load_state_file(p) == state
+
+    def test_save_to_unwritable_path_returns_false_not_raises(self, tmp_path):
+        # A directory used as the target file path can't be opened for
+        # writing - save_state_file must swallow the OSError.
+        bad_path = tmp_path / "a_directory"
+        bad_path.mkdir()
+        assert gui_logic.save_state_file(bad_path, {"meeting": {}}) is False
+
+
 class TestCsvHeaderIndex:
     def test_recognized_header(self):
         idx = gui_logic.csv_header_index(
