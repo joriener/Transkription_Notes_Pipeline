@@ -465,6 +465,7 @@ class PipelineGUI:
         db_frame = ttk.LabelFrame(parent, text="Database")
         db_frame.pack(fill="x", **pad)
         self.db_path_var = tk.StringVar(value=CONFIG["db_path"])
+        self.db_browser_path_var = tk.StringVar(value=CONFIG.get("db_browser_path", ""))
         ttk.Label(db_frame, text="Current file:").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(db_frame, textvariable=self.db_path_var, width=60).grid(
             row=0, column=1, sticky="we", columnspan=3, padx=8)
@@ -475,6 +476,8 @@ class PipelineGUI:
         ttk.Button(db_btn_row, text="New database...", command=self._db_new).pack(side="left", padx=(8, 0))
         ttk.Button(db_btn_row, text="Rename current...", command=self._db_rename).pack(side="left", padx=(8, 0))
         ttk.Button(db_btn_row, text="Refresh stats", command=self._refresh_db_stats).pack(side="left", padx=(8, 0))
+        ttk.Button(db_btn_row, text="Open in DB Browser for SQLite...",
+                  command=self._open_in_db_browser).pack(side="left", padx=(8, 0))
         self.db_stats_label = ttk.Label(db_frame, text="", foreground="#444")
         self.db_stats_label.grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 8))
 
@@ -645,6 +648,58 @@ class PipelineGUI:
             return
         self.db_path_var.set(new_path)
         self._refresh_db_stats()
+
+    def _find_db_browser(self) -> str:
+        """Return a usable "DB Browser for SQLite" executable path, or ""
+        if none can be found (task #75). Checks (in order): a path already
+        browsed for this session, config.py's db_browser_path, PATH, and
+        the standard Windows install locations (both Program Files and
+        Program Files (x86), since the official installer offers either)."""
+        for candidate in (
+            self.db_browser_path_var.get().strip(),
+            CONFIG.get("db_browser_path", "").strip(),
+        ):
+            if candidate and Path(candidate).exists():
+                return candidate
+        for name in ("DB Browser for SQLite", "sqlitebrowser"):
+            found = shutil.which(name)
+            if found:
+                return found
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                    os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            default = Path(base) / "DB Browser for SQLite" / "DB Browser for SQLite.exe"
+            if default.exists():
+                return str(default)
+        return ""
+
+    def _open_in_db_browser(self):
+        """Launch DB Browser for SQLite (free, MIT-licensed SQLite GUI
+        editor, https://sqlitebrowser.org/) against the current database
+        file, for manual inspection/editing (task #75). Does not touch the
+        pipeline in any way - purely a convenience launcher, same pattern
+        as RunTabController._open_in_losslesscut."""
+        db_path = self.db_path_var.get().strip()
+        if not db_path or not Path(db_path).exists():
+            messagebox.showwarning("No database", "Current database file does not exist yet. "
+                                   "Run the pipeline once, or use \"New database...\" above.")
+            return
+        exe = self._find_db_browser()
+        if not exe:
+            messagebox.showinfo(
+                "DB Browser for SQLite not found",
+                "Could not auto-detect DB Browser for SQLite. Free download:\n"
+                "https://sqlitebrowser.org/dl/\n\n"
+                "Select the DB Browser for SQLite executable on the next screen.")
+            exe = filedialog.askopenfilename(
+                title="Select DB Browser for SQLite executable",
+                filetypes=[("DB Browser for SQLite", "*.exe"), ("All files", "*.*")])
+            if not exe:
+                return
+            self.db_browser_path_var.set(exe)
+        try:
+            subprocess.Popen([exe, db_path])
+        except Exception as exc:
+            messagebox.showerror("Could not launch DB Browser for SQLite", str(exc))
 
 
 class RunTabController:

@@ -148,6 +148,13 @@ CONFIG = {
                               # auto-detect common install locations, or browse for it once when
                               # prompted (remembered for the session).
 
+    "db_browser_path": "",  # Full path to DB Browser for SQLite (free, MIT licence,
+                             # https://sqlitebrowser.org/). Used by the GUI Settings tab's
+                             # "Open in DB Browser for SQLite" button (task #75) to inspect/edit
+                             # the pipeline database directly, opened against db_path. Leave
+                             # blank to auto-detect common install locations, or browse for it
+                             # once when prompted (remembered for the session).
+
     # =========================================================
     # VLM SLIDE ANNOTATION  (Ollama vision model, video mode only)
     # =========================================================
