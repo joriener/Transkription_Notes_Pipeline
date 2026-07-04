@@ -193,7 +193,7 @@ CONFIG = {
     # =========================================================
     # SPEAKER DIARIZATION  (pyannote, optional)
     # =========================================================
-    "enable_diarization":       False,
+    "enable_diarization":       True,
     "hf_token":                 _KEYS.get("HF_TOKEN", ""),
     "diarization_min_speakers": None,
     "diarization_max_speakers": None,
@@ -210,7 +210,7 @@ CONFIG = {
     # a voice as new; the Rename Speakers dialog always shows the
     # suggestion for confirmation rather than applying it silently.
     # =========================================================
-    "enable_speaker_id":        False,
+    "enable_speaker_id":        True,
     "speaker_id_threshold":     0.75,
 
     # =========================================================

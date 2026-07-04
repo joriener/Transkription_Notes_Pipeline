@@ -65,8 +65,20 @@ def _get_inference(hf_token: str, device: str = "cpu"):
     if Inference is None:
         raise RuntimeError("pyannote.audio is not installed.")
 
+    # token= is the current, correct keyword (huggingface_hub deprecated
+    # use_auth_token=; recent versions silently fail to forward it,
+    # producing an anonymous request and a 401 instead of raising an
+    # error, even with a fully valid, correctly-scoped token). This is
+    # the exact same class of issue transcriber.py already documents for
+    # whisperx's DiarizationPipeline (token=, not use_auth_token=), just
+    # not caught here yet when this module was first written. Try the
+    # current form first, fall back to the deprecated one only if the
+    # installed pyannote.audio is old enough to not accept token= at all.
     try:
-        model = Model.from_pretrained(EMBEDDING_MODEL_NAME, use_auth_token=hf_token)
+        try:
+            model = Model.from_pretrained(EMBEDDING_MODEL_NAME, token=hf_token)
+        except TypeError:
+            model = Model.from_pretrained(EMBEDDING_MODEL_NAME, use_auth_token=hf_token)
         inference = Inference(model, window="whole")
         inference.to_device = device  # best-effort; pyannote handles device internally too
     except Exception as exc:
