@@ -2604,8 +2604,18 @@ class SpeakerRenameDialog(tk.Toplevel):
         ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="right")
         ttk.Button(btn_row, text="Cancel", command=self._on_close).pack(side="right", padx=(0, 6))
 
+        # Tracks whether _compute_suggestions_worker is still running (V1.20).
+        # _apply() checks this before committing to known_speakers: without
+        # it, clicking Apply while the background pyannote embedding
+        # extraction is still in flight silently skipped roster enrollment
+        # entirely (self._suggestions was still {} at that point), with no
+        # error and no log line, since renaming itself never depended on
+        # suggestions being ready.
+        self._suggestions_pending = False
+
         if self.controller.app.enable_speaker_id_var.get():
             if self.source_media_path and Path(self.source_media_path).exists():
+                self._suggestions_pending = True
                 self._status_var.set("Computing voiceprint suggestions...")
                 threading.Thread(target=self._compute_suggestions_worker, daemon=True).start()
                 self.after(200, self._poll_suggestions_queue)
@@ -2633,6 +2643,7 @@ class SpeakerRenameDialog(tk.Toplevel):
         except queue.Empty:
             self.after(200, self._poll_suggestions_queue)
             return
+        self._suggestions_pending = False
         if status == "error":
             self._status_var.set(f"Voiceprint suggestions failed: {payload}")
             return
@@ -2688,6 +2699,16 @@ class SpeakerRenameDialog(tk.Toplevel):
         if not mapping:
             messagebox.showinfo("Nothing to rename", "No labels were changed.")
             return
+        if self._suggestions_pending:
+            proceed = messagebox.askyesno(
+                "Voiceprint suggestions still computing",
+                "Voiceprint suggestions for this file are still being computed "
+                "in the background. The rename itself will work normally "
+                "either way, but if you continue now, none of these speakers "
+                "will be added to your known-speakers roster this time.\n\n"
+                "Continue without waiting?")
+            if not proceed:
+                return
         regenerate_notes = self.regenerate_notes_var.get()
         segments_json_path = self.segments_json_path
         speaker_suggestions = self._suggestions
