@@ -199,6 +199,21 @@ CONFIG = {
     "diarization_max_speakers": None,
 
     # =========================================================
+    # SPEAKER IDENTIFICATION (task #79, pyannote voiceprints, optional)
+    #
+    # Builds a global, cross-meeting roster of known speakers in
+    # known_speakers (see db.py). Requires enable_diarization above (there
+    # is nothing to identify without per-segment speaker labels first) and
+    # the same hf_token, since it reuses the pyannote.audio install that
+    # whisperx already pulls in. speaker_id_threshold is the minimum cosine
+    # similarity (0-1) to auto-suggest an existing name instead of treating
+    # a voice as new; the Rename Speakers dialog always shows the
+    # suggestion for confirmation rather than applying it silently.
+    # =========================================================
+    "enable_speaker_id":        False,
+    "speaker_id_threshold":     0.75,
+
+    # =========================================================
     # NOTES / SUMMARY GENERATION  (LLM)
     # =========================================================
     # Filename (relative to prompts_dir) of the Markdown prompt

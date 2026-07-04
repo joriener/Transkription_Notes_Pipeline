@@ -20,7 +20,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CREATE_TRANSCRIPTS = """
 CREATE TABLE IF NOT EXISTS transcripts (
@@ -73,6 +73,29 @@ CREATE_META = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Known speakers (task #79): a global voiceprint roster, shared across every
+# recording the pipeline processes. embedding is a float32 vector (see
+# speaker_id.serialize_embedding/deserialize_embedding) stored as raw bytes;
+# embedding_dim is kept alongside it so a future switch to a different
+# embedding model with a different vector size fails loudly instead of
+# silently comparing incompatible vectors. sample_count tracks how many
+# confirmed renames have contributed to the stored embedding via the
+# running-average update in speaker_id.update_running_average.
+# ---------------------------------------------------------------------------
+
+CREATE_KNOWN_SPEAKERS = """
+CREATE TABLE IF NOT EXISTS known_speakers (
+    speaker_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL UNIQUE,
+    embedding     BLOB    NOT NULL,
+    embedding_dim INTEGER NOT NULL,
+    sample_count  INTEGER DEFAULT 1,
+    created_at    TEXT    DEFAULT (datetime('now')),
+    updated_at    TEXT    DEFAULT (datetime('now'))
 );
 """
 
@@ -169,7 +192,8 @@ def validate_schema(db_path: str) -> bool:
     global FTS5_AVAILABLE
     try:
         conn = get_connection(db_path)
-        conn.executescript(CREATE_TRANSCRIPTS + CREATE_SLIDES + CREATE_RUN_LOG + CREATE_META)
+        conn.executescript(CREATE_TRANSCRIPTS + CREATE_SLIDES + CREATE_RUN_LOG + CREATE_META
+                            + CREATE_KNOWN_SPEAKERS)
 
         # Migration: older databases (schema v1) lack notes_text.
         if not _column_exists(conn, "transcripts", "notes_text"):
@@ -247,6 +271,77 @@ def get_completed_transcript(conn: sqlite3.Connection, file_path: str) -> dict |
     )
     row = cur.fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Known speakers (task #79)
+# ---------------------------------------------------------------------------
+
+def insert_known_speaker(conn: sqlite3.Connection, name: str, embedding: bytes,
+                          embedding_dim: int) -> int:
+    """Enroll a brand-new speaker voiceprint. Raises sqlite3.IntegrityError
+    if name already exists (callers should check get_known_speaker_by_name
+    first, or catch this, since the UNIQUE constraint is the source of
+    truth for name collisions)."""
+    cur = conn.execute(
+        """INSERT INTO known_speakers (name, embedding, embedding_dim, sample_count)
+           VALUES (?, ?, ?, 1)""",
+        (name, embedding, embedding_dim),
+    )
+    conn.commit()
+    log.info("DB: enrolled new known speaker '%s' (dim=%d).", name, embedding_dim)
+    return cur.lastrowid
+
+
+def list_known_speakers(conn: sqlite3.Connection) -> list[dict]:
+    cur = conn.execute("SELECT * FROM known_speakers ORDER BY name COLLATE NOCASE")
+    return [dict(row) for row in cur.fetchall()]
+
+
+def get_known_speaker_by_name(conn: sqlite3.Connection, name: str) -> dict | None:
+    cur = conn.execute("SELECT * FROM known_speakers WHERE name = ?", (name,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_known_speaker(conn: sqlite3.Connection, speaker_id: int) -> dict | None:
+    cur = conn.execute("SELECT * FROM known_speakers WHERE speaker_id = ?", (speaker_id,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def update_known_speaker_embedding(conn: sqlite3.Connection, speaker_id: int,
+                                    embedding: bytes, sample_count: int) -> None:
+    """Overwrite the stored voiceprint after a confirmed match (caller has
+    already computed the new running-average vector and sample_count via
+    speaker_id.update_running_average)."""
+    conn.execute(
+        """UPDATE known_speakers
+           SET embedding = ?, sample_count = ?, updated_at = datetime('now')
+           WHERE speaker_id = ?""",
+        (embedding, sample_count, speaker_id),
+    )
+    conn.commit()
+
+
+def rename_known_speaker(conn: sqlite3.Connection, speaker_id: int, new_name: str) -> None:
+    """Raises sqlite3.IntegrityError if new_name collides with a different
+    existing speaker (UNIQUE constraint)."""
+    conn.execute(
+        "UPDATE known_speakers SET name = ?, updated_at = datetime('now') WHERE speaker_id = ?",
+        (new_name, speaker_id),
+    )
+    conn.commit()
+    log.info("DB: renamed known speaker #%d to '%s'.", speaker_id, new_name)
+
+
+def delete_known_speaker(conn: sqlite3.Connection, speaker_id: int) -> None:
+    """Removes a voiceprint from the roster. Does not touch any already-
+    written transcript/segment files; future runs simply stop suggesting
+    this name."""
+    conn.execute("DELETE FROM known_speakers WHERE speaker_id = ?", (speaker_id,))
+    conn.commit()
+    log.info("DB: deleted known speaker #%d.", speaker_id)
 
 
 # ---------------------------------------------------------------------------
