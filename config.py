@@ -335,6 +335,61 @@ CONFIG = {
     # the recording itself). Shown in the notes header and the slide
     # report header, alongside title/date. Blank by default.
     "meeting_comments": "",
+
+    # =========================================================
+    # GUI THEME (colors)
+    #
+    # gui.py's apply_theme() reads gui_theme below and applies it to every
+    # ttk widget (buttons, tabs, treeviews, entries, checkboxes, progress
+    # bars, scrollbars) plus the handful of plain tk widgets that ttk
+    # styling can't reach (the log panel, template editor, requirements
+    # output, the Templates list, and the slide thumbnail-grid canvas).
+    #
+    # To customize: edit the hex values below (each *_100 is the
+    # lightest shade of that color, *_900 the darkest) and restart the
+    # GUI. Set gui_theme_enabled to False to fall back to your system's
+    # native Tk look with no custom colors at all.
+    #
+    # gui_ttk_theme must be "clam" (or another fully Tk-drawn theme) for
+    # the colors below to actually show up: Windows' native "vista"/
+    # "winnative" ttk themes ignore most color options since widgets are
+    # drawn by the OS theming engine, not by Tk.
+    # =========================================================
+    "gui_theme_enabled": True,
+    "gui_ttk_theme": "clam",
+    "gui_theme": {
+        # Primary: Bright Navy Blue - buttons, selected tab, headings,
+        # progress bar, focus highlights.
+        "primary_100": "#F2F6FF",
+        "primary_200": "#BCD2FE",
+        "primary_300": "#84B1F9",
+        "primary_400": "#4B92EB",
+        "primary_500": "#1773CF",
+        "primary_600": "#085FA4",
+        "primary_700": "#024C7A",
+        "primary_800": "#003650",
+        "primary_900": "#001C26",
+        # Accent: Lime Shot - checked/selected indicators, "on" states.
+        "accent_100": "#F2FFF5",
+        "accent_200": "#BCFFC8",
+        "accent_300": "#85FD93",
+        "accent_400": "#4EFA58",
+        "accent_500": "#18F218",
+        "accent_600": "#13BF08",
+        "accent_700": "#128C02",
+        "accent_800": "#105900",
+        "accent_900": "#092600",
+        # Neutral - window/frame backgrounds, body text, borders.
+        "neutral_100": "#FAFAFC",
+        "neutral_200": "#E8E9EC",
+        "neutral_300": "#D7D8DB",
+        "neutral_400": "#C6C7CB",
+        "neutral_500": "#B5B7BA",
+        "neutral_600": "#8E9195",
+        "neutral_700": "#696D70",
+        "neutral_800": "#45494B",
+        "neutral_900": "#222526",
+    },
 }
 
 # ---------------------------------------------------------------------------

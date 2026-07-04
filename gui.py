@@ -96,6 +96,144 @@ def _parse_time_to_seconds(text: str) -> float | None:
     return gui_logic.parse_time_to_seconds(text)
 
 
+# =============================================================
+# GUI color theme
+#
+# apply_theme() below reads CONFIG["gui_theme"] (see config.py's "GUI
+# THEME" section) and applies it via ttk.Style to every ttk widget in
+# the app. _THEME is populated once at startup and also used directly
+# by the handful of plain-tk widgets ttk styling can't reach (Canvas,
+# Listbox, ScrolledText, and the Toplevel dialog backgrounds) via
+# _theme_color(). _DEFAULT_THEME is the fallback if config.py's
+# gui_theme is missing or missing a key (e.g. an older config.py from
+# before this existed).
+# =============================================================
+
+_THEME: dict = {}
+
+_DEFAULT_THEME = {
+    "primary_100": "#F2F6FF", "primary_200": "#BCD2FE", "primary_300": "#84B1F9",
+    "primary_400": "#4B92EB", "primary_500": "#1773CF", "primary_600": "#085FA4",
+    "primary_700": "#024C7A", "primary_800": "#003650", "primary_900": "#001C26",
+    "accent_100": "#F2FFF5", "accent_200": "#BCFFC8", "accent_300": "#85FD93",
+    "accent_400": "#4EFA58", "accent_500": "#18F218", "accent_600": "#13BF08",
+    "accent_700": "#128C02", "accent_800": "#105900", "accent_900": "#092600",
+    "neutral_100": "#FAFAFC", "neutral_200": "#E8E9EC", "neutral_300": "#D7D8DB",
+    "neutral_400": "#C6C7CB", "neutral_500": "#B5B7BA", "neutral_600": "#8E9195",
+    "neutral_700": "#696D70", "neutral_800": "#45494B", "neutral_900": "#222526",
+}
+
+
+def _theme_color(key: str) -> str:
+    """Look up one theme color token (e.g. "primary_500"), falling back
+    to the built-in default palette if it's missing from _THEME."""
+    return _THEME.get(key) or _DEFAULT_THEME[key]
+
+
+def _style_toplevel(win: tk.Toplevel):
+    """Set a Toplevel's own background to match the theme - ttk.Style
+    only reaches ttk widgets placed inside it, not the Toplevel window
+    itself. Called at the top of each dialog's __init__."""
+    try:
+        win.configure(bg=_theme_color("neutral_100"))
+    except tk.TclError:
+        pass
+
+
+def apply_theme(root: tk.Tk):
+    """
+    Apply CONFIG["gui_theme"]'s color palette to every ttk widget via
+    ttk.Style, plus the root window background. Populates the
+    module-level _THEME dict so plain-tk widgets built later (Canvas,
+    Listbox, ScrolledText, Toplevel dialogs) can look up the same colors
+    via _theme_color()/_style_toplevel().
+
+    Leaves Tk's default look untouched if CONFIG["gui_theme_enabled"] is
+    False, but _THEME is still populated either way so callers don't
+    need to branch on the setting themselves.
+    """
+    global _THEME
+    _THEME = dict(_DEFAULT_THEME)
+    _THEME.update(CONFIG.get("gui_theme") or {})
+
+    if not CONFIG.get("gui_theme_enabled", True):
+        return
+
+    t = _THEME
+    root.configure(bg=t["neutral_100"])
+
+    style = ttk.Style(root)
+    # "clam" is drawn entirely by Tk, unlike Windows' native "vista"/
+    # "winnative" ttk themes, which ignore most color options since
+    # those widgets are rendered by the OS theming engine - required
+    # for the custom palette below to actually be visible.
+    try:
+        style.theme_use(CONFIG.get("gui_ttk_theme", "clam"))
+    except tk.TclError:
+        style.theme_use("clam")
+
+    style.configure(".", background=t["neutral_100"], foreground=t["neutral_900"],
+                    fieldbackground=t["neutral_100"])
+
+    style.configure("TFrame", background=t["neutral_100"])
+    style.configure("TLabelframe", background=t["neutral_100"], bordercolor=t["neutral_400"])
+    style.configure("TLabelframe.Label", background=t["neutral_100"], foreground=t["primary_700"])
+    style.configure("TLabel", background=t["neutral_100"], foreground=t["neutral_900"])
+
+    style.configure("TButton", background=t["primary_500"], foreground=t["neutral_100"],
+                    bordercolor=t["primary_600"], focuscolor=t["primary_300"], padding=5)
+    style.map("TButton",
+             background=[("disabled", t["neutral_400"]), ("pressed", t["primary_700"]),
+                         ("active", t["primary_400"])],
+             foreground=[("disabled", t["neutral_600"])])
+
+    style.configure("TCheckbutton", background=t["neutral_100"], foreground=t["neutral_900"])
+    style.map("TCheckbutton",
+             indicatorcolor=[("selected", t["accent_500"]), ("!selected", t["neutral_200"])],
+             background=[("active", t["neutral_100"])])
+
+    style.configure("TRadiobutton", background=t["neutral_100"], foreground=t["neutral_900"])
+    style.map("TRadiobutton",
+             indicatorcolor=[("selected", t["accent_500"]), ("!selected", t["neutral_200"])])
+
+    style.configure("TEntry", fieldbackground=t["neutral_100"], foreground=t["neutral_900"],
+                    bordercolor=t["neutral_400"])
+    style.map("TEntry", bordercolor=[("focus", t["primary_500"])])
+
+    style.configure("TCombobox", fieldbackground=t["neutral_100"], foreground=t["neutral_900"],
+                    background=t["neutral_100"], arrowcolor=t["primary_600"])
+    style.map("TCombobox",
+             fieldbackground=[("readonly", t["neutral_100"])],
+             bordercolor=[("focus", t["primary_500"])])
+
+    style.configure("TSpinbox", fieldbackground=t["neutral_100"], foreground=t["neutral_900"],
+                    arrowcolor=t["primary_600"])
+
+    style.configure("TNotebook", background=t["neutral_100"], bordercolor=t["neutral_300"])
+    style.configure("TNotebook.Tab", background=t["neutral_200"], foreground=t["neutral_800"],
+                    padding=(10, 4))
+    style.map("TNotebook.Tab",
+             background=[("selected", t["primary_500"]), ("active", t["primary_300"])],
+             foreground=[("selected", t["neutral_100"]), ("active", t["neutral_900"])])
+
+    style.configure("Treeview", background=t["neutral_100"], fieldbackground=t["neutral_100"],
+                    foreground=t["neutral_900"], bordercolor=t["neutral_300"])
+    style.configure("Treeview.Heading", background=t["primary_700"], foreground=t["neutral_100"])
+    style.map("Treeview.Heading", background=[("active", t["primary_600"])])
+    style.map("Treeview",
+             background=[("selected", t["primary_300"])],
+             foreground=[("selected", t["neutral_900"])])
+
+    style.configure("TProgressbar", background=t["primary_500"], troughcolor=t["neutral_300"],
+                    bordercolor=t["neutral_300"])
+
+    style.configure("TScrollbar", background=t["neutral_300"], troughcolor=t["neutral_200"],
+                    arrowcolor=t["primary_600"])
+    style.map("TScrollbar", background=[("active", t["primary_400"])])
+
+    style.configure("TPanedwindow", background=t["neutral_100"])
+
+
 class QueueLogHandler(logging.Handler):
     """Logging handler that pushes formatted records into a thread-safe queue."""
 
@@ -249,7 +387,7 @@ class PipelineGUI:
         while the pointer is over this tab, so it doesn't hijack scrolling
         on other widgets/tabs.
         """
-        canvas = tk.Canvas(parent, highlightthickness=0)
+        canvas = tk.Canvas(parent, highlightthickness=0, bg=_theme_color("neutral_100"))
         vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         canvas.pack(side="left", fill="both", expand=True)
@@ -392,7 +530,10 @@ class PipelineGUI:
         left = ttk.Frame(container)
         left.pack(side="left", fill="y", padx=(0, 8))
         ttk.Label(left, text="Prompt templates\n(prompts/*.md):").pack(anchor="w")
-        self.templates_list = tk.Listbox(left, width=26, height=22, exportselection=False)
+        self.templates_list = tk.Listbox(
+            left, width=26, height=22, exportselection=False,
+            bg=_theme_color("neutral_100"), fg=_theme_color("neutral_900"),
+            selectbackground=_theme_color("primary_400"), selectforeground=_theme_color("neutral_100"))
         self.templates_list.pack(fill="y", pady=(4, 4))
         self.templates_list.bind("<<ListboxSelect>>", self._on_template_selected)
 
@@ -411,7 +552,11 @@ class PipelineGUI:
         right.pack(side="left", fill="both", expand=True)
         self.template_name_label = ttk.Label(right, text="No template selected.", foreground="#444")
         self.template_name_label.pack(anchor="w")
-        self.template_editor = scrolledtext.ScrolledText(right, wrap="word", height=28, undo=True)
+        self.template_editor = scrolledtext.ScrolledText(
+            right, wrap="word", height=28, undo=True,
+            bg=_theme_color("neutral_100"), fg=_theme_color("neutral_900"),
+            insertbackground=_theme_color("neutral_900"),
+            selectbackground=_theme_color("primary_300"))
         self.template_editor.pack(fill="both", expand=True, pady=(4, 4))
         self.template_editor.config(state="disabled")
 
@@ -694,7 +839,11 @@ class PipelineGUI:
         self.install_missing_btn = ttk.Button(
             req_btn_row, text="Install missing", command=self._install_missing, state="disabled")
         self.install_missing_btn.pack(side="left", padx=(8, 0))
-        self.req_text = scrolledtext.ScrolledText(req_frame, height=9, state="disabled", wrap="word")
+        self.req_text = scrolledtext.ScrolledText(
+            req_frame, height=9, state="disabled", wrap="word",
+            bg=_theme_color("neutral_100"), fg=_theme_color("neutral_900"),
+            insertbackground=_theme_color("neutral_900"),
+            selectbackground=_theme_color("primary_300"))
         self.req_text.pack(fill="x", padx=8, pady=(0, 8))
 
         # --- Database ---
@@ -1443,7 +1592,11 @@ class RunTabController:
 
         log_frame = ttk.LabelFrame(parent, text="Log")
         log_frame.pack(fill="both", expand=True, **pad)
-        self.log_text = scrolledtext.ScrolledText(log_frame, state="disabled", height=16, wrap="word")
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, state="disabled", height=16, wrap="word",
+            bg=_theme_color("neutral_100"), fg=_theme_color("neutral_900"),
+            insertbackground=_theme_color("neutral_900"),
+            selectbackground=_theme_color("primary_300"))
         self.log_text.pack(fill="both", expand=True)
 
         # --- Persisted settings (task #71) ---
@@ -2278,6 +2431,7 @@ class KnownSpeakersDialog(tk.Toplevel):
 
     def __init__(self, app):
         super().__init__(app.root)
+        _style_toplevel(self)
         self.app = app
         self.title("Manage Known Speakers")
         self.resizable(False, False)
@@ -2401,6 +2555,7 @@ class SpeakerRenameDialog(tk.Toplevel):
     def __init__(self, controller, segments_json_path: str, labels: list,
                  source_media_path: str | None = None):
         super().__init__(controller.root)
+        _style_toplevel(self)
         self.controller = controller
         self.segments_json_path = segments_json_path
         self.source_media_path = source_media_path
@@ -2595,6 +2750,7 @@ class SlideReviewDialog(tk.Toplevel):
 
     def __init__(self, master, overrides_source):
         super().__init__(master)
+        _style_toplevel(self)
         self.title("Review / Edit Slides")
         self.geometry("1180x560")
         self._overrides_source = overrides_source  # RunTabController (video), for meeting_title/etc.
@@ -2649,7 +2805,7 @@ class SlideReviewDialog(tk.Toplevel):
         # but not packed until "Thumbnail grid view" is checked, so its
         # canvas/scrollbar simply don't exist on screen (and no image is
         # decoded) in the default list view.
-        self.grid_canvas = tk.Canvas(tree_frame, highlightthickness=0)
+        self.grid_canvas = tk.Canvas(tree_frame, highlightthickness=0, bg=_theme_color("neutral_100"))
         self.grid_vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.grid_canvas.yview)
         self.grid_canvas.configure(yscrollcommand=self.grid_vsb.set)
         self.grid_inner = ttk.Frame(self.grid_canvas)
@@ -3083,6 +3239,7 @@ class SlideReviewDialog(tk.Toplevel):
 
 def launch():
     root = tk.Tk()
+    apply_theme(root)
     PipelineGUI(root)
     root.mainloop()
 
