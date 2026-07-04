@@ -704,6 +704,7 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                 chunk_size=cfg["chunk_size"],
                 meeting_title=cfg.get("meeting_title", ""),
                 meeting_date=cfg.get("meeting_date", ""),
+                meeting_comments=cfg.get("meeting_comments", ""),
             )
 
             if notes_text and qa_segments:
@@ -727,6 +728,7 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                         chunk_size=cfg["chunk_size"],
                         meeting_title=cfg.get("meeting_title", ""),
                         meeting_date=cfg.get("meeting_date", ""),
+                        meeting_comments=cfg.get("meeting_comments", ""),
                     )
                     if qa_summary:
                         notes_text = notes_text.rstrip() + "\n\n" + qa_summary.strip()
@@ -1842,6 +1844,7 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
         claude_model=cfg["claude_model"], filename=filename,
         single_pass_limit=cfg["single_pass_limit"], chunk_size=cfg["chunk_size"],
         meeting_title=cfg.get("meeting_title", ""), meeting_date=cfg.get("meeting_date", ""),
+        meeting_comments=cfg.get("meeting_comments", ""),
     )
     if not notes_text:
         raise RuntimeError("Notes generation failed (see log above).")
@@ -1955,8 +1958,10 @@ def parse_args() -> argparse.Namespace:
                         "staying in sync with the already-converted .srt/transcript. "
                         "Requires a full ffmpeg re-encode (slow for long videos).")
     p.add_argument("--ics", type=str, metavar="FILE",
-                   help="Read --meeting-title/--meeting-date from the first VEVENT in an .ics file "
-                        "(explicit --meeting-title/--meeting-date still take precedence).")
+                   help="Read meeting title/date/comments from an .ics calendar invite (first "
+                        "VEVENT), or a .txt/.docx file with \"Title:\"/\"Date:\"/\"Comments:\" "
+                        "lines (see ics_utils.parse_labeled_text). Explicit --meeting-title/"
+                        "--meeting-date/--comments still take precedence.")
     p.add_argument("--whisper-model", type=str, help="tiny|base|small|medium|large-v2|large-v3.")
     p.add_argument("--language", dest="language_flag", type=str, help="de|en|auto (flag form).")
     p.add_argument("--llm-backend", choices=["ollama", "anthropic"])
@@ -2035,12 +2040,14 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
 
     meeting_title = args.meeting_title
     meeting_date = args.meeting_date
+    meeting_comments = args.comments
     if args.ics:
         try:
             import ics_utils
-            parsed = ics_utils.parse_ics(args.ics)
+            parsed = ics_utils.parse_meeting_info_file(args.ics)
             meeting_title = meeting_title or parsed.get("title") or None
             meeting_date = meeting_date or parsed.get("date") or None
+            meeting_comments = meeting_comments or parsed.get("comments") or None
         except Exception as exc:
             log.warning("Could not read --ics %s: %s", args.ics, exc)
 
@@ -2071,7 +2078,7 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "notes_format_docx":   True if args.docx else None,
         "meeting_title":       meeting_title,
         "meeting_date":        meeting_date,
-        "meeting_comments":    args.comments,
+        "meeting_comments":    meeting_comments,
         "output_basename_override": args.output_name,
     }
     return {k: v for k, v in overrides.items() if v is not None}

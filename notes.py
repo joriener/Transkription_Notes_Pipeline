@@ -272,6 +272,7 @@ def generate_notes(
     timeout_sec: int = 300,
     meeting_title: str = "",
     meeting_date: str = "",
+    meeting_comments: str = "",
 ) -> str | None:
     """
     Generate structured notes/summary from a transcript using the given
@@ -279,9 +280,16 @@ def generate_notes(
     Filename/Date header) or None on failure.
 
     meeting_title/meeting_date (optional, set via the GUI's "Meeting info"
-    fields or --meeting-title/--meeting-date/--ics on the CLI) are added to
-    the context header sent to the LLM so the summary can reference the
-    actual meeting name/date instead of just the source filename.
+    fields, --meeting-title/--meeting-date, or --ics/"Load meeting info...")
+    are added to the context header sent to the LLM so the summary can
+    reference the actual meeting name/date instead of just the source
+    filename. meeting_comments (task #93: same sources, plus a "Comments:"
+    block in an imported .txt/.docx file) is included as its own labeled
+    section in that same header, so organizer-provided context (agenda
+    notes, background the transcript itself wouldn't mention, etc.)
+    actually reaches the LLM and can inform the generated summary -
+    rather than only ever appearing as a header line in the output
+    documents (see reporter.py's meeting_comments usage).
     """
     from datetime import datetime
 
@@ -293,7 +301,10 @@ def generate_notes(
     header = f"Filename: {filename}\n"
     if meeting_title:
         header += f"Meeting title: {meeting_title}\n"
-    header += f"Date: {meeting_date or datetime.now().strftime('%Y-%m-%d')}\n\n"
+    header += f"Date: {meeting_date or datetime.now().strftime('%Y-%m-%d')}\n"
+    if meeting_comments.strip():
+        header += f"\nAdditional context/comments provided by the organizer:\n{meeting_comments.strip()}\n"
+    header += "\n"
     full_transcript_text = header + "TRANSCRIPT:\n" + transcript_text
 
     log.info("NOTES: backend='%s' template='%s'", llm_backend, Path(prompt_path).name)

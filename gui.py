@@ -1410,14 +1410,15 @@ class RunTabController:
             row=0, column=1, sticky="w", columnspan=2)
         ttk.Label(meeting_frame, text="Date (YYYY-MM-DD):").grid(row=1, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(meeting_frame, textvariable=self.meeting_date_var, width=16).grid(row=1, column=1, sticky="w")
-        ttk.Button(meeting_frame, text="Load from .ics...", command=self._load_ics).grid(
+        ttk.Button(meeting_frame, text="Load meeting info...", command=self._load_meeting_info).grid(
             row=1, column=2, sticky="w", padx=(8, 0))
         ttk.Label(meeting_frame, text="Comments:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(meeting_frame, textvariable=self.meeting_comments_var, width=60).grid(
             row=2, column=1, sticky="we", columnspan=2)
         ttk.Label(meeting_frame,
-                 text="Pre-fills Title/Date from an Outlook/Google/Teams .ics invite. Shown in the "
-                      "notes header" + (" and used as the report title." if is_video else "."),
+                 text="Pre-fills Title/Date/Comments from an Outlook/Google/Teams .ics invite, "
+                      "or a .txt/.docx file with \"Title:\"/\"Date:\"/\"Comments:\" lines. Shown "
+                      "in the notes header" + (" and used as the report title." if is_video else "."),
                  foreground="#666").grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
         if is_video:
             ttk.Label(meeting_frame, text="Title slide image:").grid(row=4, column=0, sticky="w", padx=8, pady=4)
@@ -1833,24 +1834,42 @@ class RunTabController:
             if self._qa_frame is not None:
                 self._qa_frame.pack(fill="x", padx=8, pady=4, after=self._meeting_frame)
 
-    def _load_ics(self):
+    def _load_meeting_info(self):
+        """Task #93: pre-fill Title/Date/Comments from an .ics calendar
+        invite, or a .txt/.docx file using the "Title:"/"Date:"/
+        "Comments:" labeled-fields format (see ics_utils.parse_labeled_text
+        for the exact rules, e.g. Comments can span multiple lines).
+        Existing Comments text is appended to (not overwritten by) a
+        newly-loaded comments block, since the user may already have
+        typed something here; Title/Date are overwritten, matching the
+        previous .ics-only behavior."""
         path = filedialog.askopenfilename(
-            title="Select .ics calendar invite",
-            filetypes=[("Calendar invite", "*.ics"), ("All files", "*.*")],
+            title="Select .ics / .txt / .docx meeting info file",
+            filetypes=[
+                ("Meeting info files", "*.ics *.txt *.docx"),
+                ("Calendar invite", "*.ics"),
+                ("Text file", "*.txt"),
+                ("Word document", "*.docx"),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
         try:
-            parsed = ics_utils.parse_ics(path)
+            parsed = ics_utils.parse_meeting_info_file(path)
         except Exception as exc:
-            messagebox.showerror("Could not read .ics file", str(exc))
+            messagebox.showerror("Could not read meeting info file", str(exc))
             return
         if parsed.get("title"):
             self.meeting_title_var.set(parsed["title"])
         if parsed.get("date"):
             self.meeting_date_var.set(parsed["date"])
-        if not parsed.get("title") and not parsed.get("date"):
-            messagebox.showinfo("Nothing found", "No title or date found in this .ics file.")
+        if parsed.get("comments"):
+            existing = self.meeting_comments_var.get().strip()
+            combined = f"{existing} {parsed['comments']}" if existing else parsed["comments"]
+            self.meeting_comments_var.set(combined)
+        if not any(parsed.get(k) for k in ("title", "date", "comments")):
+            messagebox.showinfo("Nothing found", "No title, date, or comments found in this file.")
 
     def _browse_title_slide_image(self):
         path = filedialog.askopenfilename(
