@@ -88,6 +88,7 @@ from config import CONFIG, PROMPTS_DIR, is_audio_only, SUPPORTED_EXTENSIONS
 import db
 import notes
 import reporter
+import speaker_id
 import transcriber
 
 log = logging.getLogger("Transkription_Notes_Pipeline")
@@ -947,6 +948,128 @@ def rename_speakers(segments_json_path: str, speaker_mapping: dict,
         else:
             log.info("No segments were renamed - skipping notes regeneration.")
             result["notes_regenerated"] = False
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Speaker identification (task #80): cross-meeting voiceprints on top of
+# the post-hoc rename utility above. This does NOT run automatically as
+# part of process_file - it is opt-in and triggered when the user opens
+# the Rename Speakers dialog with enable_speaker_id on (see gui.py
+# SpeakerRenameDialog), matching the review-first workflow: compute
+# suggestions, let the user confirm/correct each name (with an audio
+# preview - see speaker_id.py), then commit. rename_speakers above still
+# does the actual rewriting of the local transcript; the two functions
+# below only manage the global known_speakers roster.
+# ---------------------------------------------------------------------------
+
+def get_speaker_suggestions(segments_json_path: str, source_media_path: str,
+                             hf_token: str, threshold: float, db_path: str,
+                             device: str = "cpu") -> dict:
+    """
+    For an existing *_segments.json cache, compute one voiceprint per
+    local speaker label and match it against the global known_speakers
+    roster (db.py).
+
+    Returns {label: {"suggested_name": str|None, "score": float,
+    "embedding": np.ndarray}}. "embedding" is included so a later call to
+    commit_speaker_identities can reuse it without recomputing (which
+    would mean reloading pyannote and re-decoding the source audio a
+    second time). Returns {} if the segments file is missing, has no
+    speaker labels at all (diarization was off for that run), or
+    source_media_path can't be found alongside it.
+
+    Raises RuntimeError if pyannote.audio itself can't be loaded
+    (propagated from speaker_id.extract_speaker_embeddings, e.g. the
+    gated model's terms haven't been accepted on HuggingFace yet) - the
+    caller should surface this to the user rather than silently
+    returning {}, since it means the whole feature is unusable until
+    fixed, not just this one file.
+    """
+    path = Path(segments_json_path)
+    if not path.exists():
+        return {}
+    segments = json.loads(path.read_text(encoding="utf-8"))
+    labels = sorted({s.get("speaker") for s in segments if s.get("speaker")})
+    if not labels:
+        return {}
+    if not Path(source_media_path).exists():
+        raise FileNotFoundError(
+            f"Source media not found: {source_media_path}. Speaker "
+            f"identification needs to re-read the original audio; plain "
+            f"renaming (get_speaker_labels/rename_speakers) still works "
+            f"without it."
+        )
+
+    import whisperx  # already a hard dependency of this whole pipeline
+    audio = whisperx.load_audio(str(source_media_path))
+    embeddings = speaker_id.extract_speaker_embeddings(
+        audio, segments, hf_token, device=device)
+
+    conn = db.get_connection(db_path)
+    try:
+        known = db.list_known_speakers(conn)
+    finally:
+        conn.close()
+
+    suggestions = {}
+    for label, emb in embeddings.items():
+        match = speaker_id.match_speaker(emb, known, threshold)
+        suggestions[label] = {
+            "suggested_name": match["name"],
+            "score": match["score"],
+            "embedding": emb,
+        }
+    return suggestions
+
+
+def commit_speaker_identities(db_path: str, suggestions: dict, name_choices: dict) -> dict:
+    """
+    After the user reviews get_speaker_suggestions' output and picks a
+    final name per label (name_choices: {label: name_or_blank_to_skip}),
+    persist each non-blank choice into the known_speakers roster:
+      - name matches an existing known speaker (exact name match) ->
+        running-average update of that speaker's embedding, sample_count+1.
+      - name is new -> enroll a brand-new known_speakers row.
+
+    Returns {label: {"speaker_id": int, "action": "matched"|"enrolled"}}
+    for labels that were committed; blank/skipped labels, and labels not
+    present in suggestions (e.g. embedding extraction failed for that
+    speaker), are omitted from the result.
+
+    Does NOT touch the transcript/segment files themselves - call
+    rename_speakers separately with the same label->name mapping to
+    actually rewrite the local transcript, exactly like the existing
+    Rename Speakers workflow (task #76).
+    """
+    conn = db.get_connection(db_path)
+    result = {}
+    try:
+        for label, name in (name_choices or {}).items():
+            name = (name or "").strip()
+            if not name or label not in suggestions:
+                continue
+            embedding = suggestions[label]["embedding"]
+            existing = db.get_known_speaker_by_name(conn, name)
+            if existing:
+                new_vec, new_count = speaker_id.update_running_average(
+                    speaker_id.deserialize_embedding(
+                        existing["embedding"], existing["embedding_dim"]),
+                    existing["sample_count"], embedding,
+                )
+                db.update_known_speaker_embedding(
+                    conn, existing["speaker_id"],
+                    speaker_id.serialize_embedding(new_vec), new_count,
+                )
+                result[label] = {"speaker_id": existing["speaker_id"], "action": "matched"}
+            else:
+                dim = embedding.shape[0]
+                new_id = db.insert_known_speaker(
+                    conn, name, speaker_id.serialize_embedding(embedding), dim,
+                )
+                result[label] = {"speaker_id": new_id, "action": "enrolled"}
+    finally:
+        conn.close()
     return result
 
 

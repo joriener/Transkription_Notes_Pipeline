@@ -460,3 +460,92 @@ class TestRenameSpeakers:
         result = run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "Alice"}, regenerate_notes=True)
         assert result["renamed_segments"] == 2
         assert result["notes_regenerated"] is False
+
+
+# -----------------------------------------------------------------
+# commit_speaker_identities (task #80)
+#
+# Uses a real temp SQLite db (db.validate_schema/get_connection) rather
+# than mocking db.py: the interesting behavior here IS the DB roundtrip
+# (insert vs. running-average update), so a mock would just restate the
+# implementation. No pyannote/torch needed - embeddings are plain numpy
+# arrays constructed by hand.
+# -----------------------------------------------------------------
+
+class TestCommitSpeakerIdentities:
+    def _make_db(self, tmp_path):
+        path = str(tmp_path / "test.db")
+        db.validate_schema(path)
+        return path
+
+    def test_new_name_enrolls_new_speaker(self, tmp_path):
+        import numpy as np
+        db_path = self._make_db(tmp_path)
+        suggestions = {"SPEAKER_00": {"suggested_name": None, "score": 0.0,
+                                       "embedding": np.array([1.0, 0.0, 0.0])}}
+        result = run_pipeline.commit_speaker_identities(
+            db_path, suggestions, {"SPEAKER_00": "Anna"})
+        assert result["SPEAKER_00"]["action"] == "enrolled"
+        conn = db.get_connection(db_path)
+        row = db.get_known_speaker_by_name(conn, "Anna")
+        conn.close()
+        assert row is not None
+        assert row["sample_count"] == 1
+
+    def test_existing_name_updates_running_average(self, tmp_path):
+        import numpy as np
+        import speaker_id
+        db_path = self._make_db(tmp_path)
+        conn = db.get_connection(db_path)
+        vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        sid = db.insert_known_speaker(conn, "Anna", speaker_id.serialize_embedding(vec), 3)
+        conn.close()
+
+        suggestions = {"SPEAKER_00": {"suggested_name": "Anna", "score": 0.95,
+                                       "embedding": np.array([1.0, 0.0, 0.0])}}
+        result = run_pipeline.commit_speaker_identities(
+            db_path, suggestions, {"SPEAKER_00": "Anna"})
+        assert result["SPEAKER_00"] == {"speaker_id": sid, "action": "matched"}
+
+        conn = db.get_connection(db_path)
+        row = db.get_known_speaker(conn, sid)
+        conn.close()
+        assert row["sample_count"] == 2
+
+    def test_blank_name_choice_is_skipped(self, tmp_path):
+        import numpy as np
+        db_path = self._make_db(tmp_path)
+        suggestions = {"SPEAKER_00": {"suggested_name": None, "score": 0.0,
+                                       "embedding": np.array([1.0, 0.0, 0.0])}}
+        result = run_pipeline.commit_speaker_identities(
+            db_path, suggestions, {"SPEAKER_00": "   "})
+        assert result == {}
+        conn = db.get_connection(db_path)
+        assert db.list_known_speakers(conn) == []
+        conn.close()
+
+    def test_label_missing_from_suggestions_is_skipped(self, tmp_path):
+        db_path = self._make_db(tmp_path)
+        result = run_pipeline.commit_speaker_identities(
+            db_path, {}, {"SPEAKER_00": "Anna"})
+        assert result == {}
+
+    def test_multiple_labels_mixed_enroll_and_match(self, tmp_path):
+        import numpy as np
+        import speaker_id
+        db_path = self._make_db(tmp_path)
+        conn = db.get_connection(db_path)
+        vec = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        sid = db.insert_known_speaker(conn, "Bert", speaker_id.serialize_embedding(vec), 3)
+        conn.close()
+
+        suggestions = {
+            "SPEAKER_00": {"suggested_name": None, "score": 0.0,
+                           "embedding": np.array([1.0, 0.0, 0.0])},
+            "SPEAKER_01": {"suggested_name": "Bert", "score": 0.99,
+                           "embedding": np.array([0.0, 1.0, 0.0])},
+        }
+        result = run_pipeline.commit_speaker_identities(
+            db_path, suggestions, {"SPEAKER_00": "Carla", "SPEAKER_01": "Bert"})
+        assert result["SPEAKER_00"]["action"] == "enrolled"
+        assert result["SPEAKER_01"] == {"speaker_id": sid, "action": "matched"}
