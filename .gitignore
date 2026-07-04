@@ -13,6 +13,9 @@ __pycache__/
 *.pyc
 logs/
 
+# Persisted GUI settings (task #71): per-machine last-used values, not source
+gui_state.json
+
 # Generated outputs (transcripts, notes, slide reports) - stay next to source media,
 # which normally lives outside this repo, but ignore them if ever created here.
 *_transcript_speakers.txt
@@ -39,3 +42,7 @@ notes_batch_log_*.txt
 
 # Corruption-recovery backups (see 2026-07-02 db incident), not source
 *.corrupt-backup
+
+# Templates tab (task #77): automatic pre-Save/Delete backups of prompt
+# templates, not source - the tracked prompts/*.md files are.
+prompts/_backup/

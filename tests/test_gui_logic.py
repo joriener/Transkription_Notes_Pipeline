@@ -281,3 +281,37 @@ class TestCsvHeaderIndex:
         idx = gui_logic.csv_header_index(
             ["file", "comments"], {"file", "language", "title", "date", "comments"})
         assert idx == {"file": 0, "comments": 1}
+
+
+class TestSanitizeTemplateName:
+    def test_blank_returns_none(self):
+        assert gui_logic.sanitize_template_name("") is None
+        assert gui_logic.sanitize_template_name("   ") is None
+        assert gui_logic.sanitize_template_name(None) is None
+
+    def test_adds_md_extension(self):
+        assert gui_logic.sanitize_template_name("standup") == "standup.md"
+
+    def test_keeps_existing_md_extension(self):
+        assert gui_logic.sanitize_template_name("standup.md") == "standup.md"
+
+    def test_strips_whitespace(self):
+        assert gui_logic.sanitize_template_name("  standup  ") == "standup.md"
+
+    def test_rejects_forward_slash(self):
+        assert gui_logic.sanitize_template_name("sub/standup") is None
+
+    def test_rejects_backslash(self):
+        assert gui_logic.sanitize_template_name("sub\\standup") is None
+
+    def test_rejects_parent_dir_traversal(self):
+        assert gui_logic.sanitize_template_name("../../etc/passwd") is None
+        assert gui_logic.sanitize_template_name("..") is None
+
+    def test_rejects_readme_case_insensitive(self):
+        assert gui_logic.sanitize_template_name("readme") is None
+        assert gui_logic.sanitize_template_name("README.md") is None
+        assert gui_logic.sanitize_template_name("ReadMe") is None
+
+    def test_case_preserved_for_non_readme_names(self):
+        assert gui_logic.sanitize_template_name("Standup") == "Standup.md"

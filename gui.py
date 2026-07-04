@@ -204,13 +204,16 @@ class PipelineGUI:
         self.meeting_tab = ttk.Frame(notebook)
         self.video_tab = ttk.Frame(notebook)
         self.search_tab = ttk.Frame(notebook)
+        self.templates_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
         notebook.add(self.meeting_tab, text="Meeting")
         notebook.add(self.video_tab, text="Video / Webinar")
         notebook.add(self.search_tab, text="Search")
+        notebook.add(self.templates_tab, text="Templates")
         notebook.add(self.settings_tab, text="Settings")
 
         self._build_search_tab()
+        self._build_templates_tab()
         self._build_settings_tab()
         self.meeting_run = RunTabController(self.meeting_tab, "meeting", self)
         self.video_run = RunTabController(self.video_tab, "video", self)
@@ -369,6 +372,237 @@ class PipelineGUI:
         path = self._slides_result_paths.get(sel[0])
         if path:
             self._open_path(Path(path).parent)
+
+    # -----------------------------------------------------------------
+    # Templates tab (task #77): view/import/copy/delete/backup/edit the
+    # prompts/*.md files both Run tabs' "Prompt template" dropdown reads
+    # from. Every destructive action (Save, Delete) backs the previous
+    # content up to prompts/_backup/ first - the originals are never
+    # silently lost. gui_logic.sanitize_template_name guards New/Import/
+    # Copy against path traversal and blank/README names.
+    # -----------------------------------------------------------------
+
+    def _build_templates_tab(self):
+        parent = self.templates_tab
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True, padx=8, pady=8)
+
+        left = ttk.Frame(container)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        ttk.Label(left, text="Prompt templates\n(prompts/*.md):").pack(anchor="w")
+        self.templates_list = tk.Listbox(left, width=26, height=22, exportselection=False)
+        self.templates_list.pack(fill="y", pady=(4, 4))
+        self.templates_list.bind("<<ListboxSelect>>", self._on_template_selected)
+
+        btns = ttk.Frame(left)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="New...", command=self._template_new).pack(fill="x", pady=(0, 2))
+        ttk.Button(btns, text="Import...", command=self._template_import).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Copy...", command=self._template_copy).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Delete", command=self._template_delete).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Reload list", command=self._refresh_templates_list).pack(
+            fill="x", pady=(2, 0))
+        ttk.Button(btns, text="Open templates folder...",
+                  command=self._open_prompts_folder).pack(fill="x", pady=(8, 0))
+
+        right = ttk.Frame(container)
+        right.pack(side="left", fill="both", expand=True)
+        self.template_name_label = ttk.Label(right, text="No template selected.", foreground="#444")
+        self.template_name_label.pack(anchor="w")
+        self.template_editor = scrolledtext.ScrolledText(right, wrap="word", height=28, undo=True)
+        self.template_editor.pack(fill="both", expand=True, pady=(4, 4))
+        self.template_editor.config(state="disabled")
+
+        editor_btns = ttk.Frame(right)
+        editor_btns.pack(fill="x")
+        self.template_save_btn = ttk.Button(
+            editor_btns, text="Save", command=self._template_save, state="disabled")
+        self.template_save_btn.pack(side="left")
+        self.template_status_label = ttk.Label(editor_btns, text="", foreground="#666")
+        self.template_status_label.pack(side="left", padx=(8, 0))
+        ttk.Label(right, text="Every Save/Delete backs up the previous content to "
+                             "prompts/_backup/ first.",
+                 foreground="#666").pack(anchor="w", pady=(4, 0))
+
+        self._current_template_path: Path | None = None
+        self._template_paths: dict = {}
+        self._refresh_templates_list()
+
+    def _refresh_templates_list(self):
+        """Reload the template list from disk and clear the editor pane.
+        Also refreshes both Run tabs' "Prompt template" dropdowns, so a
+        New/Import/Copy/Delete/rename here is immediately reflected there
+        without needing their own "Reload list" button clicked too."""
+        self.templates_list.delete(0, "end")
+        self._template_paths = {}
+        for name, path in notes_mod.list_prompt_templates(PROMPTS_DIR).items():
+            self.templates_list.insert("end", name)
+            self._template_paths[name] = path
+
+        self.template_editor.config(state="normal")
+        self.template_editor.delete("1.0", "end")
+        self.template_editor.config(state="disabled")
+        self.template_save_btn.config(state="disabled")
+        self.template_name_label.config(text="No template selected.")
+        self.template_status_label.config(text="")
+        self._current_template_path = None
+
+        if hasattr(self, "meeting_run"):
+            self.meeting_run._refresh_prompt_templates()
+        if hasattr(self, "video_run"):
+            self.video_run._refresh_prompt_templates()
+
+    def _select_template_by_name(self, name: str):
+        items = list(self.templates_list.get(0, "end"))
+        if name in items:
+            idx = items.index(name)
+            self.templates_list.selection_clear(0, "end")
+            self.templates_list.selection_set(idx)
+            self.templates_list.see(idx)
+            self._on_template_selected()
+
+    def _on_template_selected(self, event=None):
+        sel = self.templates_list.curselection()
+        if not sel:
+            return
+        name = self.templates_list.get(sel[0])
+        path = self._template_paths.get(name)
+        if not path or not path.exists():
+            return
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Could not read template", str(exc))
+            return
+        self._current_template_path = path
+        self.template_name_label.config(text=path.name)
+        self.template_editor.config(state="normal")
+        self.template_editor.delete("1.0", "end")
+        self.template_editor.insert("1.0", content)
+        self.template_save_btn.config(state="normal")
+        self.template_status_label.config(text="")
+
+    def _template_backup(self, path: Path, suffix: str = "") -> Path:
+        """Copy path into prompts/_backup/<stem>_<timestamp><suffix>.md
+        before it is overwritten or deleted. Returns the backup path."""
+        backup_dir = Path(PROMPTS_DIR) / "_backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"{path.stem}_{stamp}{suffix}.md"
+        shutil.copy2(path, backup_path)
+        return backup_path
+
+    def _template_new(self):
+        raw = simpledialog.askstring(
+            "New template", 'Template name (e.g. "standup"):', parent=self.root)
+        if raw is None:
+            return
+        name = gui_logic.sanitize_template_name(raw)
+        if not name:
+            messagebox.showwarning(
+                "Invalid name",
+                "Enter a plain filename with no path separators and not \"readme\" "
+                "(a .md extension is added automatically).")
+            return
+        path = Path(PROMPTS_DIR) / name
+        if path.exists():
+            messagebox.showwarning("Already exists", f"{name} already exists.")
+            return
+        try:
+            path.write_text("## New Template\n\nDescribe the desired notes structure here.\n",
+                            encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Could not create template", str(exc))
+            return
+        self._refresh_templates_list()
+        self._select_template_by_name(path.stem)
+
+    def _template_import(self):
+        src = filedialog.askopenfilename(
+            title="Import prompt template",
+            filetypes=[("Markdown", "*.md"), ("All files", "*.*")])
+        if not src:
+            return
+        dest_name = gui_logic.sanitize_template_name(Path(src).stem)
+        if not dest_name:
+            messagebox.showwarning("Invalid name", "Selected file has an unusable name.")
+            return
+        dest = Path(PROMPTS_DIR) / dest_name
+        if dest.exists() and not messagebox.askyesno(
+                "Overwrite?", f"{dest_name} already exists. Overwrite (previous content is "
+                             f"backed up first)?"):
+            return
+        try:
+            if dest.exists():
+                self._template_backup(dest)
+            shutil.copy2(src, dest)
+        except OSError as exc:
+            messagebox.showerror("Import failed", str(exc))
+            return
+        self._refresh_templates_list()
+        self._select_template_by_name(dest.stem)
+
+    def _template_copy(self):
+        if not self._current_template_path:
+            messagebox.showinfo("No template selected", "Select a template to copy first.")
+            return
+        raw = simpledialog.askstring("Copy template", "New template name:", parent=self.root)
+        if raw is None:
+            return
+        name = gui_logic.sanitize_template_name(raw)
+        if not name:
+            messagebox.showwarning(
+                "Invalid name", "Enter a plain filename with no path separators.")
+            return
+        dest = Path(PROMPTS_DIR) / name
+        if dest.exists():
+            messagebox.showwarning("Already exists", f"{name} already exists.")
+            return
+        try:
+            shutil.copy2(self._current_template_path, dest)
+        except OSError as exc:
+            messagebox.showerror("Copy failed", str(exc))
+            return
+        self._refresh_templates_list()
+        self._select_template_by_name(dest.stem)
+
+    def _template_delete(self):
+        if not self._current_template_path:
+            messagebox.showinfo("No template selected", "Select a template to delete first.")
+            return
+        path = self._current_template_path
+        if not messagebox.askyesno(
+                "Delete template", f"Delete {path.name}? A backup is kept in prompts/_backup/."):
+            return
+        try:
+            self._template_backup(path, suffix="_deleted")
+            path.unlink()
+        except OSError as exc:
+            messagebox.showerror("Delete failed", str(exc))
+            return
+        self._refresh_templates_list()
+
+    def _template_save(self):
+        if not self._current_template_path:
+            return
+        path = self._current_template_path
+        content = self.template_editor.get("1.0", "end-1c")
+        try:
+            if path.exists():
+                backup_path = self._template_backup(path)
+            else:
+                backup_path = None
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        note = f" (backup: _backup/{backup_path.name})" if backup_path else ""
+        self.template_status_label.config(
+            text=f"Saved at {datetime.now().strftime('%H:%M:%S')}{note}")
+        if hasattr(self, "meeting_run"):
+            self.meeting_run._refresh_prompt_templates()
+        if hasattr(self, "video_run"):
+            self.video_run._refresh_prompt_templates()
 
     # -----------------------------------------------------------------
     # Settings tab: keys.cfg, requirements, database, logging

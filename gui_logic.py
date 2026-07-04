@@ -225,3 +225,28 @@ def extract_copyable_settings(values: dict) -> dict:
     dropping anything else. Used by "Copy settings to other tab" to build
     the value set copied from one RunTabController to the other."""
     return {k: values[k] for k in COPYABLE_KEYS if k in values}
+
+
+# =============================================================
+# Templates tab (task #77)
+# =============================================================
+
+def sanitize_template_name(name: str) -> str | None:
+    """
+    Validate and normalize a user-entered prompt template name for the
+    Templates tab's New/Import/Copy actions. Strips whitespace, rejects
+    blank input, rejects any path separator or ".." component (so a
+    filename can never write outside prompts_dir), rejects "readme" (the
+    folder's own doc file, not a template), and ensures a ".md"
+    extension. Returns the normalized filename, or None if invalid.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    if "/" in name or "\\" in name or ".." in name:
+        return None
+    if not name.lower().endswith(".md"):
+        name += ".md"
+    if name.lower() == "readme.md":
+        return None
+    return name
