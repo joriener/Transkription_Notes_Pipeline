@@ -72,6 +72,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 import traceback
@@ -131,6 +132,53 @@ def build_run_config(overrides: dict) -> dict:
     return cfg
 
 
+_FILENAME_DATETIME_RE = re.compile(
+    r"(?P<y>20\d{2})-?(?P<m>\d{2})-?(?P<d>\d{2})"          # date: YYYY-MM-DD or YYYYMMDD
+    r"(?:[_-]?(?P<h>\d{2})(?P<mi>\d{2})(?P<s>\d{2}))?"      # optional time: HHMMSS
+)
+
+# Generic recorder/app names that show up as filename prefixes but carry
+# no meaning as a "topic" - stripped out of derive_heading_from_filename's
+# best-effort topic extraction rather than kept as noise.
+_GENERIC_FILENAME_WORDS = {"video", "audio", "recording", "meeting", "aufnahme", "gmt", "rec"}
+
+
+def derive_heading_from_filename(filename: str) -> str | None:
+    """
+    Best-effort extraction of a date (and time, if present) out of a
+    source recording filename, reformatted as "$Y-$M-$D_$H$N$S" (or just
+    "$Y-$M-$D" if no time component is found) - e.g.
+    "Video_2020-04-07_154005.mp4" -> "2020-04-07_154005". If anything
+    else recognizable remains in the filename after removing the date/
+    time and generic recorder-name words (see _GENERIC_FILENAME_WORDS),
+    it's appended as a topic, e.g. "20260704_Sales_Call.mp4" ->
+    "2026-07-04_Sales Call".
+
+    Returns None if no recognizable date pattern is found anywhere in
+    the filename, so callers can fall back to their own default. This is
+    always just a fallback: CONFIG["meeting_title"] (and, for the output
+    filename, output_basename_override) take precedence whenever set -
+    a wrong or missing match here never blocks giving a file a proper
+    name, since the user can always set those instead.
+    """
+    stem = Path(filename).stem
+    match = _FILENAME_DATETIME_RE.search(stem)
+    if not match:
+        return None
+
+    y, m, d = match.group("y"), match.group("m"), match.group("d")
+    if match.group("h"):
+        date_part = f"{y}-{m}-{d}_{match.group('h')}{match.group('mi')}{match.group('s')}"
+    else:
+        date_part = f"{y}-{m}-{d}"
+
+    remainder = (stem[:match.start()] + stem[match.end():]).strip("_- ")
+    topic_words = [w for w in re.split(r"[_\-\s]+", remainder)
+                  if w and w.lower() not in _GENERIC_FILENAME_WORDS]
+    topic = " ".join(topic_words).strip()
+    return f"{date_part}_{topic}" if topic else date_part
+
+
 def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     """
     Return the "<dir>/<stem>" prefix used to name every output file.
@@ -139,8 +187,21 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     Honors output_basename_override (--output-name / GUI field): when
     set, ALL output files use this name instead of the source file's stem
     (e.g. "2026-07-02_Q3-Kickoff" instead of "Video_2026-07-02_100348").
+
+    Otherwise, when use_filename_date_heading is on (default), the stem
+    is derived from a date found in the source filename via
+    derive_heading_from_filename - the same cleanup shown in the example
+    above happens automatically, without needing --output-name. Falls
+    back to the raw filename stem if no date is found, or if
+    use_filename_date_heading is off.
     """
-    stem = (cfg.get("output_basename_override") or "").strip() or Path(source_file).stem
+    override_stem = (cfg.get("output_basename_override") or "").strip()
+    if override_stem:
+        stem = override_stem
+    elif cfg.get("use_filename_date_heading", True):
+        stem = derive_heading_from_filename(Path(source_file).name) or Path(source_file).stem
+    else:
+        stem = Path(source_file).stem
     override = (cfg.get("output_dir_override") or "").strip()
     if override:
         out_dir = Path(override)
@@ -650,7 +711,9 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                     "matching the transcript/slide report timestamps.", qa_start)
 
             if notes_text:
-                title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
+                title = (cfg.get("meeting_title")
+                        or derive_heading_from_filename(filename)
+                        or (prompt_path.stem.upper() + " NOTES"))
                 event_date = cfg.get("meeting_date", "")
                 comments = cfg.get("meeting_comments", "")
                 model_label = (cfg["ollama_notes_model"] if cfg["llm_backend"] == "ollama"
@@ -672,6 +735,7 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                         notes_text, output_prefix + "_notes.docx", filename,
                         title=title, generated_by=cfg["llm_backend"], event_date=event_date,
                         comments=comments,
+                        transcript_text=transcript_text if cfg.get("docx_include_transcript", False) else "",
                     )
                 # Notes PDF: explicit toggle, or automatic when this was a
                 # video-with-slides run and slide-report PDFs are enabled
@@ -1519,7 +1583,9 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
     if not notes_text:
         raise RuntimeError("Notes generation failed (see log above).")
 
-    title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
+    title = (cfg.get("meeting_title")
+            or derive_heading_from_filename(filename)
+            or (prompt_path.stem.upper() + " NOTES"))
     event_date = cfg.get("meeting_date", "")
     comments = cfg.get("meeting_comments", "")
     model_label = cfg["ollama_notes_model"] if cfg["llm_backend"] == "ollama" else cfg["claude_model"]
@@ -1535,7 +1601,8 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
     if cfg.get("notes_format_docx", False):
         reporter.save_notes_docx(notes_text, output_prefix + "_notes.docx", filename,
                                  title=title, generated_by=cfg["llm_backend"], event_date=event_date,
-                                 comments=comments)
+                                 comments=comments,
+                                 transcript_text=transcript_text if cfg.get("docx_include_transcript", False) else "")
     if cfg.get("notes_format_pdf", False):
         if notes_html_path is None:
             notes_html_path = reporter.save_notes_html(notes_text, output_prefix + "_notes.html", filename,

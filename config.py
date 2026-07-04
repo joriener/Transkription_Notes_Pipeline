@@ -257,6 +257,16 @@ CONFIG = {
     # --output-name or the GUI "Output filename" field.
     "output_basename_override": "",
 
+    # When output_basename_override is blank, derive the shared output
+    # prefix (and, separately, the notes heading when meeting_title is
+    # blank) from a date/time found in the source filename instead of
+    # the raw filename itself - e.g. "Video_2020-04-07_154005.mp4"
+    # becomes "2020-04-07_154005" (see
+    # run_pipeline.derive_heading_from_filename). Falls back to the raw
+    # filename stem if no recognizable date is found. Set to False to
+    # keep the original raw-filename-based naming.
+    "use_filename_date_heading": True,
+
     # Legacy internal path, used only as a fallback base for the video-mode
     # temp frame extraction directory when no per-run output dir is set.
     "output_dir":      str(_HERE / "output"),
@@ -267,6 +277,13 @@ CONFIG = {
     "notes_format_html": True,   # styled, print-friendly HTML
     "notes_format_pdf":  False,  # PDF via reporter.save_pdf_from_html (Playwright/weasyprint/pdfkit)
     "notes_format_docx": False,  # real Word document via python-docx
+
+    # Append the full raw transcript as a final section of the Word doc
+    # (after the LLM notes, on a fresh page). Off by default: most runs
+    # just want the notes, and the plain-text transcript is already
+    # written separately as *_transcript_speakers.txt regardless of this
+    # setting. Only takes effect when notes_format_docx is also on.
+    "docx_include_transcript": False,
 
     # Slide-report formats (video mode only, each independently toggleable).
     "report_html": True,   # slide-index HTML report with thumbnails

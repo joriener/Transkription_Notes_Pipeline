@@ -549,3 +549,72 @@ class TestCommitSpeakerIdentities:
             db_path, suggestions, {"SPEAKER_00": "Carla", "SPEAKER_01": "Bert"})
         assert result["SPEAKER_00"]["action"] == "enrolled"
         assert result["SPEAKER_01"] == {"speaker_id": sid, "action": "matched"}
+
+
+# -----------------------------------------------------------------
+# derive_heading_from_filename / resolve_output_prefix date-derived
+# naming (Word export heading/filename feature)
+# -----------------------------------------------------------------
+
+class TestDeriveHeadingFromFilename:
+    def test_date_and_time_with_generic_prefix_stripped(self):
+        assert run_pipeline.derive_heading_from_filename(
+            "Video_2020-04-07_154005.mp4") == "2020-04-07_154005"
+
+    def test_compact_date_with_topic(self):
+        assert run_pipeline.derive_heading_from_filename(
+            "20260704_Sales_Call.mp4") == "2026-07-04_Sales Call"
+
+    def test_zoom_style_prefix_with_dash_time(self):
+        assert run_pipeline.derive_heading_from_filename(
+            "GMT20260704-143022_Weekly_Sync.mp4") == "2026-07-04_143022_Weekly Sync"
+
+    def test_date_only_no_time_no_topic(self):
+        assert run_pipeline.derive_heading_from_filename("2026-07-04.wav") == "2026-07-04"
+
+    def test_no_date_returns_none(self):
+        assert run_pipeline.derive_heading_from_filename("random_no_date_filename.mp4") is None
+
+    def test_extension_stripped_before_matching(self):
+        # A ".mp4" extension must never itself be mistaken for part of
+        # the date/topic.
+        result = run_pipeline.derive_heading_from_filename("20260704_Topic.mp4")
+        assert ".mp4" not in result
+
+    def test_only_generic_word_after_date_yields_no_topic(self):
+        assert run_pipeline.derive_heading_from_filename("Meeting_2026-07-04.mp4") == "2026-07-04"
+
+
+class TestResolveOutputPrefixDateHeading:
+    def test_auto_derives_stem_from_filename_date(self):
+        cfg = {"use_filename_date_heading": True}
+        result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
+        assert result == "/tmp/2020-04-07_154005"
+
+    def test_disabled_keeps_raw_stem(self):
+        cfg = {"use_filename_date_heading": False}
+        result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
+        assert result == "/tmp/Video_2020-04-07_154005"
+
+    def test_basename_override_always_wins(self):
+        cfg = {"output_basename_override": "MyCustomName", "use_filename_date_heading": True}
+        result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
+        assert result == "/tmp/MyCustomName"
+
+    def test_no_date_in_filename_falls_back_to_raw_stem(self):
+        cfg = {"use_filename_date_heading": True}
+        result = run_pipeline.resolve_output_prefix("/tmp/random_no_date.mp4", cfg)
+        assert result == "/tmp/random_no_date"
+
+    def test_output_dir_override_combined_with_date_stem(self, tmp_path):
+        out_dir = tmp_path / "out"
+        cfg = {"use_filename_date_heading": True, "output_dir_override": str(out_dir)}
+        result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
+        assert result == str(out_dir / "2020-04-07_154005")
+
+    def test_default_behavior_uses_date_heading_when_key_absent(self):
+        # use_filename_date_heading defaults to True when the key is
+        # missing from cfg entirely (matches config.py's default).
+        cfg = {}
+        result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
+        assert result == "/tmp/2020-04-07_154005"
