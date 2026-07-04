@@ -1882,12 +1882,22 @@ class RunTabController:
                     commit_result = run_pipeline.commit_speaker_identities(
                         db_path or overrides.get("db_path") or CONFIG["db_path"],
                         speaker_suggestions, mapping)
-                    for label, info in commit_result.items():
+                    if commit_result:
+                        for label, info in commit_result.items():
+                            self.log_queue.put(
+                                f"Speaker roster: {label} -> {info['action']} "
+                                f"(known_speakers id {info['speaker_id']})")
+                    else:
                         self.log_queue.put(
-                            f"Speaker roster: {label} -> {info['action']} "
-                            f"(known_speakers id {info['speaker_id']})")
+                            "WARNING: known-speaker roster not updated - none of the "
+                            "renamed labels had a computed voiceprint (embedding "
+                            "extraction may have failed for those speakers).")
                 except Exception as exc:
                     self.log_queue.put(f"WARNING: could not update known-speaker roster: {exc}")
+            else:
+                self.log_queue.put(
+                    "Speaker roster: not updated (no voiceprint suggestions were "
+                    "available for this run).")
             result = run_pipeline.rename_speakers(
                 segments_json_path, mapping, overrides, regenerate_notes=regenerate_notes)
             self.log_queue.put(f"=== SPEAKER RENAME DONE: {result['renamed_segments']} segment(s) "
@@ -2604,14 +2614,18 @@ class SpeakerRenameDialog(tk.Toplevel):
         ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="right")
         ttk.Button(btn_row, text="Cancel", command=self._on_close).pack(side="right", padx=(0, 6))
 
-        # Tracks whether _compute_suggestions_worker is still running (V1.20).
-        # _apply() checks this before committing to known_speakers: without
-        # it, clicking Apply while the background pyannote embedding
-        # extraction is still in flight silently skipped roster enrollment
-        # entirely (self._suggestions was still {} at that point), with no
-        # error and no log line, since renaming itself never depended on
-        # suggestions being ready.
+        # Tracks whether _compute_suggestions_worker is still running (V1.20),
+        # and the error text if it already finished but failed (V1.21).
+        # _apply() checks both before committing to known_speakers: without
+        # this, clicking Apply either while the background pyannote
+        # embedding extraction is still in flight, OR after it already
+        # finished with an error (e.g. a gated HuggingFace model not yet
+        # accepted), silently skipped roster enrollment entirely
+        # (self._suggestions stays {} in both cases), with no warning and
+        # no log line, since renaming itself never depended on suggestions
+        # being ready.
         self._suggestions_pending = False
+        self._suggestions_error: str | None = None
 
         if self.controller.app.enable_speaker_id_var.get():
             if self.source_media_path and Path(self.source_media_path).exists():
@@ -2645,6 +2659,7 @@ class SpeakerRenameDialog(tk.Toplevel):
             return
         self._suggestions_pending = False
         if status == "error":
+            self._suggestions_error = payload
             self._status_var.set(f"Voiceprint suggestions failed: {payload}")
             return
         self._suggestions = payload
@@ -2707,6 +2722,17 @@ class SpeakerRenameDialog(tk.Toplevel):
                 "either way, but if you continue now, none of these speakers "
                 "will be added to your known-speakers roster this time.\n\n"
                 "Continue without waiting?")
+            if not proceed:
+                return
+        elif self._suggestions_error and not self._suggestions:
+            proceed = messagebox.askyesno(
+                "Voiceprint suggestions failed",
+                "Voiceprint suggestions could not be computed for this file, "
+                "so none of these speakers will be added to your "
+                "known-speakers roster. The rename itself is unaffected and "
+                "will still work normally.\n\n"
+                f"Error: {self._suggestions_error}\n\n"
+                "Continue with the rename anyway?")
             if not proceed:
                 return
         regenerate_notes = self.regenerate_notes_var.get()
