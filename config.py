@@ -116,6 +116,29 @@ CONFIG = {
                                           # of hash_threshold.
 
     # =========================================================
+    # Q&A SECTION  (optional, e.g. the Q&A block at the end of a
+    # webinar where only the speakers are shown, no slides)
+    # =========================================================
+    # Start of the Q&A section, in seconds, using the ALREADY-CONVERTED
+    # real time also shown everywhere else (transcript, slide report;
+    # i.e. after recording_speed is applied). None/0 = disabled
+    # (default). From this point onward (to qa_end_time_sec, or the end
+    # of the recording if that is not set): no new slides are detected
+    # (frames in this range are excluded before slide-change detection
+    # runs, so the last slide shown before the range simply stays as the
+    # final one), and the matching transcript is summarised separately
+    # by prompts/qa_summary.md and appended to the notes, instead of
+    # being folded into the main summary. Set via --qa-start or the GUI
+    # "Q&A section" fields (accepts seconds or mm:ss / hh:mm:ss there).
+    "qa_start_time_sec": None,
+
+    # End of the Q&A section, in seconds (same real-time convention as
+    # qa_start_time_sec). None (default) = to the end of the recording.
+    # Only used together with qa_start_time_sec. Set via --qa-end or the
+    # GUI.
+    "qa_end_time_sec": None,
+
+    # =========================================================
     # EXTERNAL TOOLS
     # =========================================================
     "losslesscut_path": "",  # Full path to LosslessCut.exe (free, MIT licence,

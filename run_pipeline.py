@@ -44,6 +44,8 @@
 #    python run_pipeline.py --output-name "2026-07-03_Q3-Kickoff" "call.mp4"  (custom base filename)
 #    python run_pipeline.py --reannotate-failed "file_slides/file_slides.json"  (retry failed VLM slides only)
 #    python run_pipeline.py --min-slide-duration 3.5 "webinar.mp4"  (animation debounce override)
+#    python run_pipeline.py --qa-start 1215 "webinar.mp4"       (Q&A from 20:15 to the end: no new
+#                                                                 slides there, separate Q&A summary)
 #    python run_pipeline.py --gui                             (parameter GUI)
 #
 #  FORMAT list.txt (pipe separator for language is optional):
@@ -94,8 +96,7 @@ log = logging.getLogger("Transkription_Notes_Pipeline")
 def setup_logging(level: str = "INFO", log_to_file: bool = False,
                   log_dir: str | None = None) -> Path | None:
     """Configure root logging. If log_to_file is set, also writes a
-    timestamped copy of this run's log under log_dir and returns its
-    path (used by the GUI Settings tab / CLI banner); otherwise None."""
+    timestamped copy of this run's log under log_dir (used by the GUI Settings tab / CLI banner); otherwise None."""
     handlers = [logging.StreamHandler()]
     log_file_path = None
     if log_to_file:
@@ -374,6 +375,31 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
             log.error("Frame extraction failed: %s", exc)
             frames = []
 
+        qa_start = cfg.get("qa_start_time_sec")
+        qa_end = cfg.get("qa_end_time_sec")
+        if qa_start and frames:
+            # Q&A section (task #61): drop frames in the Q&A range before
+            # slide-change detection ever sees them, so no new slides can
+            # be recorded there. Times are converted from the already-
+            # converted real-time clock (matching qa_start_time_sec's
+            # convention) back to the raw video clock frame_index/fps is
+            # measured in, using the same recording_speed factor applied
+            # elsewhere (see _rescale_slide_changes).
+            speed = cfg.get("recording_speed", 1.0)
+            qa_start_raw = qa_start * speed
+            qa_end_raw = qa_end * speed if qa_end else None
+            before_count = len(frames)
+            frames = [
+                f for idx, f in enumerate(frames)
+                if not (idx / cfg["fps"] >= qa_start_raw
+                       and (qa_end_raw is None or idx / cfg["fps"] < qa_end_raw))
+            ]
+            skipped = before_count - len(frames)
+            if skipped:
+                log.info("Q&A range configured (from %.0fs%s): skipped %d frame(s), no new "
+                         "slides will be detected there.", qa_start,
+                         f" to {qa_end:.0f}s" if qa_end else " to end of recording", skipped)
+
         changes = detector.detect_slide_changes(
             frames=frames, fps=cfg["fps"], threshold=cfg["hash_threshold"],
             algorithm=cfg["hash_algorithm"], min_slide_duration_sec=cfg["min_slide_duration_sec"],
@@ -549,7 +575,24 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
 
         if prompt_path:
             log.info("STAGE:notes")
-            if enable_slides:
+
+            # Q&A section (task #61): if configured, keep the Q&A portion
+            # out of the main transcript fed to the main prompt (so it
+            # does not dilute the main summary), and collect it
+            # separately for its own focused Q&A summary below. Times use
+            # the already-converted real-time clock, same as segments
+            # (segments were rescaled by recording_speed back in Step 1).
+            qa_start = cfg.get("qa_start_time_sec")
+            qa_end = cfg.get("qa_end_time_sec")
+            qa_segments: list[dict] = []
+            if qa_start:
+                main_segments = [s for s in segments if s.get("start", 0) < qa_start]
+                qa_segments = [
+                    s for s in segments
+                    if s.get("start", 0) >= qa_start and (not qa_end or s.get("start", 0) < qa_end)
+                ]
+                transcript_text = notes.build_transcript_text_from_segments(main_segments)
+            elif enable_slides:
                 transcript_text = notes.build_transcript_text_from_segments(segments)
             else:
                 speakers_file = transcriber.transcript_cache_paths(output_prefix)["speakers"]
@@ -569,6 +612,42 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                 meeting_title=cfg.get("meeting_title", ""),
                 meeting_date=cfg.get("meeting_date", ""),
             )
+
+            if notes_text and qa_segments:
+                qa_transcript_text = notes.build_transcript_text_from_segments(qa_segments)
+                try:
+                    qa_prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, "qa_summary")
+                except FileNotFoundError as exc:
+                    log.warning("Q&A summary skipped: %s", exc)
+                    qa_prompt_path = None
+                if qa_prompt_path:
+                    qa_summary = notes.generate_notes(
+                        transcript_text=qa_transcript_text,
+                        prompt_path=qa_prompt_path,
+                        llm_backend=cfg["llm_backend"],
+                        ollama_base_url=cfg["ollama_base_url"],
+                        ollama_notes_model=cfg["ollama_notes_model"],
+                        anthropic_api_key=cfg["anthropic_api_key"],
+                        claude_model=cfg["claude_model"],
+                        filename=filename,
+                        single_pass_limit=cfg["single_pass_limit"],
+                        chunk_size=cfg["chunk_size"],
+                        meeting_title=cfg.get("meeting_title", ""),
+                        meeting_date=cfg.get("meeting_date", ""),
+                    )
+                    if qa_summary:
+                        notes_text = notes_text.rstrip() + "\n\n" + qa_summary.strip()
+                        log.info("Q&A summary appended (%d transcript segment(s), from %.0fs%s).",
+                                 len(qa_segments), qa_start,
+                                 f" to {qa_end:.0f}s" if qa_end else " to end of recording")
+                    else:
+                        log.warning("Q&A summary generation failed - main notes saved without it.")
+            elif qa_start and not qa_segments:
+                log.warning(
+                    "qa_start_time_sec (%.0fs) is set but no transcript segments start at/after "
+                    "it - check the value: it must be already-converted real time in seconds, "
+                    "matching the transcript/slide report timestamps.", qa_start)
+
             if notes_text:
                 title = cfg.get("meeting_title") or (prompt_path.stem.upper() + " NOTES")
                 event_date = cfg.get("meeting_date", "")
@@ -768,12 +847,13 @@ def reannotate_failed_slides(slides_json_path: str, overrides: dict | None = Non
 
 def apply_slide_edits(slides: list[dict], edits: dict) -> list[dict]:
     """
-    Apply omit/merge edits to a list of slide dicts loaded from an
+    Apply title/omit/merge edits to a list of slide dicts loaded from an
     existing *_slides.json, returning a new, rebuilt list. Does not
     mutate slides or edits.
 
     edits schema (also the on-disk format of <stem>_slides_edits.json):
-      {"omit_indices": [1, 4], "merge_next_indices": [6, 7]}
+      {"omit_indices": [1, 4], "merge_next_indices": [6, 7],
+       "title_overrides": {"2": "Corrected Title"}}
     omit_indices: 0-based indices into the ORIGINAL slides list to drop
     entirely from the rebuilt output.
     merge_next_indices: 0-based indices whose slide is merged INTO the
@@ -783,10 +863,23 @@ def apply_slide_edits(slides: list[dict], edits: dict) -> list[dict]:
     segments are concatenated, and the LAST slide's title/snapshot/type
     are kept (normally the most complete view of that content). Chaining
     (e.g. both 6 and 7 marked) merges 6, 7, 8 into a single entry.
+    title_overrides (task #64): maps a 0-based ORIGINAL slide index
+    (string key, for JSON compatibility) to a replacement title. Applied
+    BEFORE merge, so a merged group's kept title (see _merge_slide_group)
+    reflects the edit.
     """
     omit = set(edits.get("omit_indices", []) or [])
     merge_next = set(edits.get("merge_next_indices", []) or [])
+    title_overrides = edits.get("title_overrides") or {}
     n = len(slides)
+
+    if title_overrides:
+        slides = [dict(s) for s in slides]
+        for key, new_title in title_overrides.items():
+            idx = int(key)
+            if 0 <= idx < n:
+                slides[idx]["title"] = new_title
+
     result: list[dict] = []
     i = 0
     while i < n:
@@ -953,6 +1046,83 @@ def run_file_list(list_file: str, overrides: dict, stop_check=None) -> None:
         run_overrides = dict(overrides)
         if lang:
             run_overrides["whisper_language"] = lang
+        try:
+            success = process_file(file, run_overrides, stop_check=stop_check)
+            dur = (datetime.now() - t_start).seconds
+            write_log(log_file, f"[{i}] {'OK' if success else 'NOT FOUND'} ({dur}s): {file}")
+            ok += 1 if success else 0
+            errors += 0 if success else 1
+        except Exception as e:
+            dur = (datetime.now() - t_start).seconds
+            log.error("ERROR: %s", e)
+            write_log(log_file, f"[{i}] ERROR ({dur}s): {file} -- {e}")
+            write_log(log_file, traceback.format_exc())
+            errors += 1
+    write_log(log_file, f"Done: OK={ok} Errors={errors} Skipped={skipped}")
+    log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
+
+
+def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None) -> None:
+    """
+    Batch-process a list of per-file row dicts (task #62), built from the
+    GUI's editable batch table. Unlike run_file_list's "path|lang" text
+    format, each row can carry its own settings on top of the shared
+    overrides, since Q&A timing/title/date/comments vary per recording
+    and don't fit cleanly into one delimited line.
+
+    Row keys (only "file" is required; all others optional, blank/None
+    means "use the shared value from the fields above"): file, language,
+    meeting_title, meeting_date, meeting_comments, qa_start_time_sec,
+    qa_end_time_sec.
+
+    Resume/retry and logging mirror run_file_list: a file already fully
+    processed (notes generated) is skipped unless force_retranscribe is
+    set, and a per-run log is written next to the first file's folder.
+    """
+    cfg = build_run_config(overrides)
+    force = bool(cfg.get("force_retranscribe"))
+    db.validate_schema(cfg["db_path"])
+
+    first_file = next((r.get("file") for r in rows if r.get("file")), None)
+    log_dir = Path(first_file).parent if first_file else Path(".")
+    log_file = log_dir / f"batch_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    log.info("BATCH (table): %d file(s)", len(rows))
+    write_log(log_file, f"Batch (table): {datetime.now()} | {len(rows)} files")
+
+    row_override_keys = ("language", "meeting_title", "meeting_date", "meeting_comments",
+                         "qa_start_time_sec", "qa_end_time_sec")
+    # "language" is a row-only convenience name; process_file's config key is
+    # whisper_language, matching run_file_list's existing |lang convention.
+    row_to_cfg_key = {"language": "whisper_language"}
+
+    ok, errors, skipped = 0, 0, 0
+    for i, row in enumerate(rows, 1):
+        file = (row.get("file") or "").strip()
+        if not file:
+            continue
+        if stop_check is not None and stop_check():
+            log.info("Stop requested - halting batch after %d/%d file(s).", i - 1, len(rows))
+            write_log(log_file, f"Stopped by user before [{i}]: {file}")
+            break
+
+        if not force:
+            conn = db.get_connection(cfg["db_path"])
+            done = db.get_completed_transcript(conn, str(Path(file)))
+            conn.close()
+            if done:
+                log.info("[%d/%d] SKIPPED (already processed on %s): %s",
+                         i, len(rows), done.get("processed_at", "?"), file)
+                write_log(log_file, f"[{i}] SKIPPED (already done {done.get('processed_at','?')}): {file}")
+                skipped += 1
+                continue
+
+        log.info("[%d/%d] %s", i, len(rows), file)
+        t_start = datetime.now()
+        run_overrides = dict(overrides)
+        for key in row_override_keys:
+            val = row.get(key)
+            if val not in (None, ""):
+                run_overrides[row_to_cfg_key.get(key, key)] = val
         try:
             success = process_file(file, run_overrides, stop_check=stop_check)
             dur = (datetime.now() - t_start).seconds
@@ -1196,6 +1366,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-slide-duration", type=float, metavar="SEC",
                    help="Minimum seconds a slide must be shown to count as a real change "
                         "(debounce for animations/transitions). Default: 2.0.")
+    p.add_argument("--qa-start", type=float, metavar="SEC",
+                   help="Start of a Q&A section, in seconds (already-converted real time, "
+                        "matching the transcript/slide report). No new slides are detected from "
+                        "this point onward (to --qa-end, or the end of the recording). The "
+                        "matching transcript gets a separate, focused Q&A summary "
+                        "(prompts/qa_summary.md) appended to the notes, instead of being folded "
+                        "into the main summary.")
+    p.add_argument("--qa-end", type=float, metavar="SEC",
+                   help="End of the Q&A section, in seconds. Only used together with --qa-start. "
+                        "Default: to the end of the recording.")
     p.add_argument("--animation-threshold", type=int, metavar="N",
                    help="Distances between this and --threshold are treated as the current slide "
                         "still building (e.g. bullets appearing one at a time), instead of a new "
@@ -1270,6 +1450,8 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "hash_threshold":      args.threshold,
         "min_slide_duration_sec": args.min_slide_duration,
         "animation_threshold": args.animation_threshold,
+        "qa_start_time_sec": args.qa_start,
+        "qa_end_time_sec": args.qa_end,
         "recording_speed":     args.recording_speed,
         "convert_video_to_realtime": True if args.normalize_speed else None,
         "title_slide_image_path": args.title_image,
