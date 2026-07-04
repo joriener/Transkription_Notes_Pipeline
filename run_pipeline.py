@@ -407,6 +407,17 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                 cfg["whisper_language"] or "auto", len(segments), duration,
             )
             conn.close()
+
+        # Record the exact source path next to the segments cache (V1.19),
+        # regardless of whether this was a cache hit or a fresh
+        # transcription. This is the authoritative lookup find_source_media
+        # uses first: output_prefix's stem may be a derived date/topic
+        # heading (use_filename_date_heading) or an explicit
+        # output_basename_override, neither of which reliably matches the
+        # raw source filename, which previously broke source-media lookup
+        # for the Rename Speakers dialog's voiceprint suggestions and Play
+        # Sample button.
+        Path(output_prefix + "_source_media.txt").write_text(file, encoding="utf-8")
     else:
         log.info("Transcription disabled (--no-whisper).")
 
@@ -1028,22 +1039,54 @@ def rename_speakers(segments_json_path: str, speaker_mapping: dict,
 
 def find_source_media(segments_json_path: str) -> str | None:
     """
-    Locate the original audio/video file next to a *_segments.json cache,
-    by matching <same-stem>.<supported extension> in the same folder
-    (same lookup rename_speakers already does inline for its transcript
-    header, factored out here so gui.py can resolve it up front for
-    speaker identification too).
+    Locate the original audio/video file next to a *_segments.json cache.
 
-    Returns None if no matching file is found (e.g. the source media was
-    moved or deleted after transcription) - rename_speakers still works
-    without it since it only needs the segment cache, but
-    get_speaker_suggestions needs to re-read the actual audio.
+    Tries, in order:
+      1. The "<prefix>_source_media.txt" sidecar written by process_file
+         (V1.19) - the authoritative record of the exact source path used
+         for that run, immune to any output-naming scheme, including
+         output_basename_override, where the stem carries no relationship
+         to the source filename at all.
+      2. A same-stem match next to the segments.json (the pre-V1.17
+         behaviour: <stem>.<supported extension> in the same folder).
+         Still correct whenever use_filename_date_heading is off, or for
+         runs that predate the sidecar file.
+      3. A reverse-derived match: for each supported media file in the
+         folder, recompute the date-derived heading
+         (derive_heading_from_filename) that resolve_output_prefix would
+         have used for it, and compare against the segments.json stem.
+         Covers files already processed under V1.17/V1.18's
+         use_filename_date_heading default (True), before this sidecar
+         existed, where the raw filename no longer matches the output
+         prefix - this was a real regression: it silently broke the
+         Rename Speakers dialog's voiceprint suggestions and Play Sample
+         button, since both are gated on this lookup succeeding.
+
+    Returns None if none of the above find a match (e.g. the source media
+    was moved or deleted after transcription) - rename_speakers still
+    works without it since it only needs the segment cache, but
+    get_speaker_suggestions/the Play Sample button need to re-read the
+    actual audio.
     """
     path = Path(segments_json_path)
     stem = path.name.replace("_segments.json", "")
+
+    sidecar = path.parent / f"{stem}_source_media.txt"
+    if sidecar.exists():
+        recorded = sidecar.read_text(encoding="utf-8").strip()
+        if recorded and Path(recorded).exists():
+            return recorded
+
     for candidate in path.parent.glob(f"{stem}.*"):
         if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
             return str(candidate)
+
+    for candidate in path.parent.iterdir():
+        if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+            derived = derive_heading_from_filename(candidate.name)
+            if derived and derived == stem:
+                return str(candidate)
+
     return None
 
 

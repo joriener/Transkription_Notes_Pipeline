@@ -618,3 +618,63 @@ class TestResolveOutputPrefixDateHeading:
         cfg = {}
         result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
         assert result == "/tmp/2020-04-07_154005"
+
+
+# -----------------------------------------------------------------
+# find_source_media (V1.19 regression fix)
+#
+# use_filename_date_heading (V1.17, default True) makes the segments.json
+# stem a derived date/topic heading instead of the raw source filename
+# stem. find_source_media used to do a plain same-stem glob match, which
+# broke for nearly every run once that default shipped: it silently
+# returned None, which disabled both the Rename Speakers dialog's
+# voiceprint suggestions and its Play Sample button (both gated on this
+# lookup succeeding). These tests cover the fix: a "_source_media.txt"
+# sidecar (authoritative, written going forward), the legacy exact-stem
+# match (still correct when date-heading is off), and a reverse-derive
+# fallback so files already processed under V1.17/V1.18 resolve without
+# reprocessing.
+# -----------------------------------------------------------------
+
+class TestFindSourceMedia:
+    def test_sidecar_is_authoritative(self, tmp_path):
+        src = tmp_path / "Video_2020-04-07_154005.mp4"
+        src.write_bytes(b"fake")
+        segments_json = tmp_path / "2020-04-07_154005_segments.json"
+        segments_json.write_text("[]")
+        (tmp_path / "2020-04-07_154005_source_media.txt").write_text(str(src))
+        assert run_pipeline.find_source_media(str(segments_json)) == str(src)
+
+    def test_legacy_exact_stem_match_without_sidecar(self, tmp_path):
+        src = tmp_path / "meeting_notes.wav"
+        src.write_bytes(b"fake")
+        segments_json = tmp_path / "meeting_notes_segments.json"
+        segments_json.write_text("[]")
+        assert run_pipeline.find_source_media(str(segments_json)) == str(src)
+
+    def test_reverse_derive_fallback_for_date_heading_stem(self, tmp_path):
+        # Simulates a file processed under V1.17/V1.18 before the sidecar
+        # existed: segments.json carries the derived stem, the source
+        # file still has its original name, exact-stem match fails.
+        src = tmp_path / "Video_2020-04-07_154005.mp4"
+        src.write_bytes(b"fake")
+        segments_json = tmp_path / "2020-04-07_154005_segments.json"
+        segments_json.write_text("[]")
+        assert run_pipeline.find_source_media(str(segments_json)) == str(src)
+
+    def test_returns_none_when_source_media_missing(self, tmp_path):
+        segments_json = tmp_path / "2020-04-07_154005_segments.json"
+        segments_json.write_text("[]")
+        assert run_pipeline.find_source_media(str(segments_json)) is None
+
+    def test_sidecar_ignored_if_it_points_to_a_missing_file(self, tmp_path):
+        # Sidecar exists but the path it records is stale (media moved/
+        # deleted) - must fall through to the other strategies rather
+        # than returning a dangling path.
+        src = tmp_path / "Video_2020-04-07_154005.mp4"
+        src.write_bytes(b"fake")
+        segments_json = tmp_path / "2020-04-07_154005_segments.json"
+        segments_json.write_text("[]")
+        (tmp_path / "2020-04-07_154005_source_media.txt").write_text(
+            str(tmp_path / "gone.mp4"))
+        assert run_pipeline.find_source_media(str(segments_json)) == str(src)
