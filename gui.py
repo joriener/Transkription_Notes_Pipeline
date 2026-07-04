@@ -1108,6 +1108,8 @@ class RunTabController:
                       command=self._on_reannotate_failed).pack(side="left", padx=(6, 0))
         ttk.Button(run_frame, text="Open in LosslessCut...",
                   command=self._open_in_losslesscut).pack(side="left", padx=(6, 0))
+        ttk.Button(run_frame, text="Rename Speakers...",
+                  command=self._on_rename_speakers).pack(side="left", padx=(6, 0))
         if is_video:
             ttk.Button(run_frame, text="Review / Edit Slides...",
                       command=self._open_slide_review).pack(side="left", padx=(6, 0))
@@ -1365,6 +1367,61 @@ class RunTabController:
             subprocess.Popen([exe, path])
         except Exception as exc:
             messagebox.showerror("Could not launch LosslessCut", str(exc))
+
+    def _on_rename_speakers(self):
+        """Open the post-hoc speaker renaming dialog (task #76): pick an
+        existing *_transcript_speakers.txt, detect its speaker labels from
+        the matching *_segments.json cache, and let the user map each
+        label to a real name. See run_pipeline.rename_speakers/
+        get_speaker_labels. Available on both tabs - diarization can be
+        used for a plain meeting recording just as much as a video."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Busy", "A run is already in progress.")
+            return
+        transcript_path = filedialog.askopenfilename(
+            title="Select *_transcript_speakers.txt",
+            filetypes=[("Transcript", "*_transcript_speakers.txt"), ("All files", "*.*")],
+        )
+        if not transcript_path:
+            return
+        segments_json_path = str(transcript_path).replace("_transcript_speakers.txt", "_segments.json")
+        labels = run_pipeline.get_speaker_labels(segments_json_path)
+        if not labels:
+            messagebox.showwarning(
+                "No speaker labels found",
+                f"No speaker labels found for:\n{transcript_path}\n\n"
+                f"Expected segment cache: {Path(segments_json_path).name}\n\n"
+                "Either diarization was not enabled for this run, or the segment "
+                "cache is missing (needed for a rename; the already-formatted "
+                ".txt file alone is not enough).")
+            return
+        SpeakerRenameDialog(self, segments_json_path, labels)
+
+    def _run_rename_speakers_worker(self, segments_json_path: str, mapping: dict, regenerate_notes: bool):
+        handler = QueueLogHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        level = getattr(logging, self.app.log_level_var.get().upper(), logging.INFO)
+        root_logger.setLevel(level)
+        try:
+            overrides = self._build_overrides()
+            result = run_pipeline.rename_speakers(
+                segments_json_path, mapping, overrides, regenerate_notes=regenerate_notes)
+            self.log_queue.put(f"=== SPEAKER RENAME DONE: {result['renamed_segments']} segment(s) "
+                               f"updated ===")
+            if regenerate_notes:
+                if result.get("notes_regenerated"):
+                    self.log_queue.put("=== NOTES REGENERATED ===")
+                else:
+                    self.log_queue.put("=== NOTES NOT REGENERATED (see log above) ===")
+        except Exception as exc:
+            self.log_queue.put(f"FATAL ERROR: {exc}")
+            import traceback
+            self.log_queue.put(traceback.format_exc())
+        finally:
+            root_logger.removeHandler(handler)
+            self.log_queue.put("__RUN_COMPLETE__")
 
     def _open_slide_review(self):
         """Open the slide review/reprocess window (task #58, video tab
@@ -1876,6 +1933,76 @@ class RunTabController:
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log_queue)
+
+
+class SpeakerRenameDialog(tk.Toplevel):
+    """
+    Modal window (task #76): post-hoc speaker renaming. Lists the distinct
+    speaker labels found in an existing *_segments.json cache, lets the
+    user type a replacement name for each, and applies the rename on
+    Apply via run_pipeline.rename_speakers (rewrites *_segments.json,
+    *_transcript_speakers.txt, *_text.txt, *_transcript.srt; optionally
+    also regenerates notes). Runs in the same background worker thread/
+    log_queue infrastructure as a normal pipeline run, so it can't overlap
+    with one and its progress shows in the same log panel.
+    """
+
+    def __init__(self, controller, segments_json_path: str, labels: list):
+        super().__init__(controller.root)
+        self.controller = controller
+        self.segments_json_path = segments_json_path
+        self.title("Rename Speakers")
+        self.resizable(False, False)
+        self.transient(controller.root)
+
+        ttk.Label(self, text=f"File: {Path(segments_json_path).name}",
+                 foreground="#666").pack(anchor="w", padx=10, pady=(10, 4))
+        ttk.Label(self, text="Enter a new name for any speaker you want to rename. "
+                             "Leave unchanged to keep the original label.",
+                 foreground="#666", wraplength=380).pack(anchor="w", padx=10, pady=(0, 8))
+
+        rows_frame = ttk.Frame(self)
+        rows_frame.pack(fill="x", padx=10)
+        self._vars = {}
+        for i, label in enumerate(labels):
+            ttk.Label(rows_frame, text=label, width=16).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Label(rows_frame, text="->").grid(row=i, column=1, padx=6)
+            var = tk.StringVar(value=label)
+            ttk.Entry(rows_frame, textvariable=var, width=24).grid(row=i, column=2, sticky="w")
+            self._vars[label] = var
+
+        self.regenerate_notes_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self, text="Also regenerate notes with the new names",
+                       variable=self.regenerate_notes_var).pack(anchor="w", padx=10, pady=(8, 0))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="right")
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 6))
+
+    def _apply(self):
+        mapping = {old: var.get().strip() for old, var in self._vars.items()
+                  if var.get().strip() and var.get().strip() != old}
+        if not mapping:
+            messagebox.showinfo("Nothing to rename", "No labels were changed.")
+            return
+        regenerate_notes = self.regenerate_notes_var.get()
+        segments_json_path = self.segments_json_path
+        self.destroy()
+
+        c = self.controller
+        c._clear_log()
+        c.run_button.config(state="disabled")
+        c.stop_button.config(state="disabled")
+        c.status_label.config(text="Renaming speakers...")
+        c.progress_var.set(0)
+        c.stage_label.config(text="")
+        c.worker_thread = threading.Thread(
+            target=c._run_rename_speakers_worker,
+            args=(segments_json_path, mapping, regenerate_notes),
+            daemon=True,
+        )
+        c.worker_thread.start()
 
 
 class SlideReviewDialog(tk.Toplevel):

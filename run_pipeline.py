@@ -839,6 +839,118 @@ def reannotate_failed_slides(slides_json_path: str, overrides: dict | None = Non
 
 
 # ---------------------------------------------------------------------------
+# Post-hoc speaker renaming (task #76): rename SPEAKER_00/SPEAKER_01/...
+# diarization labels to real names after the fact, using the cached
+# *_segments.json as the source of truth. Used by gui.py's
+# SpeakerRenameDialog.
+# ---------------------------------------------------------------------------
+
+def get_speaker_labels(segments_json_path: str) -> list[str]:
+    """
+    Return the sorted distinct speaker labels found in an existing
+    *_segments.json cache (written by process_file's transcription stage),
+    or [] if the file is missing, unreadable, or has no speaker field on
+    any segment (e.g. diarization was off for that run).
+    """
+    path = Path(segments_json_path)
+    if not path.exists():
+        return []
+    try:
+        segments = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    return sorted({s.get("speaker") for s in segments if s.get("speaker")})
+
+
+def rename_speakers(segments_json_path: str, speaker_mapping: dict,
+                    overrides: dict | None = None, regenerate_notes: bool = False) -> dict:
+    """
+    Rename speaker labels in an existing transcript (task #76), using the
+    cached *_segments.json (produced by process_file's transcription
+    stage) as the source of truth for the word-level segment data. Does
+    NOT re-run whisperx, alignment, or diarization.
+
+    speaker_mapping: {old_label: new_label}. Entries with a blank/falsy
+    new_label, or where new_label equals old_label, are no-ops. A label
+    not present in the transcript is silently ignored.
+
+    Rewrites *_segments.json in place (so the rename survives a later
+    cache-aware run that reloads it, e.g. a --no-summary re-run), then
+    regenerates *_transcript_speakers.txt, *_text.txt, and
+    *_transcript.srt from the renamed segments via
+    transcriber.write_transcript_files. If regenerate_notes is True and
+    at least one segment was renamed, also regenerates *_notes.* by
+    calling run_notes_only on the freshly rewritten
+    *_transcript_speakers.txt (notes generation failure there is logged
+    as a warning, not raised, since the rename itself already succeeded).
+
+    Returns {"renamed_segments": <count>, "labels_found": [...],
+    "speakers_path": <path>, "notes_regenerated": <bool, only present if
+    regenerate_notes was requested>}.
+
+    Raises FileNotFoundError if segments_json_path does not exist: a
+    rename needs the word-level segment cache, and there is no reliable
+    way to recover it by re-parsing the already-formatted .txt output
+    (word-level timestamps would be lost).
+    """
+    path = Path(segments_json_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No segment cache found: {path}. Speaker renaming needs the "
+            f"*_segments.json produced during transcription; re-run the "
+            f"pipeline once (with --force-retranscribe if it already ran "
+            f"without this cache) to create it."
+        )
+    segments = json.loads(path.read_text(encoding="utf-8"))
+    labels_found = sorted({s.get("speaker") for s in segments if s.get("speaker")})
+    mapping = {k: v for k, v in (speaker_mapping or {}).items() if v and v != k}
+
+    renamed_count = 0
+    for seg in segments:
+        spk = seg.get("speaker")
+        if spk and spk in mapping:
+            seg["speaker"] = mapping[spk]
+            renamed_count += 1
+    path.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Derive output_prefix and a display name for the transcript header
+    # from the segments.json naming convention (<prefix>_segments.json),
+    # matching how reannotate_failed_slides locates its source video.
+    output_prefix = str(path.parent / path.name.replace("_segments.json", ""))
+    source_label = Path(output_prefix).name
+    for candidate in path.parent.glob(f"{source_label}.*"):
+        if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+            source_label = str(candidate)
+            break
+
+    cfg = build_run_config(overrides or {})
+    paths = transcriber.write_transcript_files(
+        source_label, segments, output_prefix,
+        recording_speed=cfg.get("recording_speed", 1.0),
+    )
+    log.info("Speaker rename complete: %d segment(s) updated. Labels: %s",
+             renamed_count, labels_found)
+
+    result = {
+        "renamed_segments": renamed_count,
+        "labels_found": labels_found,
+        "speakers_path": paths["speakers"],
+    }
+    if regenerate_notes:
+        if renamed_count:
+            try:
+                run_notes_only(paths["speakers"], overrides or {})
+                result["notes_regenerated"] = True
+            except Exception as exc:
+                log.warning("Notes regeneration after speaker rename failed: %s", exc)
+                result["notes_regenerated"] = False
+        else:
+            log.info("No segments were renamed - skipping notes regeneration.")
+            result["notes_regenerated"] = False
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Slide review/reprocess (task #58): omit or merge detected slides after
 # the fact, then rebuild only the report outputs, without re-running
 # transcription, frame extraction, slide-change detection, or VLM

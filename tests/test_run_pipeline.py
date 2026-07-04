@@ -9,6 +9,7 @@
 #  Run: pytest tests/test_run_pipeline.py -v
 # =============================================================
 
+import json
 import sys
 from pathlib import Path
 
@@ -337,3 +338,125 @@ class TestRunBatchRowsProgressCallback:
         # Must not raise, and process_file must still have been called.
         run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")},
                                     progress_callback=bad_callback)
+
+
+# -----------------------------------------------------------------
+# get_speaker_labels / rename_speakers (task #76)
+# -----------------------------------------------------------------
+
+def make_segments(*speakers_and_text):
+    """speakers_and_text: list of (speaker, text) tuples -> segment dicts
+    with incrementing start/end, matching transcriber.transcribe's output
+    shape closely enough for rename_speakers/get_speaker_labels."""
+    segs = []
+    for i, (speaker, text) in enumerate(speakers_and_text):
+        segs.append({
+            "start": float(i), "end": float(i) + 0.9, "text": text,
+            "speaker": speaker, "words": [],
+        })
+    return segs
+
+
+class TestGetSpeakerLabels:
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert run_pipeline.get_speaker_labels(str(tmp_path / "nope_segments.json")) == []
+
+    def test_corrupt_json_returns_empty(self, tmp_path):
+        p = tmp_path / "a_segments.json"
+        p.write_text("not valid json{{{", encoding="utf-8")
+        assert run_pipeline.get_speaker_labels(str(p)) == []
+
+    def test_returns_sorted_distinct_labels(self, tmp_path):
+        p = tmp_path / "a_segments.json"
+        segs = make_segments(("SPEAKER_01", "hi"), ("SPEAKER_00", "hello"), ("SPEAKER_01", "again"))
+        p.write_text(json.dumps(segs), encoding="utf-8")
+        assert run_pipeline.get_speaker_labels(str(p)) == ["SPEAKER_00", "SPEAKER_01"]
+
+    def test_no_speaker_field_returns_empty(self, tmp_path):
+        p = tmp_path / "a_segments.json"
+        segs = [{"start": 0.0, "end": 1.0, "text": "hi", "speaker": "", "words": []}]
+        p.write_text(json.dumps(segs), encoding="utf-8")
+        assert run_pipeline.get_speaker_labels(str(p)) == []
+
+
+class TestRenameSpeakers:
+    def _write_segments(self, tmp_path, stem="a"):
+        p = tmp_path / f"{stem}_segments.json"
+        segs = make_segments(("SPEAKER_00", "hello there"), ("SPEAKER_01", "hi back"),
+                             ("SPEAKER_00", "how are you"))
+        p.write_text(json.dumps(segs), encoding="utf-8")
+        return p
+
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            run_pipeline.rename_speakers(str(tmp_path / "nope_segments.json"), {"SPEAKER_00": "Alice"})
+
+    def test_renames_matching_labels_and_rewrites_json(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": str(tmp_path / "a_transcript_speakers.txt"),
+                                              "text": str(tmp_path / "a_text.txt"),
+                                              "srt": str(tmp_path / "a_transcript.srt")})
+        result = run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "Alice"})
+        assert result["renamed_segments"] == 2
+        assert result["labels_found"] == ["SPEAKER_00", "SPEAKER_01"]
+        saved = json.loads(p.read_text(encoding="utf-8"))
+        assert [s["speaker"] for s in saved] == ["Alice", "SPEAKER_01", "Alice"]
+
+    def test_unmapped_labels_untouched(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": "x", "text": "y", "srt": "z"})
+        run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "Alice"})
+        saved = json.loads(p.read_text(encoding="utf-8"))
+        assert "SPEAKER_01" in [s["speaker"] for s in saved]
+
+    def test_blank_new_name_is_noop(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": "x", "text": "y", "srt": "z"})
+        result = run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "", "SPEAKER_01": None})
+        assert result["renamed_segments"] == 0
+
+    def test_same_name_is_noop(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": "x", "text": "y", "srt": "z"})
+        result = run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "SPEAKER_00"})
+        assert result["renamed_segments"] == 0
+
+    def test_regenerate_notes_calls_run_notes_only(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        speakers_path = str(tmp_path / "a_transcript_speakers.txt")
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": speakers_path, "text": "y", "srt": "z"})
+        calls = []
+        monkeypatch.setattr(run_pipeline, "run_notes_only",
+                            lambda transcript_file, overrides: calls.append(transcript_file))
+        result = run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "Alice"}, regenerate_notes=True)
+        assert calls == [speakers_path]
+        assert result["notes_regenerated"] is True
+
+    def test_regenerate_notes_skipped_when_nothing_renamed(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": "x", "text": "y", "srt": "z"})
+        calls = []
+        monkeypatch.setattr(run_pipeline, "run_notes_only",
+                            lambda transcript_file, overrides: calls.append(transcript_file))
+        result = run_pipeline.rename_speakers(str(p), {}, regenerate_notes=True)
+        assert calls == []
+        assert result["notes_regenerated"] is False
+
+    def test_regenerate_notes_failure_is_logged_not_raised(self, tmp_path, monkeypatch):
+        p = self._write_segments(tmp_path)
+        monkeypatch.setattr(run_pipeline.transcriber, "write_transcript_files",
+                            lambda *a, **kw: {"speakers": "x", "text": "y", "srt": "z"})
+
+        def fake_notes_only(transcript_file, overrides):
+            raise RuntimeError("LLM unreachable")
+
+        monkeypatch.setattr(run_pipeline, "run_notes_only", fake_notes_only)
+        result = run_pipeline.rename_speakers(str(p), {"SPEAKER_00": "Alice"}, regenerate_notes=True)
+        assert result["renamed_segments"] == 2
+        assert result["notes_regenerated"] is False
