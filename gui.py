@@ -717,6 +717,30 @@ class PipelineGUI:
         self.db_stats_label = ttk.Label(db_frame, text="", foreground="#444")
         self.db_stats_label.grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 8))
 
+        # --- Speaker identification (task #82) ---
+        speaker_id_frame = ttk.LabelFrame(parent, text="Speaker Identification")
+        speaker_id_frame.pack(fill="x", **pad)
+        self.enable_speaker_id_var = tk.BooleanVar(value=CONFIG.get("enable_speaker_id", False))
+        self.speaker_id_threshold_var = tk.DoubleVar(value=CONFIG.get("speaker_id_threshold", 0.75))
+        ttk.Checkbutton(
+            speaker_id_frame,
+            text="Suggest known speaker names in Rename Speakers (requires diarization)",
+            variable=self.enable_speaker_id_var,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(speaker_id_frame, text="Match threshold (cosine similarity):").grid(
+            row=1, column=0, sticky="w", **pad)
+        ttk.Spinbox(speaker_id_frame, textvariable=self.speaker_id_threshold_var,
+                   from_=0.50, to=0.99, increment=0.05, width=6, format="%.2f").grid(
+            row=1, column=1, sticky="w")
+        ttk.Label(speaker_id_frame,
+                 text="Higher = fewer false matches but more new speakers created; "
+                      "lower = more auto-matches but more risk of mixing up two people.",
+                 foreground="#666", wraplength=600).grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        ttk.Button(speaker_id_frame, text="Manage Known Speakers...",
+                  command=self._open_known_speakers_manager).grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 8))
+
         # --- Logging ---
         log_frame = ttk.LabelFrame(parent, text="Logging")
         log_frame.pack(fill="x", **pad)
@@ -754,6 +778,10 @@ class PipelineGUI:
 
     def _open_in_editor(self, path: Path):
         self._open_path(path.resolve())
+
+    def _open_known_speakers_manager(self):
+        """Open the global known-speakers roster manager (task #82)."""
+        KnownSpeakersDialog(self)
 
     def _open_path(self, path: Path):
         if not path.exists():
@@ -2184,6 +2212,113 @@ class RunTabController:
         self.root.after(100, self._poll_log_queue)
 
 
+class KnownSpeakersDialog(tk.Toplevel):
+    """
+    Modal window (task #82): manage the global known_speakers roster
+    (db.py) used by speaker identification (tasks #79-81). Lists every
+    enrolled voiceprint - name, how many confirmed renames contributed to
+    it (sample_count), and when it was last updated - and lets the user
+    rename or delete an entry. Deleting only removes the stored
+    voiceprint; it never touches any already-written transcript, so past
+    renames stay exactly as they are - future runs simply stop
+    suggesting that name.
+    """
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Manage Known Speakers")
+        self.resizable(False, False)
+        self.transient(app.root)
+
+        ttk.Label(self, text="Global voiceprint roster used by speaker identification "
+                             "suggestions in Rename Speakers.",
+                 foreground="#666", wraplength=460).pack(anchor="w", padx=10, pady=(10, 8))
+
+        columns = ("name", "samples", "updated")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
+        self.tree.heading("name", text="Name")
+        self.tree.heading("samples", text="Samples")
+        self.tree.heading("updated", text="Last updated")
+        self.tree.column("name", width=200)
+        self.tree.column("samples", width=70, anchor="center")
+        self.tree.column("updated", width=160)
+        self.tree.pack(fill="both", expand=True, padx=10)
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btn_row, text="Rename...", command=self._rename_selected).pack(side="left")
+        ttk.Button(btn_row, text="Delete...", command=self._delete_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Refresh", command=self._refresh).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
+
+        self._rows = []  # parallel to tree iids: raw db.list_known_speakers rows
+        self._refresh()
+
+    def _db_path(self) -> str:
+        return self.app.db_path_var.get().strip() or CONFIG["db_path"]
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self._rows = []
+        db_path = self._db_path()
+        if not Path(db_path).exists():
+            return
+        conn = db.get_connection(db_path)
+        try:
+            rows = db.list_known_speakers(conn)
+        finally:
+            conn.close()
+        for row in rows:
+            iid = str(len(self._rows))
+            self._rows.append(row)
+            self.tree.insert("", "end", iid=iid,
+                             values=(row["name"], row["sample_count"], row["updated_at"]))
+
+    def _selected_row(self) -> dict | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._rows[int(sel[0])]
+
+    def _rename_selected(self):
+        row = self._selected_row()
+        if not row:
+            messagebox.showinfo("No selection", "Select a speaker first.")
+            return
+        new_name = simpledialog.askstring(
+            "Rename Speaker", "New name:", initialvalue=row["name"], parent=self)
+        if not new_name or new_name.strip() == row["name"]:
+            return
+        conn = db.get_connection(self._db_path())
+        try:
+            db.rename_known_speaker(conn, row["speaker_id"], new_name.strip())
+        except Exception as exc:
+            messagebox.showerror("Rename failed", str(exc))
+            return
+        finally:
+            conn.close()
+        self._refresh()
+
+    def _delete_selected(self):
+        row = self._selected_row()
+        if not row:
+            messagebox.showinfo("No selection", "Select a speaker first.")
+            return
+        if not messagebox.askyesno(
+            "Delete speaker",
+            f"Delete the voiceprint for '{row['name']}'?\n\n"
+            f"This does not change any transcript already renamed to this "
+            f"name - it only stops future runs from suggesting it."):
+            return
+        conn = db.get_connection(self._db_path())
+        try:
+            db.delete_known_speaker(conn, row["speaker_id"])
+        finally:
+            conn.close()
+        self._refresh()
+
+
 class SpeakerRenameDialog(tk.Toplevel):
     """
     Modal window (task #76, extended task #81): post-hoc speaker renaming.
@@ -2262,7 +2397,7 @@ class SpeakerRenameDialog(tk.Toplevel):
         ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="right")
         ttk.Button(btn_row, text="Cancel", command=self._on_close).pack(side="right", padx=(0, 6))
 
-        if CONFIG.get("enable_speaker_id", False):
+        if self.controller.app.enable_speaker_id_var.get():
             if self.source_media_path and Path(self.source_media_path).exists():
                 self._status_var.set("Computing voiceprint suggestions...")
                 threading.Thread(target=self._compute_suggestions_worker, daemon=True).start()
@@ -2275,7 +2410,7 @@ class SpeakerRenameDialog(tk.Toplevel):
     def _compute_suggestions_worker(self):
         try:
             db_path = self.controller.app.db_path_var.get().strip() or CONFIG["db_path"]
-            threshold = CONFIG.get("speaker_id_threshold", 0.75)
+            threshold = self.controller.app.speaker_id_threshold_var.get()
             suggestions = run_pipeline.get_speaker_suggestions(
                 self.segments_json_path, self.source_media_path,
                 CONFIG.get("hf_token", ""), threshold, db_path)
@@ -2295,7 +2430,7 @@ class SpeakerRenameDialog(tk.Toplevel):
             self._status_var.set(f"Voiceprint suggestions failed: {payload}")
             return
         self._suggestions = payload
-        threshold = CONFIG.get("speaker_id_threshold", 0.75)
+        threshold = self.controller.app.speaker_id_threshold_var.get()
         for label, info in payload.items():
             suggestion_var = self._suggestion_vars.get(label)
             if suggestion_var is None:
