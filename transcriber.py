@@ -103,6 +103,57 @@ def transcript_cache_exists(output_prefix: str) -> bool:
     return Path(transcript_cache_paths(output_prefix)["speakers"]).exists()
 
 
+def enhance_audio(input_path: str, output_path: str) -> bool:
+    """
+    Run a conservative ffmpeg audio-cleanup filter chain and write the
+    result to output_path, for use as a temporary pre-transcription pass
+    (config: enhance_audio, off by default). Never touches input_path.
+
+    Filter chain, in order:
+      highpass=f=100  - cuts rumble, AC hum, and mic-handling noise
+                         below the speech range. Very low risk of
+                         hurting transcription, this is a safe default.
+      afftdn           - mild FFT-based noise reduction (ffmpeg
+                         defaults, not tuned aggressively) for steady
+                         background hiss or fan noise. Aggressive
+                         denoising can introduce artifacts that confuse
+                         Whisper, so this deliberately uses ffmpeg's
+                         untuned defaults rather than a stronger setting.
+      dynaudnorm       - evens out volume between a loud and a quiet
+                         speaker on the same recording, and helps the
+                         voiceprint/speaker-ID step be more consistent.
+
+    Output is resampled to 16 kHz mono, matching what Whisper expects
+    anyway, so this replaces (not adds to) WhisperX's own resampling
+    step for the enhanced copy.
+
+    Returns True on success, False if ffmpeg is missing or the filter
+    pass fails for any reason - a failed enhancement should never be
+    fatal to transcription; callers should fall back to the original
+    file.
+    """
+    import shutil as _shutil
+    import subprocess
+
+    if _shutil.which("ffmpeg") is None:
+        log.warning("ffmpeg not found in PATH - skipping audio enhancement, "
+                    "using original audio.")
+        return False
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-af", "highpass=f=100,afftdn,dynaudnorm",
+        "-ar", "16000", "-ac", "1",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.warning("Audio enhancement failed: %s", result.stderr[-500:])
+        return False
+    log.info("Audio enhancement applied: %s", output_path)
+    return True
+
+
 def transcribe(
     file_path: str,
     model_size: str = "large-v3",

@@ -125,7 +125,7 @@ STATE_FILENAME = "gui_state.json"
 PERSISTED_KEYS_COMMON = (
     "recording_type", "prompt_template", "whisper_model", "language",
     "llm_backend", "output_dir", "enable_diarization", "no_summary",
-    "force_retranscribe",
+    "force_retranscribe", "enhance_audio",
 )
 
 # Additional keys persisted only for the Video/Webinar tab.
@@ -216,7 +216,7 @@ def save_state_file(path, state: dict) -> bool:
 
 COPYABLE_KEYS = (
     "whisper_model", "language", "llm_backend",
-    "enable_diarization", "no_summary", "force_retranscribe",
+    "enable_diarization", "no_summary", "force_retranscribe", "enhance_audio",
 )
 
 

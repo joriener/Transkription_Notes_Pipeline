@@ -190,6 +190,18 @@ CONFIG = {
     # *_transcript_speakers.txt / *_segments.json already exist.
     "force_retranscribe": False,
 
+    # Optional ffmpeg audio-cleanup pass before transcription (V1.24):
+    # highpass filter for rumble/hum, mild denoise for background
+    # hiss/fan noise, and loudness normalization for uneven volume
+    # between speakers on the same recording. Off by default: audio
+    # processing can occasionally change what Whisper transcribes, so
+    # this is opt-in rather than silently altering every run. Only
+    # affects the transcription pass itself, on a temporary copy - the
+    # original file is never modified and is still what Play Sample and
+    # voiceprint extraction read from directly. See
+    # transcriber.enhance_audio.
+    "enhance_audio": False,
+
     # =========================================================
     # SPEAKER DIARIZATION  (pyannote, optional)
     # =========================================================

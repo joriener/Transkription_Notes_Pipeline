@@ -376,19 +376,38 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                          "transcription. Use --force-retranscribe if you changed recording_speed "
                          "since this cache was created.")
         else:
-            segments = transcriber.transcribe(
-                file_path=file,
-                model_size=cfg["whisper_model"],
-                language=cfg["whisper_language"],
-                device=cfg["whisper_device"],
-                batch_size=cfg["whisper_batch_size"],
-                compute_type=cfg["whisper_compute_type"],
-                hf_token=cfg.get("hf_token"),
-                enable_diarization=cfg["enable_diarization"],
-                use_vocabulary=cfg["whisper_use_vocabulary"],
-                min_speakers=cfg.get("diarization_min_speakers"),
-                max_speakers=cfg.get("diarization_max_speakers"),
-            )
+            # Optional audio-cleanup pass (V1.24, off by default): only
+            # ever applies to this transcription call, on a temporary
+            # copy next to the segments cache. The original file is
+            # never touched, and is still what get_speaker_suggestions/
+            # Play Sample read from directly.
+            transcribe_from = file
+            enhanced_tmp = None
+            if cfg.get("enhance_audio", False):
+                enhanced_tmp = output_prefix + "_enhanced_tmp.wav"
+                if transcriber.enhance_audio(file, enhanced_tmp):
+                    transcribe_from = enhanced_tmp
+                else:
+                    enhanced_tmp = None  # nothing to clean up, fall back silently
+
+            try:
+                segments = transcriber.transcribe(
+                    file_path=transcribe_from,
+                    model_size=cfg["whisper_model"],
+                    language=cfg["whisper_language"],
+                    device=cfg["whisper_device"],
+                    batch_size=cfg["whisper_batch_size"],
+                    compute_type=cfg["whisper_compute_type"],
+                    hf_token=cfg.get("hf_token"),
+                    enable_diarization=cfg["enable_diarization"],
+                    use_vocabulary=cfg["whisper_use_vocabulary"],
+                    min_speakers=cfg.get("diarization_min_speakers"),
+                    max_speakers=cfg.get("diarization_max_speakers"),
+                )
+            finally:
+                if enhanced_tmp:
+                    Path(enhanced_tmp).unlink(missing_ok=True)
+
             if not segments:
                 log.error("Transcription returned no segments - aborting.")
                 return False
@@ -1744,6 +1763,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-whisper", action="store_true", help="Skip transcription.")
     p.add_argument("--no-summary", action="store_true", help="Skip notes/summary generation.")
     p.add_argument("--force-retranscribe", action="store_true", help="Ignore transcript cache.")
+    p.add_argument("--enhance-audio", action="store_true",
+                   help="Run a conservative ffmpeg cleanup pass (rumble/hum filter, mild "
+                        "denoise, volume normalization) on a temporary copy before "
+                        "transcription. Off by default; original file is never modified.")
     p.add_argument("--dry-run", action="store_true", help="Slide timestamps only, no annotation/whisper/reports.")
     p.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires HF_TOKEN).")
     p.add_argument("--threshold", type=int, help="Slide-change hash threshold override.")
@@ -1829,6 +1852,7 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "enable_whisper":      False if args.no_whisper else None,
         "no_summary":          True if args.no_summary else None,
         "force_retranscribe":  True if args.force_retranscribe else None,
+        "enhance_audio":       True if args.enhance_audio else None,
         "dry_run":             True if args.dry_run else None,
         "enable_diarization":  True if args.diarize else None,
         "hash_threshold":      args.threshold,
