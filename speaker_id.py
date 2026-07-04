@@ -225,6 +225,52 @@ def match_speaker(embedding: np.ndarray, known_speakers: list[dict],
     return {"speaker_id": None, "name": None, "score": best_score}
 
 
+def check_ffmpeg() -> bool:
+    """Same check as extractor.check_ffmpeg (video mode), duplicated here
+    to keep speaker_id.py's only project-internal dependency being
+    numpy - avoids importing extractor.py (which pulls in Pillow/
+    ImageHash for slide detection, irrelevant to audio-only speaker ID)."""
+    import shutil as _shutil
+    return _shutil.which("ffmpeg") is not None
+
+
+def extract_speaker_sample_clip(source_media_path: str, segments: list[dict],
+                                 speaker_label: str, out_path: str,
+                                 max_duration: float = 6.0) -> str | None:
+    """
+    Extract a short audio clip of speaker_label's longest segment from
+    source_media_path via ffmpeg, for the Rename Speakers dialog's
+    "Play sample" button (task #81).
+
+    Returns out_path on success, or None if speaker_label has no
+    segments, ffmpeg is unavailable, or extraction fails - a missing
+    preview should never be fatal to the renaming workflow itself, so
+    callers show a message rather than raise.
+    """
+    own_segments = [s for s in segments if s.get("speaker") == speaker_label]
+    if not own_segments:
+        return None
+    if not check_ffmpeg():
+        log.warning("ffmpeg not found in PATH - cannot extract a speaker sample clip.")
+        return None
+    longest = max(own_segments, key=lambda s: s["end"] - s["start"])
+    start = max(0.0, float(longest["start"]))
+    duration = min(max_duration, float(longest["end"]) - start)
+    if duration < 0.3:
+        return None
+
+    import subprocess
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(start), "-i", str(source_media_path),
+        "-t", str(duration), "-vn", "-ac", "1", "-ar", "16000", str(out_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.warning("ffmpeg sample-clip extraction failed: %s", result.stderr[-500:])
+        return None
+    return out_path
+
+
 def update_running_average(old_vector: np.ndarray, old_sample_count: int,
                             new_vector: np.ndarray) -> tuple:
     """

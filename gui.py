@@ -28,6 +28,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -43,6 +44,7 @@ import ics_utils
 import keys_loader
 import notes as notes_mod
 import run_pipeline
+import speaker_id
 
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 LANGUAGES = ["auto", "en", "de", "fr", "es", "it", "ja", "zh", "nl", "uk", "pt"]
@@ -1629,9 +1631,11 @@ class RunTabController:
                 "cache is missing (needed for a rename; the already-formatted "
                 ".txt file alone is not enough).")
             return
-        SpeakerRenameDialog(self, segments_json_path, labels)
+        source_media_path = run_pipeline.find_source_media(segments_json_path)
+        SpeakerRenameDialog(self, segments_json_path, labels, source_media_path)
 
-    def _run_rename_speakers_worker(self, segments_json_path: str, mapping: dict, regenerate_notes: bool):
+    def _run_rename_speakers_worker(self, segments_json_path: str, mapping: dict, regenerate_notes: bool,
+                                    speaker_suggestions: dict | None = None, db_path: str | None = None):
         handler = QueueLogHandler(self.log_queue)
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
         root_logger = logging.getLogger()
@@ -1640,6 +1644,17 @@ class RunTabController:
         root_logger.setLevel(level)
         try:
             overrides = self._build_overrides()
+            if speaker_suggestions:
+                try:
+                    commit_result = run_pipeline.commit_speaker_identities(
+                        db_path or overrides.get("db_path") or CONFIG["db_path"],
+                        speaker_suggestions, mapping)
+                    for label, info in commit_result.items():
+                        self.log_queue.put(
+                            f"Speaker roster: {label} -> {info['action']} "
+                            f"(known_speakers id {info['speaker_id']})")
+                except Exception as exc:
+                    self.log_queue.put(f"WARNING: could not update known-speaker roster: {exc}")
             result = run_pipeline.rename_speakers(
                 segments_json_path, mapping, overrides, regenerate_notes=regenerate_notes)
             self.log_queue.put(f"=== SPEAKER RENAME DONE: {result['renamed_segments']} segment(s) "
@@ -2171,48 +2186,159 @@ class RunTabController:
 
 class SpeakerRenameDialog(tk.Toplevel):
     """
-    Modal window (task #76): post-hoc speaker renaming. Lists the distinct
-    speaker labels found in an existing *_segments.json cache, lets the
-    user type a replacement name for each, and applies the rename on
-    Apply via run_pipeline.rename_speakers (rewrites *_segments.json,
-    *_transcript_speakers.txt, *_text.txt, *_transcript.srt; optionally
-    also regenerates notes). Runs in the same background worker thread/
-    log_queue infrastructure as a normal pipeline run, so it can't overlap
-    with one and its progress shows in the same log panel.
+    Modal window (task #76, extended task #81): post-hoc speaker renaming.
+    Lists the distinct speaker labels found in an existing *_segments.json
+    cache, lets the user type a replacement name for each, and applies the
+    rename on Apply via run_pipeline.rename_speakers (rewrites
+    *_segments.json, *_transcript_speakers.txt, *_text.txt,
+    *_transcript.srt; optionally also regenerates notes). Runs in the same
+    background worker thread/log_queue infrastructure as a normal pipeline
+    run, so it can't overlap with one and its progress shows in the same
+    log panel.
+
+    Task #81 additions, active only when CONFIG["enable_speaker_id"] is on
+    and the original audio/video file is still findable next to the
+    transcript (source_media_path): a background thread computes one
+    voiceprint per speaker label (speaker_id.py) and matches it against
+    the global known_speakers roster, pre-filling the name field when a
+    match clears the configured threshold and always showing the
+    confidence next to it. Each row also gets a "Play sample" button that
+    extracts and plays that speaker's longest segment (ffmpeg + the
+    system default player, via the same _open_path used elsewhere) so the
+    suggestion can be confirmed by ear before accepting it. On Apply, any
+    name the user settled on is committed back into known_speakers
+    (run_pipeline.commit_speaker_identities) in the same worker thread
+    that performs the actual local rename.
     """
 
-    def __init__(self, controller, segments_json_path: str, labels: list):
+    def __init__(self, controller, segments_json_path: str, labels: list,
+                 source_media_path: str | None = None):
         super().__init__(controller.root)
         self.controller = controller
         self.segments_json_path = segments_json_path
+        self.source_media_path = source_media_path
         self.title("Rename Speakers")
         self.resizable(False, False)
         self.transient(controller.root)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._suggestions: dict = {}
+        self._suggestions_queue: queue.Queue = queue.Queue()
+        self._sample_dir = tempfile.mkdtemp(prefix="tnp_speaker_samples_")
 
         ttk.Label(self, text=f"File: {Path(segments_json_path).name}",
                  foreground="#666").pack(anchor="w", padx=10, pady=(10, 4))
         ttk.Label(self, text="Enter a new name for any speaker you want to rename. "
                              "Leave unchanged to keep the original label.",
-                 foreground="#666", wraplength=380).pack(anchor="w", padx=10, pady=(0, 8))
+                 foreground="#666", wraplength=420).pack(anchor="w", padx=10, pady=(0, 8))
 
         rows_frame = ttk.Frame(self)
         rows_frame.pack(fill="x", padx=10)
         self._vars = {}
+        self._suggestion_vars = {}
         for i, label in enumerate(labels):
             ttk.Label(rows_frame, text=label, width=16).grid(row=i, column=0, sticky="w", pady=2)
             ttk.Label(rows_frame, text="->").grid(row=i, column=1, padx=6)
             var = tk.StringVar(value=label)
-            ttk.Entry(rows_frame, textvariable=var, width=24).grid(row=i, column=2, sticky="w")
+            ttk.Entry(rows_frame, textvariable=var, width=20).grid(row=i, column=2, sticky="w")
             self._vars[label] = var
+            suggestion_var = tk.StringVar(value="")
+            ttk.Label(rows_frame, textvariable=suggestion_var, foreground="#666",
+                     width=28).grid(row=i, column=3, sticky="w", padx=(8, 0))
+            self._suggestion_vars[label] = suggestion_var
+            ttk.Button(rows_frame, text="Play sample", width=11,
+                      command=lambda l=label: self._play_sample(l)).grid(row=i, column=4, padx=(8, 0))
 
         self.regenerate_notes_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self, text="Also regenerate notes with the new names",
                        variable=self.regenerate_notes_var).pack(anchor="w", padx=10, pady=(8, 0))
 
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._status_var, foreground="#666",
+                 wraplength=420).pack(anchor="w", padx=10, pady=(4, 0))
+
         btn_row = ttk.Frame(self)
         btn_row.pack(fill="x", padx=10, pady=10)
         ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="right")
-        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 6))
+        ttk.Button(btn_row, text="Cancel", command=self._on_close).pack(side="right", padx=(0, 6))
+
+        if CONFIG.get("enable_speaker_id", False):
+            if self.source_media_path and Path(self.source_media_path).exists():
+                self._status_var.set("Computing voiceprint suggestions...")
+                threading.Thread(target=self._compute_suggestions_worker, daemon=True).start()
+                self.after(200, self._poll_suggestions_queue)
+            else:
+                self._status_var.set(
+                    "Source media not found next to this transcript - voiceprint "
+                    "suggestions unavailable, renaming still works.")
+
+    def _compute_suggestions_worker(self):
+        try:
+            db_path = self.controller.app.db_path_var.get().strip() or CONFIG["db_path"]
+            threshold = CONFIG.get("speaker_id_threshold", 0.75)
+            suggestions = run_pipeline.get_speaker_suggestions(
+                self.segments_json_path, self.source_media_path,
+                CONFIG.get("hf_token", ""), threshold, db_path)
+            self._suggestions_queue.put(("ok", suggestions))
+        except Exception as exc:
+            self._suggestions_queue.put(("error", str(exc)))
+
+    def _poll_suggestions_queue(self):
+        if not self.winfo_exists():
+            return
+        try:
+            status, payload = self._suggestions_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, self._poll_suggestions_queue)
+            return
+        if status == "error":
+            self._status_var.set(f"Voiceprint suggestions failed: {payload}")
+            return
+        self._suggestions = payload
+        threshold = CONFIG.get("speaker_id_threshold", 0.75)
+        for label, info in payload.items():
+            suggestion_var = self._suggestion_vars.get(label)
+            if suggestion_var is None:
+                continue
+            if info["suggested_name"]:
+                suggestion_var.set(f"suggests: {info['suggested_name']} ({info['score']:.2f})")
+                entry_var = self._vars.get(label)
+                if entry_var is not None and entry_var.get() == label:
+                    entry_var.set(info["suggested_name"])
+            elif info["score"] > 0:
+                suggestion_var.set(f"closest match {info['score']:.2f} (below threshold {threshold:.2f})")
+            else:
+                suggestion_var.set("no match - looks like a new speaker")
+        self._status_var.set(f"Voiceprint suggestions ready for {len(payload)} speaker(s).")
+
+    def _play_sample(self, label: str):
+        if not self.source_media_path or not Path(self.source_media_path).exists():
+            messagebox.showinfo(
+                "No source media",
+                "The original audio/video file was not found next to this transcript.")
+            return
+        threading.Thread(target=self._play_sample_worker, args=(label,), daemon=True).start()
+
+    def _play_sample_worker(self, label: str):
+        try:
+            segments = json.loads(Path(self.segments_json_path).read_text(encoding="utf-8"))
+            clip_path = str(Path(self._sample_dir) / f"{label}.wav")
+            result = speaker_id.extract_speaker_sample_clip(
+                self.source_media_path, segments, label, clip_path)
+        except Exception as exc:
+            self.after(0, lambda: messagebox.showerror("Playback failed", str(exc)))
+            return
+        if result:
+            self.after(0, lambda: self.controller.app._open_path(Path(result)))
+        else:
+            self.after(0, lambda: messagebox.showinfo(
+                "No sample available",
+                f"Could not extract an audio sample for {label} "
+                f"(no long-enough segment found, or ffmpeg is not installed)."))
+
+    def _on_close(self):
+        shutil.rmtree(self._sample_dir, ignore_errors=True)
+        self.destroy()
 
     def _apply(self):
         mapping = {old: var.get().strip() for old, var in self._vars.items()
@@ -2222,6 +2348,9 @@ class SpeakerRenameDialog(tk.Toplevel):
             return
         regenerate_notes = self.regenerate_notes_var.get()
         segments_json_path = self.segments_json_path
+        speaker_suggestions = self._suggestions
+        db_path = self.controller.app.db_path_var.get().strip() or CONFIG["db_path"]
+        shutil.rmtree(self._sample_dir, ignore_errors=True)
         self.destroy()
 
         c = self.controller
@@ -2234,6 +2363,7 @@ class SpeakerRenameDialog(tk.Toplevel):
         c.worker_thread = threading.Thread(
             target=c._run_rename_speakers_worker,
             args=(segments_json_path, mapping, regenerate_notes),
+            kwargs={"speaker_suggestions": speaker_suggestions, "db_path": db_path},
             daemon=True,
         )
         c.worker_thread.start()

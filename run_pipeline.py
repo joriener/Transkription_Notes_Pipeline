@@ -963,6 +963,27 @@ def rename_speakers(segments_json_path: str, speaker_mapping: dict,
 # below only manage the global known_speakers roster.
 # ---------------------------------------------------------------------------
 
+def find_source_media(segments_json_path: str) -> str | None:
+    """
+    Locate the original audio/video file next to a *_segments.json cache,
+    by matching <same-stem>.<supported extension> in the same folder
+    (same lookup rename_speakers already does inline for its transcript
+    header, factored out here so gui.py can resolve it up front for
+    speaker identification too).
+
+    Returns None if no matching file is found (e.g. the source media was
+    moved or deleted after transcription) - rename_speakers still works
+    without it since it only needs the segment cache, but
+    get_speaker_suggestions needs to re-read the actual audio.
+    """
+    path = Path(segments_json_path)
+    stem = path.name.replace("_segments.json", "")
+    for candidate in path.parent.glob(f"{stem}.*"):
+        if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+            return str(candidate)
+    return None
+
+
 def get_speaker_suggestions(segments_json_path: str, source_media_path: str,
                              hf_token: str, threshold: float, db_path: str,
                              device: str = "cpu") -> dict:
