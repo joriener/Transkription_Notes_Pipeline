@@ -70,6 +70,7 @@ warnings.filterwarnings("ignore", message=".*Lightning automatically upgraded.*"
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
 
 import argparse
+import base64
 import json
 import logging
 import re
@@ -1217,6 +1218,207 @@ def commit_speaker_identities(db_path: str, suggestions: dict, name_choices: dic
     finally:
         conn.close()
     return result
+
+
+# ---------------------------------------------------------------------------
+# Batch speaker roster export/apply (task #92): after an overnight batch of
+# several recordings, review every detected speaker across ALL files in one
+# JSON file instead of opening each file's Rename Speakers dialog one at a
+# time. export_speaker_roster_json scans a folder for *_segments.json,
+# computes voiceprint suggestions per file (best-effort - a failure on one
+# file logs a warning and still includes that file with blank suggestions,
+# rather than aborting the whole export), and writes one combined JSON.
+# apply_speaker_roster_json reads the same file back (after the user has
+# edited the "name" fields) and applies the renames + known_speakers roster
+# updates across every file in one pass.
+# ---------------------------------------------------------------------------
+
+def export_speaker_roster_json(folder: str, output_json_path: str,
+                                hf_token: str, threshold: float, db_path: str,
+                                device: str = "cpu", recursive: bool = False) -> dict:
+    """
+    Scan folder (optionally recursive, same discovery rule as
+    run_batch_folder) for every *_segments.json produced by a previous
+    run, compute voiceprint suggestions for each local speaker label
+    against the known_speakers roster, and write ONE combined JSON file
+    with every file's speakers side by side - built for reviewing an
+    overnight batch of several recordings in one sitting instead of
+    opening each file's Rename Speakers dialog individually.
+
+    Each speaker entry's "name" field is pre-filled with its suggested
+    match (if any cleared threshold), so the user only has to correct
+    the wrong ones and fill in genuinely new speakers; leaving "name"
+    blank (or unchanged and equal to "label") means "skip this one" when
+    the file is later applied with apply_speaker_roster_json.
+
+    A missing source recording, or a pyannote/voiceprint failure, for
+    one file is logged and that file is still included with blank
+    suggestions - one bad file must never lose the rest of the batch's
+    entries. Once pyannote.audio itself turns out to be unusable at all
+    (e.g. gated model terms not accepted), the same failure would just
+    repeat for every remaining file, so that case stops trying voiceprint
+    suggestions for the rest of this export and adds one top-level
+    "warning" field to the output instead of one warning per file.
+
+    Returns {"path": output_json_path, "files": <count>, "speakers": <count>}.
+    """
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        raise NotADirectoryError(f"Not a folder: {folder}")
+
+    pattern_fn = folder_path.rglob if recursive else folder_path.glob
+    segment_files = sorted(pattern_fn("*_segments.json"))
+
+    pyannote_unavailable: str | None = None
+    file_entries = []
+    total_speakers = 0
+
+    for segments_json in segment_files:
+        try:
+            segments = json.loads(segments_json.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("Could not read %s: %s - skipping.", segments_json, exc)
+            continue
+        labels = sorted({s.get("speaker") for s in segments if s.get("speaker")})
+        if not labels:
+            continue
+
+        source_media = find_source_media(str(segments_json))
+        suggestions: dict = {}
+        if pyannote_unavailable is None and source_media and hf_token:
+            try:
+                suggestions = get_speaker_suggestions(
+                    str(segments_json), source_media, hf_token, threshold, db_path, device=device)
+            except FileNotFoundError as exc:
+                log.warning("%s", exc)
+            except RuntimeError as exc:
+                pyannote_unavailable = str(exc)
+                log.warning("Voiceprint suggestions unavailable for the rest of this "
+                            "export: %s", exc)
+
+        speakers = []
+        for label in labels:
+            info = suggestions.get(label) or {}
+            suggested_name = info.get("suggested_name")
+            entry = {
+                "label": label,
+                "suggested_name": suggested_name,
+                "score": round(info["score"], 3) if info.get("score") is not None else None,
+                "name": suggested_name or "",
+            }
+            if "embedding" in info:
+                entry["embedding_b64"] = base64.b64encode(
+                    speaker_id.serialize_embedding(info["embedding"])).decode("ascii")
+                entry["embedding_dim"] = int(info["embedding"].shape[0])
+            speakers.append(entry)
+        total_speakers += len(speakers)
+
+        file_entries.append({
+            "output_prefix": str(segments_json).replace("_segments.json", ""),
+            "segments_json": str(segments_json),
+            "source_media": source_media,
+            "speakers": speakers,
+        })
+
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "db_path": db_path,
+        "note": "Edit each speaker's \"name\" field, then apply with "
+                "apply_speaker_roster_json (GUI: Settings > Apply speaker "
+                "roster JSON...). Leave \"name\" blank, or equal to \"label\", "
+                "to skip a speaker.",
+        "files": file_entries,
+    }
+    if pyannote_unavailable:
+        payload["warning"] = (
+            "Voiceprint suggestions could not be computed for some or all "
+            f"files: {pyannote_unavailable}. Speakers are still listed "
+            "below with blank suggestions - fill in \"name\" manually."
+        )
+
+    Path(output_json_path).write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Speaker roster exported: %d file(s), %d speaker(s) -> %s",
+             len(file_entries), total_speakers, output_json_path)
+    return {"path": output_json_path, "files": len(file_entries), "speakers": total_speakers}
+
+
+def apply_speaker_roster_json(json_path: str, overrides: dict | None = None,
+                               regenerate_notes: bool = False) -> dict:
+    """
+    Read back a JSON file produced by export_speaker_roster_json (after
+    the user has edited each speaker's "name" field) and, for every file
+    listed, rename its speaker labels (rename_speakers) and commit any
+    named speaker to the known_speakers roster (commit_speaker_identities)
+    - the same two steps the Rename Speakers dialog's Apply button runs
+    for a single file, done here for every file in the batch in one call.
+
+    A speaker is applied only if its "name" is non-blank and differs
+    from "label" (matching rename_speakers/commit_speaker_identities'
+    own no-op rule) - this is what makes leaving "name" blank, or
+    unedited and equal to "label", mean "skip this speaker".
+
+    Roster commits reuse the embedding captured at export time
+    (embedding_b64/embedding_dim), so applying does NOT need
+    pyannote.audio, a HuggingFace token, or the source recording to be
+    reachable again - only rename_speakers' *_segments.json is touched
+    for that part. Entries with no embedding_b64 (suggestions were
+    unavailable at export time) still get the transcript rename, just no
+    roster commit for that one speaker.
+
+    One file's error (e.g. its *_segments.json was moved or deleted
+    since export) is logged and skipped rather than aborting the rest of
+    the batch. Returns {"files_updated": <count>, "speakers_renamed":
+    <count>, "roster_updates": <count>, "errors": [{"file":..., "error":...}]}.
+    """
+    payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    overrides = overrides or {}
+    db_path = payload.get("db_path") or CONFIG["db_path"]
+
+    files_updated = 0
+    speakers_renamed = 0
+    roster_updates = 0
+    errors = []
+
+    for entry in payload.get("files", []):
+        segments_json = entry.get("segments_json")
+        try:
+            mapping = {}
+            suggestions = {}
+            for spk in entry.get("speakers", []):
+                label = spk.get("label")
+                name = (spk.get("name") or "").strip()
+                if not label or not name or name == label:
+                    continue
+                mapping[label] = name
+                if spk.get("embedding_b64"):
+                    emb = speaker_id.deserialize_embedding(
+                        base64.b64decode(spk["embedding_b64"]), spk["embedding_dim"])
+                    suggestions[label] = {"embedding": emb}
+
+            if not mapping:
+                continue
+
+            result = rename_speakers(segments_json, mapping, overrides, regenerate_notes)
+            speakers_renamed += result["renamed_segments"]
+            files_updated += 1
+
+            if suggestions:
+                commit_result = commit_speaker_identities(db_path, suggestions, mapping)
+                roster_updates += len(commit_result)
+        except Exception as exc:
+            log.error("Applying speaker roster failed for %s: %s", segments_json, exc)
+            errors.append({"file": segments_json, "error": str(exc)})
+
+    log.info("Speaker roster applied: %d file(s) updated, %d segment(s) renamed, "
+             "%d roster update(s), %d error(s).",
+             files_updated, speakers_renamed, roster_updates, len(errors))
+    return {
+        "files_updated": files_updated,
+        "speakers_renamed": speakers_renamed,
+        "roster_updates": roster_updates,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------

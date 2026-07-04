@@ -889,6 +889,19 @@ class PipelineGUI:
         ttk.Button(speaker_id_frame, text="Manage Known Speakers...",
                   command=self._open_known_speakers_manager).grid(
             row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 8))
+        ttk.Label(speaker_id_frame,
+                 text="Batch review (task #92): after processing several recordings "
+                      "overnight, export every detected speaker across all of them into "
+                      "one JSON file, edit the names there, then apply them all at once - "
+                      "instead of opening Rename Speakers per file.",
+                 foreground="#666", wraplength=600).grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0))
+        roster_btn_row = ttk.Frame(speaker_id_frame)
+        roster_btn_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 8))
+        ttk.Button(roster_btn_row, text="Export batch speaker roster...",
+                  command=self._export_speaker_roster_batch).pack(side="left")
+        ttk.Button(roster_btn_row, text="Apply speaker roster JSON...",
+                  command=self._apply_speaker_roster_batch).pack(side="left", padx=(8, 0))
 
         # --- Logging ---
         log_frame = ttk.LabelFrame(parent, text="Logging")
@@ -943,6 +956,87 @@ class PipelineGUI:
     def _open_known_speakers_manager(self):
         """Open the global known-speakers roster manager (task #82)."""
         KnownSpeakersDialog(self)
+
+    def _export_speaker_roster_batch(self):
+        """Task #92: scan a folder of already-processed recordings and
+        write every detected speaker across ALL of them into one JSON
+        file (run_pipeline.export_speaker_roster_json), for reviewing an
+        overnight batch of several recordings in one sitting instead of
+        opening each file's Rename Speakers dialog individually.
+        Voiceprint suggestions use the same hf_token/threshold/roster as
+        that dialog. Runs synchronously (like Backup all databases...
+        above) - this is an occasional, manual action, not a per-file
+        live operation, so a brief wait cursor is enough rather than a
+        background thread."""
+        folder = filedialog.askdirectory(title="Select folder with processed recordings")
+        if not folder:
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = filedialog.asksaveasfilename(
+            title="Save speaker roster as", initialdir=folder,
+            initialfile=f"speaker_roster_{timestamp}.json",
+            defaultextension=".json", filetypes=[("JSON", "*.json")],
+        )
+        if not out_path:
+            return
+        recursive = messagebox.askyesno(
+            "Include subfolders?",
+            "Also scan subfolders of the selected folder for processed recordings?")
+
+        hf_token = CONFIG.get("hf_token", "")
+        threshold = self.speaker_id_threshold_var.get()
+        db_path = self.db_path_var.get().strip() or CONFIG["db_path"]
+
+        self.root.config(cursor="watch")
+        self.root.update()
+        try:
+            result = run_pipeline.export_speaker_roster_json(
+                folder, out_path, hf_token, threshold, db_path, recursive=recursive)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        finally:
+            self.root.config(cursor="")
+
+        messagebox.showinfo(
+            "Speaker roster exported",
+            f"{result['files']} file(s), {result['speakers']} speaker(s).\n\n"
+            f"Edit each speaker's \"name\" field in:\n{result['path']}\n\n"
+            f"Then use \"Apply speaker roster JSON...\" to apply your edits.")
+
+    def _apply_speaker_roster_batch(self):
+        """Task #92: read back a speaker-roster JSON (see
+        _export_speaker_roster_batch, after the user has edited each
+        speaker's "name" field) and apply the renames + known-speakers
+        roster updates across every file listed in one pass
+        (run_pipeline.apply_speaker_roster_json)."""
+        json_path = filedialog.askopenfilename(
+            title="Select speaker roster JSON", filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not json_path:
+            return
+        regenerate_notes = messagebox.askyesno(
+            "Regenerate notes?",
+            "Also regenerate each file's notes/summary, for files where at least "
+            "one speaker was actually renamed?")
+
+        self.root.config(cursor="watch")
+        self.root.update()
+        try:
+            result = run_pipeline.apply_speaker_roster_json(
+                json_path, regenerate_notes=regenerate_notes)
+        except Exception as exc:
+            messagebox.showerror("Apply failed", str(exc))
+            return
+        finally:
+            self.root.config(cursor="")
+
+        msg = (f"{result['files_updated']} file(s) updated, "
+               f"{result['speakers_renamed']} segment(s) renamed, "
+               f"{result['roster_updates']} roster update(s).")
+        if result["errors"]:
+            details = "\n".join(f"- {e['file']}: {e['error']}" for e in result["errors"][:10])
+            msg += f"\n\n{len(result['errors'])} file(s) failed:\n{details}"
+        messagebox.showinfo("Speaker roster applied", msg)
 
     def _backup_all(self):
         """Zip the database, persisted GUI settings (gui_state.json),

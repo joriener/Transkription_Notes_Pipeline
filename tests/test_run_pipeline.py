@@ -9,6 +9,7 @@
 #  Run: pytest tests/test_run_pipeline.py -v
 # =============================================================
 
+import base64
 import json
 import sys
 from pathlib import Path
@@ -678,3 +679,233 @@ class TestFindSourceMedia:
         (tmp_path / "2020-04-07_154005_source_media.txt").write_text(
             str(tmp_path / "gone.mp4"))
         assert run_pipeline.find_source_media(str(segments_json)) == str(src)
+
+
+# -----------------------------------------------------------------
+# export_speaker_roster_json / apply_speaker_roster_json (task #92)
+#
+# "Process several recordings overnight, review every speaker in one
+# JSON file the next morning" - no pyannote/torch needed for these
+# tests: hf_token="" makes export skip voiceprint suggestion computation
+# entirely (same code path as source media being unreachable), so the
+# tests cover the file-discovery, JSON structure, and apply/rename/
+# roster-commit logic on their own merits.
+# -----------------------------------------------------------------
+
+class TestExportSpeakerRosterJson:
+    def _make_processed_file(self, tmp_path, stem, speakers, media_name=None):
+        media_name = media_name or f"{stem}.wav"
+        src = tmp_path / media_name
+        src.write_bytes(b"fake")
+        segments = [{"start": i * 1.0, "end": i * 1.0 + 0.5, "speaker": spk,
+                     "text": "hello", "words": []}
+                    for i, spk in enumerate(speakers)]
+        segments_json = tmp_path / f"{stem}_segments.json"
+        segments_json.write_text(json.dumps(segments), encoding="utf-8")
+        (tmp_path / f"{stem}_source_media.txt").write_text(str(src), encoding="utf-8")
+        return segments_json, src
+
+    def _make_db(self, tmp_path):
+        path = str(tmp_path / "test.db")
+        db.validate_schema(path)
+        return path
+
+    def test_scans_folder_and_lists_every_speaker(self, tmp_path):
+        self._make_processed_file(tmp_path, "call_one", ["SPEAKER_00", "SPEAKER_01"])
+        self._make_processed_file(tmp_path, "call_two", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        result = run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        assert result["files"] == 2
+        assert result["speakers"] == 3
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        assert len(payload["files"]) == 2
+        labels_by_file = {Path(f["segments_json"]).name: [s["label"] for s in f["speakers"]]
+                          for f in payload["files"]}
+        assert labels_by_file["call_one_segments.json"] == ["SPEAKER_00", "SPEAKER_01"]
+        assert labels_by_file["call_two_segments.json"] == ["SPEAKER_00"]
+
+    def test_blank_hf_token_yields_no_suggestions_but_still_lists_speakers(self, tmp_path):
+        self._make_processed_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        speaker = payload["files"][0]["speakers"][0]
+        assert speaker["suggested_name"] is None
+        assert speaker["name"] == ""
+        assert "embedding_b64" not in speaker
+
+    def test_file_with_no_speaker_labels_is_omitted(self, tmp_path):
+        # Diarization was off for this run: segments exist but carry no
+        # "speaker" key at all.
+        stem = "no_diarization"
+        segments = [{"start": 0.0, "end": 1.0, "text": "hi", "words": []}]
+        (tmp_path / f"{stem}_segments.json").write_text(json.dumps(segments), encoding="utf-8")
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        result = run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        assert result["files"] == 0
+
+    def test_not_a_folder_raises(self, tmp_path):
+        with pytest.raises(NotADirectoryError):
+            run_pipeline.export_speaker_roster_json(
+                str(tmp_path / "missing"), str(tmp_path / "out.json"),
+                hf_token="", threshold=0.75, db_path=str(tmp_path / "x.db"))
+
+    def test_includes_source_media_path(self, tmp_path):
+        segments_json, src = self._make_processed_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        assert payload["files"][0]["source_media"] == str(src)
+
+
+class TestApplySpeakerRosterJson:
+    def _make_db(self, tmp_path):
+        path = str(tmp_path / "test.db")
+        db.validate_schema(path)
+        return path
+
+    def _make_segments_file(self, tmp_path, stem, speakers):
+        segments = [{"start": i * 1.0, "end": i * 1.0 + 0.5, "speaker": spk,
+                     "text": "hello", "words": []}
+                    for i, spk in enumerate(speakers)]
+        segments_json = tmp_path / f"{stem}_segments.json"
+        segments_json.write_text(json.dumps(segments), encoding="utf-8")
+        media = tmp_path / f"{stem}.wav"
+        media.write_bytes(b"fake")
+        return segments_json
+
+    def test_applies_rename_across_multiple_files(self, tmp_path):
+        seg1 = self._make_segments_file(tmp_path, "call_one", ["SPEAKER_00"])
+        seg2 = self._make_segments_file(tmp_path, "call_two", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        roster = {
+            "db_path": db_path,
+            "files": [
+                {"segments_json": str(seg1), "speakers": [
+                    {"label": "SPEAKER_00", "name": "Joerg Riener"}]},
+                {"segments_json": str(seg2), "speakers": [
+                    {"label": "SPEAKER_00", "name": "Massimo"}]},
+            ],
+        }
+        roster_json = tmp_path / "roster.json"
+        roster_json.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = run_pipeline.apply_speaker_roster_json(str(roster_json))
+
+        assert result["files_updated"] == 2
+        assert result["speakers_renamed"] == 2
+        assert result["errors"] == []
+        renamed_1 = json.loads(seg1.read_text(encoding="utf-8"))
+        renamed_2 = json.loads(seg2.read_text(encoding="utf-8"))
+        assert renamed_1[0]["speaker"] == "Joerg Riener"
+        assert renamed_2[0]["speaker"] == "Massimo"
+
+    def test_blank_name_skips_speaker(self, tmp_path):
+        seg1 = self._make_segments_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        roster = {
+            "db_path": db_path,
+            "files": [{"segments_json": str(seg1), "speakers": [
+                {"label": "SPEAKER_00", "name": ""}]}],
+        }
+        roster_json = tmp_path / "roster.json"
+        roster_json.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = run_pipeline.apply_speaker_roster_json(str(roster_json))
+
+        assert result["files_updated"] == 0
+        assert result["speakers_renamed"] == 0
+        unchanged = json.loads(seg1.read_text(encoding="utf-8"))
+        assert unchanged[0]["speaker"] == "SPEAKER_00"
+
+    def test_name_equal_to_label_skips_speaker(self, tmp_path):
+        seg1 = self._make_segments_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        roster = {
+            "db_path": db_path,
+            "files": [{"segments_json": str(seg1), "speakers": [
+                {"label": "SPEAKER_00", "name": "SPEAKER_00"}]}],
+        }
+        roster_json = tmp_path / "roster.json"
+        roster_json.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = run_pipeline.apply_speaker_roster_json(str(roster_json))
+
+        assert result["files_updated"] == 0
+
+    def test_embedding_commits_to_roster(self, tmp_path):
+        import numpy as np
+        import speaker_id
+        seg1 = self._make_segments_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        emb_b64 = base64.b64encode(speaker_id.serialize_embedding(vec)).decode("ascii")
+        roster = {
+            "db_path": db_path,
+            "files": [{"segments_json": str(seg1), "speakers": [
+                {"label": "SPEAKER_00", "name": "Anna",
+                 "embedding_b64": emb_b64, "embedding_dim": 3}]}],
+        }
+        roster_json = tmp_path / "roster.json"
+        roster_json.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = run_pipeline.apply_speaker_roster_json(str(roster_json))
+
+        assert result["roster_updates"] == 1
+        conn = db.get_connection(db_path)
+        row = db.get_known_speaker_by_name(conn, "Anna")
+        conn.close()
+        assert row is not None
+
+    def test_no_embedding_still_renames_but_no_roster_update(self, tmp_path):
+        seg1 = self._make_segments_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        roster = {
+            "db_path": db_path,
+            "files": [{"segments_json": str(seg1), "speakers": [
+                {"label": "SPEAKER_00", "name": "Anna"}]}],
+        }
+        roster_json = tmp_path / "roster.json"
+        roster_json.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = run_pipeline.apply_speaker_roster_json(str(roster_json))
+
+        assert result["files_updated"] == 1
+        assert result["roster_updates"] == 0
+
+    def test_missing_segments_file_logs_error_and_continues(self, tmp_path):
+        seg_good = self._make_segments_file(tmp_path, "call_good", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        roster = {
+            "db_path": db_path,
+            "files": [
+                {"segments_json": str(tmp_path / "missing_segments.json"),
+                 "speakers": [{"label": "SPEAKER_00", "name": "Ghost"}]},
+                {"segments_json": str(seg_good),
+                 "speakers": [{"label": "SPEAKER_00", "name": "RealPerson"}]},
+            ],
+        }
+        roster_json = tmp_path / "roster.json"
+        roster_json.write_text(json.dumps(roster), encoding="utf-8")
+
+        result = run_pipeline.apply_speaker_roster_json(str(roster_json))
+
+        assert result["files_updated"] == 1
+        assert len(result["errors"]) == 1
+        assert "missing_segments.json" in result["errors"][0]["file"]
