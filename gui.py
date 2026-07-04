@@ -756,6 +756,18 @@ class PipelineGUI:
         ttk.Entry(log_frame, textvariable=self.log_dir_var, width=45).grid(row=2, column=1, sticky="w")
         ttk.Button(log_frame, text="Browse...", command=self._browse_log_dir).grid(row=2, column=2, sticky="w")
 
+        # --- Backup (task #83) ---
+        backup_frame = ttk.LabelFrame(parent, text="Backup")
+        backup_frame.pack(fill="x", **pad)
+        ttk.Label(backup_frame,
+                 text="Zips the database, persisted GUI settings, and prompt templates "
+                      "into one file. Also includes keys.cfg (your HuggingFace token and "
+                      "Anthropic API key in plain text) - keep the resulting zip as private "
+                      "as keys.cfg itself.",
+                 foreground="#666", wraplength=700).pack(anchor="w", padx=8, pady=(8, 4))
+        ttk.Button(backup_frame, text="Backup all databases + settings to ZIP...",
+                  command=self._backup_all).pack(anchor="w", padx=8, pady=(0, 8))
+
         self._refresh_db_stats()
 
     def _toggle_mask(self, entry: ttk.Entry):
@@ -782,6 +794,46 @@ class PipelineGUI:
     def _open_known_speakers_manager(self):
         """Open the global known-speakers roster manager (task #82)."""
         KnownSpeakersDialog(self)
+
+    def _backup_all(self):
+        """Zip the database, persisted GUI settings (gui_state.json),
+        prompt templates, and keys.cfg into one timestamped archive
+        (task #83). keys.cfg is always included per explicit user choice
+        made when this feature was designed - it holds the HuggingFace
+        token and Anthropic API key in plain text, so the resulting zip
+        needs the same handling as keys.cfg itself. prompts/_backup/
+        (task #77's own automatic pre-save/delete backups) is excluded -
+        those are backups of backups, not source."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"TNP_Backup_{timestamp}.zip"
+        out_path = filedialog.asksaveasfilename(
+            title="Save backup as", initialfile=default_name,
+            defaultextension=".zip", filetypes=[("ZIP archive", "*.zip")],
+        )
+        if not out_path:
+            return
+        try:
+            import zipfile
+            db_path = Path(self.db_path_var.get().strip() or CONFIG["db_path"])
+            with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                if db_path.exists():
+                    zf.write(db_path, arcname=db_path.name)
+                if STATE_PATH.exists():
+                    zf.write(STATE_PATH, arcname=STATE_PATH.name)
+                keys_path = Path("keys.cfg")
+                if keys_path.exists():
+                    zf.write(keys_path, arcname=keys_path.name)
+                prompts_dir = Path(PROMPTS_DIR)
+                if prompts_dir.exists():
+                    for f in prompts_dir.rglob("*"):
+                        if not f.is_file():
+                            continue
+                        if "_backup" in f.relative_to(prompts_dir).parts:
+                            continue
+                        zf.write(f, arcname=str(Path("prompts") / f.relative_to(prompts_dir)))
+            messagebox.showinfo("Backup complete", f"Saved to:\n{out_path}")
+        except Exception as exc:
+            messagebox.showerror("Backup failed", str(exc))
 
     def _open_path(self, path: Path):
         if not path.exists():
