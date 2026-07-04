@@ -105,6 +105,81 @@ class QueueLogHandler(logging.Handler):
         self.log_queue.put(self.format(record))
 
 
+class Tooltip:
+    """
+    Small delayed popup shown on hover (task #73), used to explain what a
+    Stages checkbox actually does without cluttering the tab with a
+    permanent label under every one. Attach with Tooltip(widget, "text");
+    nothing else needs to reference the returned instance afterward, the
+    event bindings on the widget keep it alive for the widget's lifetime.
+    """
+
+    def __init__(self, widget, text: str, delay_ms: int = 500):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id = None
+        self._tip_window = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self):
+        if self._after_id is not None:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self):
+        if self._tip_window is not None:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self._tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify="left", background="#ffffe0",
+                         relief="solid", borderwidth=1, wraplength=360, font=("", 9))
+        label.pack(ipadx=4, ipady=2)
+
+    def _hide(self, event=None):
+        self._cancel()
+        if self._tip_window is not None:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+
+# Explanatory tooltip text for each Stages checkbox (task #73). Shared
+# between both tabs; a given tab only uses the keys for checkboxes it
+# actually has (see RunTabController._build's Stages section).
+STAGE_TOOLTIPS = {
+    "enable_slides": "Detects slide changes in the video by comparing "
+                      "perceptual hashes between frames. Automatically "
+                      "skipped for audio-only files regardless of this "
+                      "setting.",
+    "enable_vlm": "Sends each detected slide's snapshot image to a local "
+                  "vision-language model (Ollama) to extract a title and "
+                  "bullet points. Requires slide detection to be enabled.",
+    "enable_diarization": "Identifies and labels distinct speakers "
+                          "(SPEAKER_01, SPEAKER_02, ...) using pyannote. "
+                          "Requires HF_TOKEN to be set in Settings and the "
+                          "pyannote model terms to be accepted on "
+                          "HuggingFace.",
+    "no_summary": "Skips the LLM summary/notes step entirely: only the "
+                  "transcript, .srt, and (Video/Webinar tab) slide report "
+                  "are produced.",
+    "force_retranscribe": "Ignores any cached transcript, segments, or "
+                          "slides already on disk for this file and "
+                          "reprocesses it completely from scratch.",
+    "dry_run": "Runs slide-change detection only, to preview slide "
+              "timestamps, without VLM annotation, transcription, or "
+              "notes generation.",
+}
+
+
 class PipelineGUI:
     """
     Top-level window: owns the Notebook and the Search/Settings tabs
@@ -865,28 +940,56 @@ class RunTabController:
                      foreground="#666").grid(row=7, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
 
         # --- Stages ---
+        # Each checkbox gets a Tooltip (task #73) explaining what the
+        # stage actually does on hover, keyed by STAGE_TOOLTIPS so the
+        # explanation text lives in one place shared by both tabs.
         toggles = ttk.LabelFrame(parent, text="Stages")
         toggles.pack(fill="x", **pad)
         if is_video:
-            ttk.Checkbutton(toggles, text="Slide detection (video files only)",
-                            variable=self.enable_slides_var).grid(row=0, column=0, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="VLM slide annotation",
-                            variable=self.enable_vlm_var).grid(row=0, column=1, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="Speaker diarization",
-                            variable=self.enable_diarization_var).grid(row=0, column=2, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="No summary (transcript only)",
-                            variable=self.no_summary_var).grid(row=1, column=0, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="Force re-transcribe / re-process",
-                            variable=self.force_retranscribe_var).grid(row=1, column=1, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="Dry run (slide timestamps only)",
-                            variable=self.dry_run_var).grid(row=1, column=2, sticky="w", **pad)
+            cb = ttk.Checkbutton(toggles, text="Slide detection (video files only)",
+                                 variable=self.enable_slides_var)
+            cb.grid(row=0, column=0, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["enable_slides"])
+
+            cb = ttk.Checkbutton(toggles, text="VLM slide annotation",
+                                 variable=self.enable_vlm_var)
+            cb.grid(row=0, column=1, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["enable_vlm"])
+
+            cb = ttk.Checkbutton(toggles, text="Speaker diarization",
+                                 variable=self.enable_diarization_var)
+            cb.grid(row=0, column=2, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["enable_diarization"])
+
+            cb = ttk.Checkbutton(toggles, text="No summary (transcript only)",
+                                 variable=self.no_summary_var)
+            cb.grid(row=1, column=0, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["no_summary"])
+
+            cb = ttk.Checkbutton(toggles, text="Force re-transcribe / re-process",
+                                 variable=self.force_retranscribe_var)
+            cb.grid(row=1, column=1, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["force_retranscribe"])
+
+            cb = ttk.Checkbutton(toggles, text="Dry run (slide timestamps only)",
+                                 variable=self.dry_run_var)
+            cb.grid(row=1, column=2, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["dry_run"])
         else:
-            ttk.Checkbutton(toggles, text="Speaker diarization",
-                            variable=self.enable_diarization_var).grid(row=0, column=0, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="No summary (transcript only)",
-                            variable=self.no_summary_var).grid(row=0, column=1, sticky="w", **pad)
-            ttk.Checkbutton(toggles, text="Force re-transcribe / re-process",
-                            variable=self.force_retranscribe_var).grid(row=0, column=2, sticky="w", **pad)
+            cb = ttk.Checkbutton(toggles, text="Speaker diarization",
+                                 variable=self.enable_diarization_var)
+            cb.grid(row=0, column=0, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["enable_diarization"])
+
+            cb = ttk.Checkbutton(toggles, text="No summary (transcript only)",
+                                 variable=self.no_summary_var)
+            cb.grid(row=0, column=1, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["no_summary"])
+
+            cb = ttk.Checkbutton(toggles, text="Force re-transcribe / re-process",
+                                 variable=self.force_retranscribe_var)
+            cb.grid(row=0, column=2, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["force_retranscribe"])
 
         # --- Output formats ---
         formats = ttk.LabelFrame(parent, text="Output formats")
