@@ -25,9 +25,10 @@ OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=qwen3:14b
 
 # --- Ollama vision model for slide annotation (video mode only) ---
-# Recommended: qwen2.5vl:7b (better structured text extraction than llava)
-# Pull command: ollama pull qwen2.5vl:7b
-OLLAMA_VLM_MODEL=qwen2.5vl:7b
+# Recommended: qwen3-vl:4b-instruct (config.py's default; annotator.py caps
+# num_ctx at 4096 for it, since its 262144 native context overflows 16 GB VRAM)
+# Pull command: ollama pull qwen3-vl:4b-instruct
+OLLAMA_VLM_MODEL=qwen3-vl:4b-instruct
 
 # --- Ollama text model for the Translate tab/CLI (optional) ---
 # Leave blank to reuse OLLAMA_MODEL above (the common case - most models
@@ -37,6 +38,6 @@ OLLAMA_TRANSLATE_MODEL=
 
 # --- HuggingFace token (speaker diarization via pyannote) ---
 # Step 1: Register at https://huggingface.co and create a read token.
-# Step 2: Accept model terms at https://huggingface.co/pyannote/speaker-diarization-3.1
+# Step 2: Accept model terms at https://huggingface.co/pyannote/speaker-diarization-community-1
 # Step 3: Paste your token below.
 HF_TOKEN=hf_...

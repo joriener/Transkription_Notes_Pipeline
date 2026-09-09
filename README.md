@@ -654,9 +654,6 @@ Not implemented, worth considering if they become a real bottleneck:
 - **Config profiles**: named presets in `config.py` (e.g. "fast draft" vs.
   "high quality") selectable from the GUI instead of hand-adjusting every
   field per run.
-- **Cancel-run button**: the GUI currently has no way to stop a run once
-  started short of closing the window; the worker thread is daemonized so
-  the process exits cleanly, but there is no graceful mid-run abort.
 - **Retry-on-transient-failure** for Ollama/Anthropic API calls (timeouts,
   connection resets), currently a single attempt per chunk.
 - **CSV export of search results** from the Search tab, for pasting into a

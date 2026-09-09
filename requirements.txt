@@ -14,7 +14,7 @@
 #
 #  Ollama models to pull (run once):
 #    ollama pull qwen3:14b        # notes/summary generation (default, see keys.cfg.example)
-#    ollama pull qwen2.5vl:7b     # VLM slide annotation (video mode only)
+#    ollama pull qwen3-vl:4b-instruct   # VLM slide annotation (video mode only)
 # =============================================================
 
 # ---------------------------------------------------------------

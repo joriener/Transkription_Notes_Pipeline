@@ -40,7 +40,7 @@ REQUIREMENTS = [
     Requirement("tkinter",    "",                    "tkinter (GUI)", False),
     Requirement("playwright", "playwright>=1.45.0",  "Playwright (PDF, preferred)", False),
     Requirement("weasyprint", "weasyprint>=62.0",    "weasyprint (PDF fallback)",   False),
-    Requirement("anthropic",  "anthropic>=0.40.0",   "anthropic (Claude backend)",  False),
+    Requirement("anthropic",  "anthropic>=0.60.0",   "anthropic (Claude backend)",  False),
     Requirement("pptx",       "python-pptx>=1.0.2",  "python-pptx (Translate tab)", False),
     Requirement("pypdf",      "pypdf>=4.3.0",        "pypdf (Translate tab, PDF)",  False),
     Requirement("pytesseract","pytesseract>=0.3.13", "pytesseract (Translate tab, image OCR)", False),

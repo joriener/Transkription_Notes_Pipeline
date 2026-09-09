@@ -112,8 +112,8 @@ if ($LASTEXITCODE -ne 0) { Write-Fail "torch install failed."; exit 1 }
 Write-OK "torch installed."
 
 # --- Step 3: whisperx ---
-Write-Step "Installing whisperx 3.8.5"
-& $Python -m pip install "whisperx==3.8.5"
+Write-Step "Installing whisperx 3.8.6"
+& $Python -m pip install "whisperx==3.8.6"
 if ($LASTEXITCODE -ne 0) { Write-Fail "whisperx install failed."; exit 1 }
 Write-OK "whisperx installed."
 
