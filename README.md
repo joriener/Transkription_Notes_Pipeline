@@ -716,7 +716,7 @@ Transkription_Notes_Pipeline/
 
 ## NAS and network paths
 
-`\\192.168.0.104\Public\Agilent\` is a private LAN address; it cannot be
+`\\192.168.0.104\Public\` is a private LAN address; it cannot be
 reached or tested from outside your network, so the following is a code
 review plus a script to run locally, not a live end-to-end test result.
 
@@ -729,7 +729,7 @@ review plus a script to run locally, not a live end-to-end test result.
 - **ffmpeg on UNC paths**: most current ffmpeg builds read `-i \\server\...`
   directly without issue. Some older or minimal builds have had trouble
   with UNC input paths; if frame extraction fails only for NAS files, map
-  the share to a drive letter first (`net use Z: \\192.168.0.104\Public\Agilent`)
+  the share to a drive letter first (`net use Z: \\192.168.0.104\Public\`)
   and use `Z:\...` instead as a reliable workaround.
 - **SQLite and the database file specifically**: keep `db_path` on local
   disk. SQLite's WAL journal mode (used by `db.py` for concurrent-safe
