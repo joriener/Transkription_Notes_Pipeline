@@ -173,7 +173,7 @@ PERSISTED_KEYS_VIDEO_ONLY = (
     "convert_video_to_realtime", "report_html", "report_csv", "report_json",
     "report_srt", "report_pdf", "report_slide_timing", "zip_snapshots",
     "report_show_image", "report_show_bullets", "report_show_transcript",
-    "report_transcript_mode", "qa_include_in_summary",
+    "report_transcript_mode", "qa_include_in_summary", "qa_autodetect_start",
 )
 
 

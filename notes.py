@@ -153,6 +153,258 @@ def build_transcript_text_with_qa_marker(
 
 
 # ---------------------------------------------------------------------------
+# Q&A start detection (webinar recordings)
+#
+# The whole Q&A pipeline already runs off ONE number, qa_start_time_sec: the
+# frame filter in process_file, the summary split, the synthetic qa_session
+# slide, and generate_qa_pairs below all read it. Until now that number had
+# to be typed in by hand (GUI "Q&A section" or --qa-start). These helpers
+# work it out from the transcript instead.
+#
+# Cue phrases live here rather than in a module of their own because every
+# other piece of Q&A semantics is already in this file (QA_SESSION_MARKER,
+# build_transcript_text_with_qa_marker, _parse_qa_pairs, generate_qa_pairs),
+# and this module imports only logging/re/pathlib, so it stays testable with
+# no whisperx, torch or PIL anywhere near it.
+#
+# Two tiers, because the two kinds of phrase behave differently. A STRONG cue
+# announces the session ("now to the questions and answers") and does not
+# recur once it is under way, so the LAST one wins: presenters routinely
+# foreshadow Q&A ("we'll take questions at the end") before actually starting
+# it. A WEAK cue is an opener that recurs between questions ("are there any
+# questions"), so the FIRST one wins, since that is when Q&A actually opened.
+# ---------------------------------------------------------------------------
+
+QA_CUE_STRONG = (
+    # English
+    "questions and answers", "question and answer", "q and a",
+    "time for questions", "time for your questions",
+    "take your questions", "take some questions",
+    "open the floor", "open it up for questions",
+    "move on to the questions", "over to the questions",
+    "now to the questions", "question round",
+    # German. Both the umlaut and the umlaut-less spelling are listed
+    # because Whisper's own output varies between them.
+    "fragen und antworten", "frage und antwort", "q und a",
+    "fragerunde", "frageteil",
+    "zu den fragen", "zu ihren fragen", "zu euren fragen",
+    "zeit fur fragen", "zeit fuer fragen",
+    "kommen wir zu den fragen",
+    "fragen aus dem publikum", "fragen aus dem chat",
+)
+
+QA_CUE_WEAK = (
+    # English
+    "are there any questions", "do we have any questions",
+    "any questions from", "first question",
+    # German
+    "gibt es fragen", "gibt es noch fragen",
+    "haben sie fragen", "habt ihr fragen",
+    "erste frage", "wer hat eine frage",
+)
+
+# Deliberately absent from both tiers, because these are mid-talk
+# housekeeping or intra-Q&A transitions rather than a session boundary, and
+# are the main source of false positives:
+#   "if you have any questions", "any questions just email",
+#   "next question", "naechste frage", "weitere fragen"
+
+_CUE_NON_WORD = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def _normalize_cue_text(text: str) -> str:
+    """
+    Casefold, turn "&" into " and " so "Q&A" matches "q and a", replace every
+    non-word character with a space (umlauts and sz survive, punctuation does
+    not), collapse whitespace, and pad with single spaces so a plain
+    substring test is word-boundary safe.
+    """
+    lowered = (text or "").casefold().replace("&", " and ")
+    collapsed = _CUE_NON_WORD.sub(" ", lowered)
+    return " " + " ".join(collapsed.split()) + " "
+
+
+def _cue_word_offset(text_norm: str, phrase_norm: str) -> int | None:
+    """How many words precede phrase_norm in text_norm, or None if absent."""
+    idx = text_norm.find(phrase_norm.strip().join((" ", " ")))
+    if idx < 0:
+        return None
+    return len(text_norm[:idx].split())
+
+
+def detect_qa_start(
+    segments: list[dict],
+    search_last_fraction: float = 0.4,
+    min_remaining_sec: float = 60.0,
+    max_cue_offset_words: int = 12,
+) -> tuple[float, str] | None:
+    """
+    Find where the audience Q&A session starts, from cue phrases in the
+    transcript. Returns (start_seconds, matched_cue) or None.
+
+    The returned value is on the SAME clock as the segments handed in.
+    run_pipeline rescales segments to real time before this is called
+    (_rescale_segments), and qa_start_time_sec lives on that same real-time
+    clock, so the result must NOT be rescaled again by the caller.
+
+    Pure: no logging, no config, no I/O, so the caller decides what to report.
+
+    Four guards, all applied together, which between them rule out the
+    everyday false positives:
+      1. Only the final search_last_fraction of the recording is searched
+         (default 0.4). A real Q&A block is the last 10-33 percent of a
+         webinar, so 0.4 covers it with margin while excluding the intro
+         housekeeping ("put your questions in the chat, we'll get to them at
+         the end") that is the single most common false trigger.
+      2. The cue must begin within the first max_cue_offset_words words of a
+         segment (default 12), which rules out passing mentions buried
+         mid-paragraph while still tolerating leading filler ("So, aehm, ok,
+         dann kommen wir jetzt zu den Fragen").
+      3. At least min_remaining_sec must remain afterwards (default 60), so a
+         closing "thanks for all your questions" cannot create a 20-second
+         Q&A that drops frames and burns an LLM call on an empty card.
+      4. Tier tie-breaking: last STRONG cue, else first WEAK cue.
+    """
+    if not segments:
+        return None
+
+    ends = [s.get("end", s.get("start", 0.0)) or 0.0 for s in segments]
+    duration = max(ends) if ends else 0.0
+    if duration <= 0:
+        return None
+
+    window_start = duration * (1.0 - search_last_fraction)
+    strong_hits: list[tuple[float, str]] = []
+    weak_hits: list[tuple[float, str]] = []
+
+    for seg in segments:
+        start = seg.get("start", 0.0) or 0.0
+        if start < window_start:
+            continue
+        if duration - start < min_remaining_sec:
+            continue
+        text_norm = _normalize_cue_text(seg.get("text", ""))
+        if not text_norm.strip():
+            continue
+        for phrase in QA_CUE_STRONG:
+            offset = _cue_word_offset(text_norm, phrase)
+            if offset is not None and offset <= max_cue_offset_words:
+                strong_hits.append((float(start), phrase))
+                break
+        else:
+            for phrase in QA_CUE_WEAK:
+                offset = _cue_word_offset(text_norm, phrase)
+                if offset is not None and offset <= max_cue_offset_words:
+                    weak_hits.append((float(start), phrase))
+                    break
+
+    if strong_hits:
+        return strong_hits[-1]
+    if weak_hits:
+        return weak_hits[0]
+    return None
+
+
+_QA_LLM_SYSTEM = (
+    "You are given the tail end of a webinar transcript, as timestamped lines. "
+    "Decide where the live audience Q&A session begins: the point where the "
+    "presenter stops presenting and starts taking questions from the audience. "
+    "Answer with the start time in seconds of the first line that belongs to the "
+    "Q&A session, as a bare number, nothing else. If there is no audience Q&A "
+    "session in this text, answer exactly NONE."
+)
+
+
+def detect_qa_start_llm(
+    segments: list[dict],
+    llm_backend: str,
+    ollama_base_url: str,
+    ollama_notes_model: str,
+    anthropic_api_key: str,
+    claude_model: str,
+    search_last_fraction: float = 0.4,
+    min_remaining_sec: float = 60.0,
+    ollama_num_ctx: int = 8_192,
+    timeout_sec: int = 120,
+) -> tuple[float, str] | None:
+    """
+    Fallback for when detect_qa_start finds no cue phrase: ask the configured
+    notes backend where the Q&A starts. Returns (start_seconds, "LLM") or None.
+
+    Only the TAIL of the transcript is sent, the same window detect_qa_start
+    searches, not the whole thing. Returns None rather than raising for every
+    failure mode (no backend configured, no credentials, unparseable answer,
+    a time outside the window), so this can never turn a working
+    transcription run into a failed one, and never makes Ollama or Anthropic
+    a hard requirement of the pipeline.
+    """
+    if not segments:
+        return None
+    ends = [s.get("end", s.get("start", 0.0)) or 0.0 for s in segments]
+    duration = max(ends) if ends else 0.0
+    if duration <= 0:
+        return None
+
+    window_start = duration * (1.0 - search_last_fraction)
+    tail = [s for s in segments if (s.get("start", 0.0) or 0.0) >= window_start]
+    if not tail:
+        return None
+
+    lines = []
+    for seg in tail:
+        text = (seg.get("text", "") or "").strip()
+        if text:
+            lines.append(f"[{float(seg.get('start', 0.0) or 0.0):.1f}] {text}")
+    if not lines:
+        return None
+    user = "\n".join(lines)
+
+    raw = ""
+    try:
+        if llm_backend == "ollama":
+            raw = _chat_ollama(_QA_LLM_SYSTEM, user, ollama_base_url,
+                               ollama_notes_model, timeout_sec,
+                               num_predict=16, num_ctx=ollama_num_ctx)
+        elif llm_backend == "anthropic":
+            if not anthropic_api_key or anthropic_api_key.startswith("sk-ant-..."):
+                log.debug("Q&A auto-detect: no Anthropic key, skipping the LLM fallback.")
+                return None
+            import anthropic
+            client = anthropic.Anthropic(api_key=anthropic_api_key)
+            message = client.messages.create(
+                model=claude_model, max_tokens=16,
+                system=_QA_LLM_SYSTEM,
+                messages=[{"role": "user", "content": user}],
+            )
+            for block in message.content:
+                if getattr(block, "type", None) == "text":
+                    raw = block.text
+                    break
+        else:
+            log.debug("Q&A auto-detect: no usable llm_backend (%r), skipping the "
+                      "LLM fallback.", llm_backend)
+            return None
+    except Exception as exc:
+        log.debug("Q&A auto-detect: LLM fallback failed (%s) - no Q&A section set.", exc)
+        return None
+
+    answer = (raw or "").strip()
+    if not answer or answer.upper().startswith("NONE"):
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", answer)
+    if not match:
+        log.debug("Q&A auto-detect: LLM answer %r is not a number.", answer[:60])
+        return None
+    value = float(match.group(0))
+    if value < window_start or duration - value < min_remaining_sec:
+        log.debug("Q&A auto-detect: LLM answered %.1fs, outside the searched "
+                  "window (%.1f-%.1fs) - ignored.", value, window_start,
+                  duration - min_remaining_sec)
+        return None
+    return value, "LLM"
+
+
+# ---------------------------------------------------------------------------
 # Chunking (map-reduce for long transcripts)
 # ---------------------------------------------------------------------------
 

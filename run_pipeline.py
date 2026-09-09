@@ -441,6 +441,73 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     return str(out_dir / stem)
 
 
+def _resolve_qa_autodetect(cfg: dict) -> bool:
+    """
+    Whether Q&A start auto-detection should run for this run.
+
+    cfg["qa_autodetect_start"] is tri-state: True/False force it either way,
+    and None (config's default, and what the GUI checkbox sends when ticked)
+    means "the webinar prompt template only". Other recording types rarely
+    have a formal Q&A block, and a false boundary in one would quietly cut
+    part of the summary.
+    """
+    setting = cfg.get("qa_autodetect_start")
+    if setting is None:
+        return cfg.get("prompt_template") == "webinar"
+    return bool(setting)
+
+
+def _apply_qa_autodetect(cfg: dict, segments: list[dict]) -> None:
+    """
+    Fill in cfg["qa_start_time_sec"] from the transcript when it was not set
+    by hand, so the rest of the Q&A pipeline (frame filter, summary split,
+    the synthetic qa_session slide, generate_qa_pairs) works without the
+    boundary having been timed manually.
+
+    Mutates the run's local cfg only, never CONFIG or gui_state.json, so a
+    detected value cannot leak into another batch row or become sticky.
+
+    Deliberately never sets qa_end_time_sec: it reports a start only, so the
+    Q&A runs to the end of the recording, which is how webinars actually
+    work. That also keeps the excised frame range strictly trailing, well
+    away from the mid-recording excision path in the slide detector.
+    """
+    if not _resolve_qa_autodetect(cfg) or not segments:
+        return
+    if cfg.get("qa_start_time_sec"):
+        log.info("Q&A auto-detect skipped: Q&A start already set manually (%s).",
+                 reporter.format_ts(cfg["qa_start_time_sec"]))
+        return
+
+    hit = notes.detect_qa_start(segments)
+    if hit is None and cfg.get("llm_backend"):
+        # Only on a miss, and only over the transcript tail rather than the
+        # whole thing. Silently skipped when no backend answers.
+        hit = notes.detect_qa_start_llm(
+            segments,
+            llm_backend=cfg["llm_backend"],
+            ollama_base_url=cfg.get("ollama_base_url", ""),
+            ollama_notes_model=cfg.get("ollama_notes_model", ""),
+            anthropic_api_key=cfg.get("anthropic_api_key", ""),
+            claude_model=cfg.get("claude_model", ""),
+        )
+    if not hit:
+        log.info("Q&A auto-detect: no Q&A cue phrase found in the final 40%% of "
+                 "the recording - no Q&A section set.")
+        return
+
+    detected, cue = hit
+    cfg["qa_start_time_sec"] = detected
+    snippet = next(
+        ((s.get("text", "") or "").strip()[:120] for s in segments
+         if (s.get("start", 0.0) or 0.0) == detected), "")
+    log.info(
+        "Q&A auto-detect: Q&A session appears to start at %s (%.1fs), cue \"%s\" "
+        "in: \"%s\". Wrong? Set the Q&A section's \"Starts at\" field in the GUI "
+        "(or --qa-start) to override, or untick auto-detect.",
+        reporter.format_ts(detected), detected, cue, snippet)
+
+
 def _unique_snapshot_path(snapshot_dir: Path, base_name: str, slide_idx: int,
                           suffix: str = ".png") -> Path:
     """
@@ -676,6 +743,22 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
         Path(output_prefix + "_source_media.txt").write_text(file, encoding="utf-8")
     else:
         log.info("Transcription disabled (--no-whisper).")
+
+    # -----------------------------------------------------------------
+    # Step 1b: Q&A start auto-detection (webinar recordings)
+    #
+    # Deliberately OUTSIDE the enable_slides block below: an audio-only
+    # webinar run has no slides but still needs qa_start_time_sec for the
+    # summary split in Step 3. Placed here because segments are populated by
+    # now on both paths (a fresh transcription and a cached one) and already
+    # rescaled to real time, which is the clock qa_start_time_sec uses - so
+    # the detected value must NOT be rescaled again.
+    #
+    # Written into this run's local cfg only, never back into CONFIG or
+    # gui_state.json, so it cannot leak into another batch row or become
+    # sticky for the next run.
+    # -----------------------------------------------------------------
+    _apply_qa_autodetect(cfg, segments)
 
     # -----------------------------------------------------------------
     # Step 2: Slide detection + VLM annotation (video mode only)
@@ -2906,6 +2989,14 @@ def parse_args() -> argparse.Namespace:
                         "notes/summary entirely (its 'QUESTIONS & ANSWERS' section falls back to "
                         "'No Q&A session') instead of the default of folding it into the same "
                         "summary prompt. See CONFIG['qa_include_in_summary'].")
+    p.add_argument("--qa-autodetect", action="store_true",
+                   help="Work out --qa-start automatically from cue phrases in the transcript "
+                        "(\"now to the questions and answers\", \"kommen wir zu den Fragen\", "
+                        "German and English). On by default for --mode webinar only. An "
+                        "explicit --qa-start always wins. Never sets --qa-end. See "
+                        "CONFIG['qa_autodetect_start'].")
+    p.add_argument("--no-qa-autodetect", action="store_true",
+                   help="Never auto-detect the Q&A start, not even for --mode webinar.")
     p.add_argument("--animation-threshold", type=int, metavar="N",
                    help="Distances between this and --threshold are treated as the current slide "
                         "still building (e.g. bullets appearing one at a time), instead of a new "
@@ -3019,6 +3110,10 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "qa_start_time_sec": args.qa_start,
         "qa_end_time_sec": args.qa_end,
         "qa_include_in_summary": False if args.qa_exclude_from_summary else None,
+        # Tri-state: --qa-autodetect forces on, --no-qa-autodetect forces off,
+        # neither leaves CONFIG's None (= webinar template only) in place.
+        "qa_autodetect_start": (True if args.qa_autodetect
+                                else (False if args.no_qa_autodetect else None)),
         "recording_speed":     args.recording_speed,
         "convert_video_to_realtime": True if args.normalize_speed else None,
         "title_slide_image_path": args.title_image,

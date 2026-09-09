@@ -148,6 +148,22 @@ CONFIG = {
     # Q&A in the summary" checkbox or --qa-exclude-from-summary.
     "qa_include_in_summary": True,
 
+    # Work out qa_start_time_sec automatically from cue phrases in the
+    # transcript ("now to the questions and answers", "kommen wir zu den
+    # Fragen", ...), so a webinar's Q&A block does not have to be timed by
+    # hand. See notes.detect_qa_start.
+    #
+    # None (default) = on for the "webinar" prompt template only, off for
+    # every other recording type. True/False force it either way. None
+    # rather than a plain bool so that webinar-only default is expressible
+    # while leaving behaviour unchanged for every existing config.
+    #
+    # A manually set qa_start_time_sec always wins: detection only ever
+    # fills a gap. Detection never sets qa_end_time_sec - it reports a
+    # start only, so the Q&A runs to the end of the recording, which is
+    # how webinars actually run.
+    "qa_autodetect_start": None,
+
     # =========================================================
     # EXTERNAL TOOLS
     # =========================================================

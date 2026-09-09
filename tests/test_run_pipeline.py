@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import run_pipeline
 import db
+import notes
 import anthropic
 
 
@@ -1673,3 +1674,137 @@ class TestBatchModelCache:
         assert transcriber._CACHE_ENABLED is True
         transcriber.enable_model_cache(False)
         assert transcriber._CACHE_ENABLED is False
+
+
+# -----------------------------------------------------------------
+# Q&A start auto-detection
+#
+# The whole Q&A pipeline runs off one number, qa_start_time_sec. These two
+# helpers decide whether to work it out from the transcript, and do it.
+# -----------------------------------------------------------------
+
+class TestResolveQaAutodetect:
+    def test_none_means_webinar_template_only(self):
+        assert run_pipeline._resolve_qa_autodetect(
+            {"qa_autodetect_start": None, "prompt_template": "webinar"}) is True
+        assert run_pipeline._resolve_qa_autodetect(
+            {"qa_autodetect_start": None, "prompt_template": "meeting"}) is False
+        assert run_pipeline._resolve_qa_autodetect(
+            {"qa_autodetect_start": None, "prompt_template": "video_transcript"}) is False
+
+    def test_true_forces_it_on_for_any_template(self):
+        assert run_pipeline._resolve_qa_autodetect(
+            {"qa_autodetect_start": True, "prompt_template": "meeting"}) is True
+
+    def test_false_forces_it_off_even_for_webinar(self):
+        assert run_pipeline._resolve_qa_autodetect(
+            {"qa_autodetect_start": False, "prompt_template": "webinar"}) is False
+
+    def test_missing_key_behaves_like_none(self):
+        assert run_pipeline._resolve_qa_autodetect({"prompt_template": "webinar"}) is True
+        assert run_pipeline._resolve_qa_autodetect({}) is False
+
+
+class TestApplyQaAutodetect:
+    def _cfg(self, **over):
+        cfg = {"qa_autodetect_start": True, "prompt_template": "webinar",
+               "llm_backend": ""}
+        cfg.update(over)
+        return cfg
+
+    def _segments(self):
+        segs = [{"start": float(i * 10), "end": float(i * 10 + 5), "text": "presenting"}
+                for i in range(60)]
+        segs[48] = {"start": 480.0, "end": 485.0,
+                    "text": "So, now to the questions and answers."}
+        segs[-1]["end"] = 600.0
+        return segs
+
+    def test_sets_the_detected_start_on_cfg(self, monkeypatch):
+        cfg = self._cfg()
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert cfg["qa_start_time_sec"] == 480.0
+
+    def test_never_sets_an_end_time(self, monkeypatch):
+        """Detection reports a start only, so the Q&A runs to the end of the
+        recording. That also keeps the excised frame range strictly trailing,
+        away from the detector's mid-recording excision path."""
+        cfg = self._cfg()
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert cfg.get("qa_end_time_sec") is None
+
+    def test_a_manual_value_wins_and_detection_is_not_even_attempted(self, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("detection must not run when set by hand")
+
+        monkeypatch.setattr(notes, "detect_qa_start", boom)
+        cfg = self._cfg(qa_start_time_sec=123.0)
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert cfg["qa_start_time_sec"] == 123.0
+
+    def test_disabled_means_no_detection(self, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("detection must not run when disabled")
+
+        monkeypatch.setattr(notes, "detect_qa_start", boom)
+        cfg = self._cfg(qa_autodetect_start=False)
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert "qa_start_time_sec" not in cfg
+
+    def test_non_webinar_template_is_left_alone_by_default(self, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("detection must not run for a meeting")
+
+        monkeypatch.setattr(notes, "detect_qa_start", boom)
+        cfg = self._cfg(qa_autodetect_start=None, prompt_template="meeting")
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert "qa_start_time_sec" not in cfg
+
+    def test_empty_segments_are_a_no_op(self):
+        cfg = self._cfg()
+        run_pipeline._apply_qa_autodetect(cfg, [])
+        assert "qa_start_time_sec" not in cfg
+
+    def test_no_cue_leaves_cfg_untouched(self):
+        cfg = self._cfg()
+        segs = [{"start": float(i * 10), "end": float(i * 10 + 5), "text": "presenting"}
+                for i in range(60)]
+        run_pipeline._apply_qa_autodetect(cfg, segs)
+        assert "qa_start_time_sec" not in cfg
+
+    def test_llm_fallback_runs_only_when_phrase_matching_misses(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(notes, "detect_qa_start", lambda *a, **kw: None)
+        monkeypatch.setattr(notes, "detect_qa_start_llm",
+                            lambda *a, **kw: calls.append("llm") or (420.0, "LLM"))
+        cfg = self._cfg(llm_backend="ollama")
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert calls == ["llm"]
+        assert cfg["qa_start_time_sec"] == 420.0
+
+    def test_llm_fallback_is_skipped_when_phrase_matching_hits(self, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("the LLM must not be consulted after a cue hit")
+
+        monkeypatch.setattr(notes, "detect_qa_start_llm", boom)
+        cfg = self._cfg(llm_backend="ollama")
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert cfg["qa_start_time_sec"] == 480.0
+
+    def test_llm_fallback_is_skipped_without_a_backend(self, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("no backend configured, so no LLM call")
+
+        monkeypatch.setattr(notes, "detect_qa_start", lambda *a, **kw: None)
+        monkeypatch.setattr(notes, "detect_qa_start_llm", boom)
+        cfg = self._cfg(llm_backend="")
+        run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert "qa_start_time_sec" not in cfg
+
+    def test_logs_the_detected_time_and_the_matched_cue(self, caplog):
+        cfg = self._cfg()
+        with caplog.at_level("INFO"):
+            run_pipeline._apply_qa_autodetect(cfg, self._segments())
+        assert "0:08:00" in caplog.text          # 480s, via reporter.format_ts
+        assert "questions and answers" in caplog.text
+        assert "--qa-start" in caplog.text       # tells the user how to override

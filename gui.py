@@ -1684,6 +1684,11 @@ class RunTabController:
             self.qa_end_var = tk.StringVar()
             self.qa_include_in_summary_var = tk.BooleanVar(
                 value=CONFIG.get("qa_include_in_summary", True))
+            # CONFIG's qa_autodetect_start is tri-state (None = webinar
+            # template only). The checkbox shows whether detection would run
+            # for a webinar, which is the case this feature exists for.
+            self.qa_autodetect_var = tk.BooleanVar(
+                value=CONFIG.get("qa_autodetect_start") is not False)
             ttk.Label(qa_frame, text="Starts at:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
             ttk.Entry(qa_frame, textvariable=self.qa_start_var, width=12).grid(row=0, column=1, sticky="w")
             ttk.Label(qa_frame, text="Ends at (optional):").grid(row=0, column=2, sticky="w", padx=(16, 4), pady=4)
@@ -1691,6 +1696,18 @@ class RunTabController:
             ttk.Checkbutton(qa_frame, text="Include Q&A in the summary",
                             variable=self.qa_include_in_summary_var).grid(
                 row=0, column=4, sticky="w", padx=(16, 4))
+            cb = ttk.Checkbutton(qa_frame, text="Auto-detect Q&A start (leave \"Starts at\" blank)",
+                                 variable=self.qa_autodetect_var)
+            cb.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 2))
+            Tooltip(cb, "Finds the Q&A start from cue phrases in the transcript "
+                        "(\"now to the questions and answers\", \"kommen wir zu den "
+                        "Fragen\", German and English), searching only the final 40% "
+                        "of the recording. Applies to the \"Webinar Transcript\" "
+                        "recording type; other types are left alone, since they "
+                        "rarely have a formal Q&A block. Anything typed into "
+                        "\"Starts at\" always wins. Only a start is ever detected, "
+                        "never an end, so the Q&A runs to the end of the recording.")
+
             ttk.Label(qa_frame,
                      text="For webinars with a Q&A block at the end where only the speakers are shown. "
                           "If set, no new slides are detected from here onward (to Ends at, or the end "
@@ -1701,7 +1718,7 @@ class RunTabController:
                           "prompt, one summary either way. Blank Starts at = disabled. Accepts seconds "
                           "(975), mm:ss (16:15), or hh:mm:ss.",
                      foreground="#666", wraplength=860).grid(
-                row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 6))
+                row=2, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 6))
 
         # --- Batch table (task #62) ---
         self.batch_frame = ttk.LabelFrame(
@@ -2088,6 +2105,7 @@ class RunTabController:
                 "report_show_transcript": self.report_show_transcript_var,
                 "report_transcript_mode": self.report_transcript_mode_var,
                 "qa_include_in_summary":  self.qa_include_in_summary_var,
+            "qa_autodetect_start":    self.qa_autodetect_var,
             })
 
         self._apply_recording_type()
@@ -2816,6 +2834,12 @@ class RunTabController:
                 "qa_start_time_sec":   self._parse_qa_time(self.qa_start_var.get()),
                 "qa_end_time_sec":     self._parse_qa_time(self.qa_end_var.get()),
                 "qa_include_in_summary": self.qa_include_in_summary_var.get(),
+                # Ticked -> None: leave CONFIG's rule in charge, which runs
+                # detection for the webinar prompt template only. Unticked ->
+                # False: never detect. Passing True here would widen it to
+                # every recording type on this tab, including plain video
+                # transcripts that have no Q&A block.
+                "qa_autodetect_start": (None if self.qa_autodetect_var.get() else False),
                 "recording_speed":     self.recording_speed_var.get(),
                 "convert_video_to_realtime": self.convert_video_to_realtime_var.get(),
                 "title_slide_image_path": self.title_slide_image_var.get().strip(),
