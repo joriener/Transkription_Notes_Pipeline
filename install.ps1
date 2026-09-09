@@ -62,6 +62,12 @@ if ($Verify) {
     if ($LASTEXITCODE -eq 0) { Write-OK "weasyprint (PDF export fallback)" }
     else { Write-Fail "weasyprint -- not found (PDF export unavailable if Playwright missing too)" }
     & $Python -c "import torch; print('  CUDA available:', torch.cuda.is_available())" 2>$null
+    $ffmpegBinDir = Join-Path $PSScriptRoot "ffmpegin"
+    foreach ($exe in @("ffmpeg.exe", "ffplay.exe", "ffprobe.exe")) {
+        if (Test-Path -LiteralPath (Join-Path $ffmpegBinDir $exe)) { Write-OK "$exe (bundled)" }
+        elseif (Get-Command ($exe -replace '\.exe$', '') -ErrorAction SilentlyContinue) { Write-OK "$exe (on PATH)" }
+        else { Write-Fail "$exe -- not bundled and not on PATH"; $allOK = $false }
+    }
     if ($allOK) { Write-Host "`nAll core packages verified." -ForegroundColor Green }
     else { Write-Host "`nSome packages missing. Run .\install.ps1 to fix." -ForegroundColor Yellow }
     exit 0
@@ -154,6 +160,58 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "  weasyprint install failed (non-fatal). PDF export still works via Playwright if installed above." -ForegroundColor Yellow
 } else {
     Write-OK "weasyprint installed."
+}
+
+# --- Step 5b: bundled ffmpeg/ffplay/ffprobe ---
+# config.py's _BUNDLED_FFMPEG_DIR prefers <repo>fmpegin\ over PATH, so the
+# pipeline needs no system-wide ffmpeg install and no PATH edit. The three .exe
+# files are ~87 MB each and the gyan.dev essentials build is GPL v3, so they are
+# gitignored and fetched here instead of being stored in the repository.
+# Non-fatal: config.get_ffmpeg_path() falls back to ffmpeg on PATH, then to None.
+$FfmpegVersion = "7.1"
+$FfmpegUrl     = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$FfmpegVersion-essentials_build.zip"
+$FfmpegBinDir  = Join-Path $PSScriptRoot "ffmpegin"
+$FfmpegExes    = @("ffmpeg.exe", "ffplay.exe", "ffprobe.exe")
+
+Write-Step "Checking bundled ffmpeg"
+$missingExes = @($FfmpegExes | Where-Object { -not (Test-Path -LiteralPath (Join-Path $FfmpegBinDir $_)) })
+if ($missingExes.Count -eq 0) {
+    Write-OK "ffmpeg, ffplay and ffprobe already in ffmpegin - skipping download."
+} else {
+    Write-Host "  Missing: $($missingExes -join ', ')" -ForegroundColor Yellow
+    Write-Host "  Downloading ffmpeg $FfmpegVersion essentials (~80 MB) from gyan.dev..." -ForegroundColor Yellow
+    $tmpZip = Join-Path $env:TEMP "ffmpeg-$FfmpegVersion-essentials_build.zip"
+    $tmpDir = Join-Path $env:TEMP "ffmpeg-extract-$PID"
+    try {
+        Invoke-WebRequest -Uri $FfmpegUrl -OutFile $tmpZip -UseBasicParsing
+        Expand-Archive -LiteralPath $tmpZip -DestinationPath $tmpDir -Force
+        New-Item -ItemType Directory -Force -Path $FfmpegBinDir | Out-Null
+        # The archive holds one top-level folder, e.g. ffmpeg-7.1-essentials_buildin\.
+        $srcBin = Get-ChildItem -LiteralPath $tmpDir -Directory |
+                  ForEach-Object { Join-Path $_.FullName "bin" } |
+                  Where-Object { Test-Path -LiteralPath $_ } |
+                  Select-Object -First 1
+        if (-not $srcBin) { throw "No bin\ folder found inside the downloaded archive." }
+        foreach ($exe in $FfmpegExes) {
+            $src = Join-Path $srcBin $exe
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $FfmpegBinDir $exe) -Force
+                Write-OK $exe
+            } else {
+                Write-Host "  $exe not in the archive - skipped." -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "  ffmpeg download failed (non-fatal): $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  The pipeline will use ffmpeg from PATH instead, if present." -ForegroundColor Yellow
+        Write-Host "  To install manually:" -ForegroundColor Yellow
+        Write-Host "    1. Download $FfmpegUrl" -ForegroundColor Yellow
+        Write-Host "    2. Copy binfmpeg.exe, ffplay.exe and ffprobe.exe into:" -ForegroundColor Yellow
+        Write-Host "       $FfmpegBinDir" -ForegroundColor Yellow
+    } finally {
+        Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # --- Step 6: tkinter check (GUI) ---

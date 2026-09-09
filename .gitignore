@@ -46,3 +46,16 @@ notes_batch_log_*.txt
 # Templates tab (task #77): automatic pre-Save/Delete backups of prompt
 # templates, not source - the tracked prompts/*.md files are.
 prompts/_backup/
+
+# Bundled ffmpeg/ffplay/ffprobe binaries (config.py's _BUNDLED_FFMPEG_DIR).
+# Fetched by install.ps1, not stored in git: the three .exe files are ~87 MB
+# each (~251 MB total), and the gyan.dev essentials build is GPL v3, so this
+# repository does not redistribute it. config.get_ffmpeg_path() falls back to
+# ffmpeg on PATH, then to None, when the bundled copy is absent.
+ffmpeg/
+
+# Scratch output from redirected manual pytest runs (not produced by the
+# tests themselves - those write only under pytest's tmp_path).
+_t*.txt
+_pytest_out*.txt
+.pytest_cache/
