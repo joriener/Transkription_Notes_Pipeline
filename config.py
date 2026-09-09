@@ -12,6 +12,7 @@
 #  overridden per run via CLI flags or the GUI (gui.py).
 # =============================================================
 
+import shutil
 from pathlib import Path
 from keys_loader import load_keys
 
@@ -126,10 +127,8 @@ CONFIG = {
     # of the recording if that is not set): no new slides are detected
     # (frames in this range are excluded before slide-change detection
     # runs, so the last slide shown before the range simply stays as the
-    # final one), and the matching transcript is summarised separately
-    # by prompts/qa_summary.md and appended to the notes, instead of
-    # being folded into the main summary. Set via --qa-start or the GUI
-    # "Q&A section" fields (accepts seconds or mm:ss / hh:mm:ss there).
+    # final one). Set via --qa-start or the GUI "Q&A section" fields
+    # (accepts seconds or mm:ss / hh:mm:ss there).
     "qa_start_time_sec": None,
 
     # End of the Q&A section, in seconds (same real-time convention as
@@ -137,6 +136,17 @@ CONFIG = {
     # Only used together with qa_start_time_sec. Set via --qa-end or the
     # GUI.
     "qa_end_time_sec": None,
+
+    # Whether the Q&A section (qa_start_time_sec) is folded into the
+    # SAME notes/summary prompt-pass as the rest of the recording
+    # (True, default - its content lands in the prompt's own
+    # "## QUESTIONS & ANSWERS" section, e.g. in prompts/webinar.md), or
+    # dropped from the summary entirely (False - that section falls back
+    # to its "No Q&A session" placeholder). Only used together with
+    # qa_start_time_sec; there is no separate qa_summary.md prompt/pass
+    # any more - one recording, one summary. Set via the GUI "Include
+    # Q&A in the summary" checkbox or --qa-exclude-from-summary.
+    "qa_include_in_summary": True,
 
     # =========================================================
     # EXTERNAL TOOLS
@@ -158,7 +168,7 @@ CONFIG = {
     # =========================================================
     # VLM SLIDE ANNOTATION  (Ollama vision model, video mode only)
     # =========================================================
-    "ollama_vlm_model": _KEYS.get("OLLAMA_VLM_MODEL", "qwen2.5vl:7b"),
+    "ollama_vlm_model": _KEYS.get("OLLAMA_VLM_MODEL", "qwen3-vl:4b-instruct"),
     "vlm_prompt": (
         "Analyse this presentation slide. "
         "Reply with ONLY a valid JSON object, no other text. "
@@ -200,7 +210,7 @@ CONFIG = {
     # original file is never modified and is still what Play Sample and
     # voiceprint extraction read from directly. See
     # transcriber.enhance_audio.
-    "enhance_audio": False,
+    "enhance_audio": True,
 
     # =========================================================
     # SPEAKER DIARIZATION  (pyannote, optional)
@@ -225,6 +235,17 @@ CONFIG = {
     "enable_speaker_id":        True,
     "speaker_id_threshold":     0.75,
 
+    # Target length (seconds) of the audio preview clip extracted per
+    # speaker for the Rename Speakers dialog's "Play sample"/"Improve
+    # audio" buttons and the batch speaker-roster export's sample_clip
+    # files (see speaker_id.extract_speaker_sample_clip). That helper
+    # picks the speaker's longest segments first and concatenates as
+    # many as needed to approach this length, rather than only ever
+    # using one single segment - most utterances are shorter than this
+    # on their own. Raise for a longer listen before naming a speaker;
+    # lower to keep the batch export's samples folder smaller.
+    "speaker_sample_seconds":   15.0,
+
     # =========================================================
     # NOTES / SUMMARY GENERATION  (LLM)
     # =========================================================
@@ -232,6 +253,20 @@ CONFIG = {
     # template to use. Any .md file dropped into prompts/ shows
     # up as a selectable option in the GUI - no code change needed.
     "prompt_template": "meeting.md",
+
+    # Output language for the generated notes/summary AND the VLM slide
+    # title/bullets, independent of whisper_language (which only affects
+    # transcription accuracy/ASR). "auto" (default): no instruction is
+    # added, the LLM/VLM responds in whichever language comes naturally
+    # (usually matching the transcript/slide). Set to "en", "de", etc. to
+    # force notes and slide annotations into that language regardless of
+    # the source recording's language, e.g. transcribe an English call but
+    # get German notes. The verbatim transcript file itself
+    # (*_transcript_speakers.txt/.srt) is never translated and always
+    # reflects whisper's own output. See notes.language_instruction and
+    # annotator.build_prompt. Set via --output-language or the GUI's
+    # "Output language" dropdown next to Language.
+    "output_language": "auto",
 
     # "ollama" (local, free) or "anthropic" (Claude API)
     "llm_backend": _KEYS.get("LLM_BACKEND", "ollama"),
@@ -241,6 +276,17 @@ CONFIG = {
     # (same VRAM budget as qwen2.5:14b, better instruction following).
     # Override with OLLAMA_MODEL in keys.cfg if you need a different model.
     "ollama_notes_model": _KEYS.get("OLLAMA_MODEL", "qwen3:14b"),
+    # Explicit context window for the notes/summary Ollama calls (task:
+    # investigated 2026-07-18 after notes came back empty/generic - see
+    # notes._chat_ollama's docstring). Sized to comfortably hold
+    # single_pass_limit/chunk_size worth of transcript text plus the
+    # response; NOT left unset, since Ollama's own per-model default
+    # varies (some models default too small, silently truncating the
+    # transcript before the model ever sees it - symptom: notes claim
+    # "no transcript provided" despite a real one being sent). Lower this
+    # if VRAM is tight and your transcripts are short; raise it if you
+    # also raise single_pass_limit/chunk_size below.
+    "ollama_notes_num_ctx": 16_384,
     "anthropic_api_key":  _KEYS.get("ANTHROPIC_API_KEY", ""),
     # claude-sonnet-5 is the current balanced default. Use claude-opus-4-8
     # for long, topic-dense transcripts where quality matters most, or
@@ -252,6 +298,56 @@ CONFIG = {
     # Longer: split into chunk_size pieces, each summarised, then merged.
     "single_pass_limit": 20_000,   # chars
     "chunk_size":        12_000,   # chars per chunk
+
+    # =========================================================
+    # DOCUMENT TRANSLATION  (Translate tab/CLI: txt/docx/pptx/pdf/images)
+    # =========================================================
+    # Target language for the Translate tab/CLI. Unlike output_language
+    # above, "auto" is not meaningful here - a translation run always
+    # needs a real target, so the GUI dropdown/CLI flag default to a
+    # concrete code rather than "auto". See translator.translate_text
+    # and doc_translate.py.
+    "translate_target_language": "en",
+
+    # Ollama model used for document translation. Falls back to
+    # ollama_notes_model above if left blank, so most users need not set
+    # this separately; override only if you prefer a different model
+    # specifically for translation (e.g. a smaller/faster one, or a
+    # model marketed for translation quality).
+    "ollama_translate_model": _KEYS.get("OLLAMA_TRANSLATE_MODEL", ""),
+
+    # Explicit context window for translation Ollama calls (see
+    # notes.py's ollama_notes_num_ctx comment for why this is not left
+    # unset). Smaller than ollama_notes_num_ctx since translation units
+    # are normally one paragraph/slide-text-frame at a time, not a whole
+    # transcript; raise it if you translate very long unstructured .txt
+    # files with few paragraph breaks.
+    "ollama_translate_num_ctx": 8_192,
+
+    # Character size above which translate_text splits a text unit into
+    # multiple chunks (paragraph-aware, see translator._chunk_text).
+    # Only engages for large plain .txt/.pdf/OCR text - docx/pptx
+    # paragraphs are almost always far shorter than this already.
+    "translate_chunk_size": 6_000,
+
+    # OCR source language for image inputs (.jpg/.png/etc.) in the
+    # Translate tab/CLI. NOT the translation target - this tells
+    # Tesseract what script/language to expect while READING the image,
+    # before translation ever happens. Wrong here means garbled/gibberish
+    # OCR text (e.g. German umlauts misread under an English-only OCR
+    # pass), which then gets faithfully "translated" into more garbage -
+    # this looks like a translation bug but is actually an OCR-language
+    # problem. "auto" (default) is not true language identification
+    # (Tesseract has no reliable way to do that) - it is a fixed,
+    # reasonable default of "eng+deu" (English technical terms in
+    # German-language slides is the common case here). Set to a code
+    # from LANGUAGE_NAMES below (mapped via TESSERACT_LANG_MAP) for a
+    # single, more accurate targeted OCR pass, or type a raw Tesseract
+    # --lang string directly (e.g. "deu+fra") for anything not in that
+    # map. Run `tesseract --list-langs` to see which language packs are
+    # actually installed; missing ones fall back to Tesseract's own
+    # default and log a warning (see doc_translate._ocr_image_text).
+    "translate_ocr_language": "auto",
 
     # =========================================================
     # OUTPUT FILES
@@ -278,6 +374,57 @@ CONFIG = {
     # filename stem if no recognizable date is found. Set to False to
     # keep the original raw-filename-based naming.
     "use_filename_date_heading": True,
+
+    # Opt-in alternative to use_filename_date_heading above: when True AND
+    # meeting_title is set (Meeting info fields, --meeting-title, --ics
+    # import, a .txt/.docx "Title:" line, or a correlate_calendar_recordings.py
+    # batch CSV), the output basename becomes "YYYYMMDD_Subject" - date
+    # first, then the meeting/webinar title, e.g. "20260703_Q3 Kickoff".
+    # Takes priority over use_filename_date_heading (but NOT over an
+    # explicit output_basename_override, which always wins outright) -
+    # see run_pipeline.build_date_subject_filename/resolve_output_prefix.
+    # Falls back silently to the use_filename_date_heading behaviour when
+    # meeting_title is blank, so turning this on is safe even for a batch
+    # where only some files have a matched title.
+    #
+    # Date resolution order: 1) meeting_date if set (ISO "YYYY-MM-DD",
+    # e.g. from an .ics import or calendar correlation) - 2) a date
+    # embedded in the source filename - 3) the source file's own
+    # last-modified date. Subject is sanitized for filesystem-illegal
+    # characters (\\ / : * ? " < > |) and truncated to keep the whole
+    # filename a reasonable length.
+    "use_date_subject_filename": False,
+
+    # =========================================================
+    # POST-RUN ARCHIVING
+    # =========================================================
+    # Opt-in: after a file finishes successfully (transcript + notes, or
+    # transcript-only with --no-summary - never on failure, never on a
+    # video --dry-run), move the ORIGINAL source audio/video file into a
+    # processed_subfolder_name subfolder next to it. Every already-written
+    # output (transcript, notes, slide report, DB rows) stays exactly
+    # where it was - only the source recording itself relocates, so a
+    # source folder full of raw recordings gradually empties out into a
+    # tidy "already done" subfolder instead of growing forever.
+    #
+    # Safe by construction: run_pipeline.move_processed_source_file
+    # rewrites the *_source_media.txt sidecar and the transcripts/slides
+    # DB rows to the new path, so Play Sample, "Improve audio", and the
+    # Rename Speakers dialog's voiceprint suggestions keep working for
+    # already-processed meetings exactly as before. run_batch_folder
+    # (--batch-folder / GUI "Process folder", recursive or not) also
+    # excludes this subfolder from its own file scan, so an archived file
+    # is never picked up and reprocessed by a later run over the same
+    # parent folder. Off by default: moving files is a bigger behaviour
+    # change than any other option on this page, worth trying deliberately
+    # before leaving it on for an unattended batch.
+    "move_processed_files": False,
+
+    # Subfolder name (created next to each source file, not a single
+    # global folder - so this works the same whether your recordings for
+    # different months/projects live in one flat folder or many). Rename
+    # to whatever fits your own convention.
+    "processed_subfolder_name": "_processed",
 
     # Legacy internal path, used only as a fallback base for the video-mode
     # temp frame extraction directory when no per-run output dir is set.
@@ -414,6 +561,42 @@ CONFIG = {
     },
 }
 
+# Display names for output_language (and whisper_language) codes, used to
+# turn a short code into a clear instruction for the notes LLM and the VLM
+# (e.g. "de" -> "German"). Keep in sync with gui.py's LANGUAGES list.
+# "auto" maps to "" since it means "no language instruction", not a real
+# language name.
+LANGUAGE_NAMES = {
+    "auto": "",
+    "en": "English",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "ja": "Japanese",
+    "zh": "Chinese",
+    "nl": "Dutch",
+    "uk": "Ukrainian",
+    "pt": "Portuguese",
+}
+
+# Tesseract OCR uses ISO 639-2 three-letter language codes, NOT the
+# two-letter codes above - this maps our short codes to Tesseract's
+# --lang values for the Translate tab/CLI's image inputs. See
+# translate_ocr_language's comment above and doc_translate.py.
+TESSERACT_LANG_MAP = {
+    "en": "eng",
+    "de": "deu",
+    "fr": "fra",
+    "es": "spa",
+    "it": "ita",
+    "ja": "jpn",
+    "zh": "chi_sim",
+    "nl": "nld",
+    "uk": "ukr",
+    "pt": "por",
+}
+
 # ---------------------------------------------------------------------------
 # Derived paths and constants - computed from CONFIG, do not edit directly.
 # ---------------------------------------------------------------------------
@@ -437,3 +620,62 @@ SUPPORTED_EXTENSIONS = AUDIO_ONLY_EXTENSIONS | VIDEO_EXTENSIONS
 def is_audio_only(path: str) -> bool:
     """True if the file extension indicates no video stream is possible."""
     return Path(path).suffix.lower() in AUDIO_ONLY_EXTENSIONS
+
+
+# =========================================================
+# BUNDLED FFMPEG  (optional, portable install alongside PATH)
+#
+# Drop a full ffmpeg build (as downloaded from https://ffmpeg.org/download.html,
+# e.g. a gyan.dev "full" Windows build: ffmpeg.exe, ffplay.exe, ffprobe.exe,
+# a doc/ folder, presets/) into <project root>\ffmpeg\bin\ and every ffmpeg/
+# ffplay/ffprobe call in this project (extractor.py, speaker_id.py,
+# transcriber.py, gui.py) prefers it over PATH - no system-wide ffmpeg
+# install or PATH edit needed. Falls back to PATH ("ffmpeg"/"ffplay"/
+# "ffprobe") when the bundled copy is not present, and to None (caller
+# decides how to degrade) when neither is found.
+# =========================================================
+_BUNDLED_FFMPEG_DIR = _HERE / "ffmpeg" / "bin"
+
+# Prepend the bundled ffmpeg\bin dir to THIS PROCESS's PATH, not just to the
+# calls in this project that go through get_ffmpeg_path() below. Libraries
+# this project depends on (whisperx's wx.load_audio, torchaudio, pyannote's
+# VAD) shell out to a bare "ffmpeg"/"ffprobe" internally and rely on PATH
+# alone - they never see the bundled-path preference below. If the process's
+# own PATH does not contain ffmpeg (e.g. GUI/scheduled-task launch with a
+# stale or different environment than an interactive shell), those internal
+# calls fail with WinError 2 ("cannot find the specified file") even though
+# a fresh terminal's `ffmpeg -version` works fine and this project's own
+# ffmpeg-aware calls (extractor.py, speaker_id.py, transcriber.enhance_audio)
+# succeed via the bundled copy. Doing this once, at import time, fixes it
+# for every subprocess call anywhere in the process.
+if _BUNDLED_FFMPEG_DIR.is_dir():
+    import os as _os
+    _os.environ["PATH"] = str(_BUNDLED_FFMPEG_DIR) + _os.pathsep + _os.environ.get("PATH", "")
+
+
+def _find_bundled_tool(name: str) -> str | None:
+    """name without extension, e.g. "ffmpeg" - checks both "<name>.exe"
+    (Windows, the expected case for this project) and the bare name
+    (in case a non-Windows build is ever dropped in)."""
+    for candidate in (_BUNDLED_FFMPEG_DIR / f"{name}.exe", _BUNDLED_FFMPEG_DIR / name):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def get_ffmpeg_path() -> str | None:
+    """Full path to a bundled ffmpeg, else "ffmpeg" if found on PATH,
+    else None (not available at all)."""
+    return _find_bundled_tool("ffmpeg") or shutil.which("ffmpeg")
+
+
+def get_ffplay_path() -> str | None:
+    """Same as get_ffmpeg_path, for ffplay - used to play audio clips
+    directly (e.g. speaker sample previews) without going through the
+    OS's default media player/app."""
+    return _find_bundled_tool("ffplay") or shutil.which("ffplay")
+
+
+def get_ffprobe_path() -> str | None:
+    """Same as get_ffmpeg_path, for ffprobe."""
+    return _find_bundled_tool("ffprobe") or shutil.which("ffprobe")

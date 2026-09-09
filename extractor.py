@@ -3,19 +3,21 @@
 # Requires ffmpeg to be available in PATH. Video mode only.
 
 import subprocess
-import shutil
 import logging
 from pathlib import Path
+
+import config
 
 log = logging.getLogger(__name__)
 
 
 def check_ffmpeg() -> bool:
-    """Verify ffmpeg is available before attempting extraction."""
-    if shutil.which("ffmpeg") is None:
+    """Verify ffmpeg is available (bundled ffmpeg\\bin\\ or PATH, see
+    config.get_ffmpeg_path) before attempting extraction."""
+    if config.get_ffmpeg_path() is None:
         log.error(
-            "ffmpeg not found in PATH. "
-            "Install from https://ffmpeg.org or add to system PATH."
+            "ffmpeg not found. Drop a build into ffmpeg\\bin\\ next to the "
+            "project, or install from https://ffmpeg.org / add to system PATH."
         )
         return False
     return True
@@ -39,7 +41,7 @@ def extract_frames(
     pattern = output_dir / f"frame_%06d.{fmt}"
 
     # Build ffmpeg command
-    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-vf", f"fps={fps}"]
+    cmd = [config.get_ffmpeg_path(), "-y", "-i", str(video_path), "-vf", f"fps={fps}"]
     if fmt == "jpg":
         cmd += ["-q:v", str(max(2, int(100 - quality) // 3))]  # ffmpeg q:v scale 2-31
     cmd += [str(pattern)]
@@ -63,12 +65,13 @@ def extract_frames(
 
 def get_video_duration_sec(video_path: str) -> float:
     """Return video duration in seconds using ffprobe."""
-    if shutil.which("ffprobe") is None:
+    ffprobe_exe = config.get_ffprobe_path()
+    if ffprobe_exe is None:
         log.warning("ffprobe not found; duration will be estimated from frame count.")
         return 0.0
 
     cmd = [
-        "ffprobe", "-v", "error",
+        ffprobe_exe, "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(video_path),
@@ -95,11 +98,12 @@ def get_video_duration_sec(video_path: str) -> float:
 
 def has_audio_stream(video_path: str) -> bool:
     """True if video_path has at least one audio stream (via ffprobe)."""
-    if shutil.which("ffprobe") is None:
+    ffprobe_exe = config.get_ffprobe_path()
+    if ffprobe_exe is None:
         log.warning("ffprobe not found; assuming an audio stream is present.")
         return True
     cmd = [
-        "ffprobe", "-v", "error",
+        ffprobe_exe, "-v", "error",
         "-select_streams", "a",
         "-show_entries", "stream=index",
         "-of", "csv=p=0",
@@ -156,7 +160,7 @@ def convert_to_realtime_speed(video_path: str, output_path: Path, speed: float) 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     audio_present = has_audio_stream(video_path)
 
-    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-filter:v", f"setpts=PTS/{speed}"]
+    cmd = [config.get_ffmpeg_path(), "-y", "-i", str(video_path), "-filter:v", f"setpts=PTS/{speed}"]
     if audio_present:
         cmd += ["-filter:a", _build_atempo_chain(speed)]
     else:

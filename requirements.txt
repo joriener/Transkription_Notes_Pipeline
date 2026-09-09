@@ -28,7 +28,7 @@
 # ---------------------------------------------------------------
 # whisperx: word-level timestamps, forced alignment, speaker diarization.
 # Uses faster-whisper as ASR backend (auto-installed).
-whisperx==3.8.5
+whisperx==3.8.6
 
 # PyTorch: required by whisperx alignment models.
 # CPU variant installed here by default. For CUDA GPU:
@@ -54,14 +54,19 @@ requests>=2.32.0
 # Notes generation - Anthropic backend (optional)
 # ---------------------------------------------------------------
 # Required only when LLM_BACKEND=anthropic in keys.cfg.
-# anthropic>=0.40.0
+# 0.60.0+: prompt caching (notes.py/_build_anthropic_request) and the
+# Message Batches API (run_pipeline.run_notes_batch_via_batch_api,
+# --notes-batch-api) need a reasonably current SDK. Installed here: 0.120.0.
+# anthropic>=0.60.0
 
 # ---------------------------------------------------------------
 # Speaker diarization (optional, needs HuggingFace token)
 # ---------------------------------------------------------------
 # pyannote.audio is installed automatically as a whisperx dependency.
 # To enable: set HF_TOKEN in keys.cfg and --diarize / GUI checkbox,
-# after accepting https://huggingface.co/pyannote/speaker-diarization-3.1
+# after accepting https://huggingface.co/pyannote/speaker-diarization-community-1
+# (2026-08: switched from speaker-diarization-3.1 - lower diarization
+# error rate, free, fully local - see transcriber.py's module docstring)
 
 # ---------------------------------------------------------------
 # PDF export - Playwright/Chromium preferred (recommended)
@@ -77,8 +82,27 @@ weasyprint>=62.0
 
 # ---------------------------------------------------------------
 # Notes export - real Word document (optional, --docx / GUI checkbox)
+# Also used by the Translate tab/CLI (docx/pptx/pdf/image -> docx).
 # ---------------------------------------------------------------
 python-docx>=1.1.0
+
+# ---------------------------------------------------------------
+# Translate tab/CLI (doc_translate.py)
+# ---------------------------------------------------------------
+# PowerPoint read/write (slide text + speaker notes).
+python-pptx>=1.0.2
+# PDF text extraction (translated output is written as .docx - see
+# doc_translate.py's module docstring for why).
+pypdf>=4.3.0
+# OCR for image inputs (.jpg/.png/etc.). Requires the Tesseract-OCR
+# BINARY installed separately and on PATH:
+# https://github.com/tesseract-ocr/tesseract - this Python package is
+# only a wrapper around it.
+pytesseract>=0.3.13
+# HTML parsing/rewriting (.html/.htm inputs, including this project's
+# own generated notes/slide-report HTML). html.parser backend only, no
+# lxml/native dependency needed.
+beautifulsoup4>=4.12.0
 
 # ---------------------------------------------------------------
 # Development and testing

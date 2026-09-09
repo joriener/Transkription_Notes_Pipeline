@@ -3,7 +3,7 @@
 **Combined transcription + AI notes pipeline for audio and video recordings**,
 with optional slide-change detection for recorded webinars/presentations.
 
-Version 1.3, 2026-07-02. Merges two previously separate tools into one codebase:
+Version 1.6, 2026-07-18. Merges two previously separate tools into one codebase:
 
 - `Audio_Transkription_Notes_Pipeline` - WhisperX transcription + speaker
   diarization + LLM meeting/webinar notes (audio or video, no slide analysis)
@@ -125,6 +125,87 @@ for when the defaults are not enough.
 
 ---
 
+## What's new in V1.4 (2026-07-18)
+
+- **Output language, independent of transcription language**: a new
+  "Output language" dropdown in the GUI (next to "Language") or
+  `--output-language` on the CLI forces the generated notes/summary AND
+  the VLM slide title/bullets into a chosen language, regardless of the
+  language actually spoken/shown in the recording - e.g. transcribe an
+  English call but get German notes. `"auto"` (default) keeps the
+  previous behaviour: no instruction added, notes/slides follow the
+  transcript's/slide's own language. The verbatim transcript file itself
+  (`*_transcript_speakers.txt` / `.srt`) is never translated and always
+  reflects whisper's own output. See `notes.language_instruction` and
+  `annotator.build_prompt`.
+
+---
+
+## What's new in V1.5 (2026-07-18)
+
+- **Translate tab/CLI**: a new, independent "Translate" tab (and
+  `--translate`/`--translate-batch-folder`/`--translate-file-list` on the
+  CLI) translates documents into a chosen language, unrelated to the
+  audio/video pipeline above - no whisper/notes/slides involved. Same
+  Single file / File list (batch) / Folder (auto-discover) modes as the
+  Run tabs.
+  - **.txt, .docx, .pptx**: translated in place, keeping their own
+    format. docx/pptx formatting (bold/italic/font/color), images, and
+    table structure survive; PowerPoint **speaker notes** are translated
+    too, not just slide text.
+  - **.pdf and images** (.jpg/.jpeg/.png/.bmp/.tiff): PDF has no editable
+    layout to translate into, so text is extracted (pypdf) or OCR'd
+    (pytesseract + Tesseract-OCR, images only) and written into a clean,
+    new **translated .docx** instead - the original visual layout is not
+    reconstructed.
+  - **Not supported**: legacy binary `.doc`/`.ppt` (pre-2007) - save as
+    `.docx`/`.pptx` in Office first, then translate that file.
+  - Uses the same `llm_backend`/Ollama-or-Anthropic setup as notes
+    generation; optionally point translation at a different Ollama model
+    via `OLLAMA_TRANSLATE_MODEL` in keys.cfg (blank = reuse `OLLAMA_MODEL`).
+  - See `translator.py` (LLM translation core, paragraph-aware chunking)
+    and `doc_translate.py` (per-format file I/O).
+
+---
+
+## What's new in V1.6 (2026-07-18)
+
+- **Translate tab/CLI: .html/.htm support**, including this pipeline's
+  own generated notes/slide-report HTML. Kept in HTML format (not
+  converted to .docx): parsed with BeautifulSoup, only actual visible
+  text nodes and a couple of human-readable attributes (`alt`, `title`)
+  are translated - `<style>`/`<script>` content, every tag, class, id,
+  inline style, and `src`/`href` URL are left completely untouched, so a
+  translated slide report still opens and looks like a slide report. See
+  `doc_translate.translate_html`.
+- **Fixed empty/very slow translations and notes on "thinking" Ollama
+  models**: hybrid reasoning models (Qwen3 and similar) can spend the
+  entire response budget on the hidden reasoning phase and leave
+  `message.content` empty, with the real answer only in
+  `message.thinking` - observed as ~90s-per-call VLM/translation calls
+  that then failed with "Empty translation result". `notes.py`,
+  `translator.py`, and `annotator.py`'s Ollama calls now send
+  `"think": false` and fall back to reading `message.thinking` if
+  `content` is still empty.
+- **Fixed garbled OCR/translation on non-English images** (e.g. Chinese
+  slide screenshots): Tesseract was called with no explicit `lang`,
+  which silently reads whatever script is in the image through an
+  English letter-shape model - it does not fail, it emits confident but
+  completely wrong Latin-lookalike text, which a capable LLM then
+  "translates" into fluent-sounding but entirely invented nonsense. A
+  new **"OCR language" dropdown** in the Translate tab (or
+  `--ocr-language` on the CLI; `translate_ocr_language` in config.py,
+  default `"auto"` = `"eng+deu"`) sets Tesseract's actual `--lang`,
+  independent of the translation target language. Set it to the slide's
+  real language, e.g. `"zh"` for Chinese. A requested language pack that
+  is not installed falls back to Tesseract's default and logs a warning
+  instead of failing the file outright - check what is actually
+  installed with `tesseract --list-langs`, and download any missing
+  `.traineddata` from https://github.com/tesseract-ocr/tessdata (a
+  fresh Windows Tesseract-OCR install typically bundles English only).
+
+---
+
 ## PDF export: which backend, and why
 
 PDF export now tries backends in this order and uses the first one that
@@ -167,10 +248,21 @@ C:\Python\Python311\python.exe run_pipeline.py --gui
 ```
 
 **Run tab**: pick a file, folder, or list (or paste paths directly into the
-batch box for File list mode); set Whisper model, language, prompt
-template; toggle slide detection / VLM / diarization; choose which output
-formats to write; optionally set an output folder; click Run and watch the
-log panel and per-stage progress bar.
+batch box for File list mode); set Whisper model, language, output
+language (notes/slide-annotation language, independent of the
+transcription language above), prompt template; toggle slide detection /
+VLM / diarization; choose which output formats to write; optionally set
+an output folder; click Run and watch the log panel and per-stage
+progress bar.
+
+**Translate tab**: pick a file, folder, or list (same three modes as the
+Run tabs), choose a target language, and translate txt/docx/pptx/html/
+pdf/image files - independent of the audio/video pipeline, no whisper/
+notes/slides involved. docx/pptx/txt/html keep their format (formatting,
+images, tables, PowerPoint speaker notes, and HTML styling all carry
+over - this includes the notes/slide-report HTML this pipeline itself
+generates, see below); pdf/images are written as a translated .docx.
+Legacy `.doc`/`.ppt` are not supported - save as `.docx`/`.pptx` first.
 
 **Search tab**: full-text search over generated notes and slide
 titles/bullets; double-click a result to open its folder.
@@ -190,6 +282,10 @@ python run_pipeline.py "D:\Videos\meeting.mp4"
 
 # Force language
 python run_pipeline.py "D:\Videos\meeting.mp4" de
+
+# Transcribe an English call but get German notes + German slide bullets
+# (verbatim transcript file stays in English; "auto" = previous default)
+python run_pipeline.py --output-language de "D:\Videos\call_en.mp4"
 
 # Choose a prompt template explicitly (any file in prompts/, without .md)
 python run_pipeline.py --prompt-template webinar "D:\Videos\webinar.mp4"
@@ -248,6 +344,24 @@ python run_pipeline.py --meeting-title "Q3 Roadmap Review" --meeting-date 2026-0
 
 # Same, read from a calendar invite instead (SUMMARY/DTSTART of the first VEVENT)
 python run_pipeline.py --ics "D:\Invites\roadmap.ics" "D:\Videos\call.mp4"
+
+# --- Translate tab/CLI: independent of everything above, no whisper/notes/slides ---
+
+# Single file: docx/pptx/txt/html keep their format; pdf/images -> translated .docx
+python run_pipeline.py --translate "D:\Docs\proposal.docx" --target-language de
+
+# Translate one of this pipeline's own generated reports in place
+python run_pipeline.py --translate "D:\Videos\webinar_slides\webinar_report.html" --target-language de
+
+# Batch: every supported file found directly in a folder
+python run_pipeline.py --translate-batch-folder "D:\Docs\to_translate" --target-language en
+
+# Batch from a list file (one path per line, # comments ignored)
+python run_pipeline.py --translate-file-list "translate_list.txt" --target-language fr
+
+# Chinese slide screenshots -> German docx: --ocr-language is the SOURCE
+# script Tesseract should read, --target-language is the translation output
+python run_pipeline.py --translate-batch-folder "D:\Videos\webinar_slides\snapshots" --ocr-language zh --target-language de
 ```
 
 `--file-list` resumes automatically: if a file already has notes generated
@@ -363,9 +477,14 @@ each with an explanatory comment. Key ones:
 | `whisper_language` | `auto` | `en`, `de`, or `auto` |
 | `whisper_use_vocabulary` | `True` | Inject domain vocabulary |
 | `prompt_template` | `meeting.md` | Default notes template |
+| `output_language` | `auto` | Force notes/summary + VLM slide title/bullets into this language, independent of `whisper_language`. `auto` = no instruction added (previous behaviour). Verbatim transcript file is never translated. |
 | `notes_format_txt/html/pdf/docx` | `True/True/False/False` | Which notes formats to write by default |
 | `single_pass_limit` / `chunk_size` | `20000` / `12000` | Map-reduce thresholds for long transcripts |
 | `hash_threshold` | `8` | Slide-change sensitivity |
+| `translate_target_language` | `en` | Default target language for the Translate tab/CLI |
+| `ollama_translate_model` | `""` (reuses `ollama_notes_model`) | Set via `OLLAMA_TRANSLATE_MODEL` in keys.cfg to use a different model for translation |
+| `ollama_translate_num_ctx` / `translate_chunk_size` | `8192` / `6000` | Context window / chunk size for translation LLM calls |
+| `translate_ocr_language` | `auto` (= `eng+deu`) | Tesseract OCR source language for image inputs; NOT the translation target. Set to a code like `zh` for Chinese slides, or a raw Tesseract `--lang` string |
 
 ---
 
@@ -395,6 +514,15 @@ Additional, only when slide detection ran (video mode), under
   <stem>_slides.json      Full JSON index
   snapshots/              PNG snapshot per detected slide
 ```
+
+### Translate tab/CLI output
+
+Independent of the above - one output file per input, named
+`<stem>_<target_language><ext>`, next to the source file (or under an
+output folder override): `.txt`/`.docx`/`.pptx`/`.html`/`.htm` keep the
+source's own extension; `.pdf` and images become `.docx`. Not written to the database
+- translation runs are not tracked/searchable the way transcription runs
+are.
 
 ---
 
@@ -441,7 +569,7 @@ new)`, `db.get_db_stats(path)`.
 ```
 Transkription_Notes_Pipeline/
   run_pipeline.py     CLI entry point / orchestrator (start here)
-  gui.py               tkinter parameter GUI (Run + Search + Settings tabs)
+  gui.py               tkinter parameter GUI (Run + Translate + Search + Settings tabs)
   config.py            Central configuration, all defaults documented
   keys_loader.py       Reads/writes keys.cfg (used by config.py and the Settings tab)
   keys.cfg.example     Secret keys template (copy to keys.cfg)
@@ -453,6 +581,8 @@ Transkription_Notes_Pipeline/
   extractor.py                  ffmpeg frame extraction (video mode)
   detector.py                     pHash slide-change detection (video mode)
   annotator.py                      Ollama VLM slide annotation (video mode)
+  translator.py                       LLM translation core (Translate tab/CLI, paragraph-aware chunking)
+  doc_translate.py                      Per-format file I/O for translation: txt/docx/pptx/html/pdf/images
   vocabulary.py                       GC/MS domain vocabulary for Whisper (copy from .example)
   prompts/                              Markdown notes/summary templates (meeting.md, webinar.md, ...)
   install.ps1                             One-shot dependency installer
@@ -472,6 +602,12 @@ Transkription_Notes_Pipeline/
 - tkinter - included with the standard python.org Windows installer; needed
   for the GUI only, not for the CLI
 - Playwright + Chromium - installed by `install.ps1`, used for PDF export
+- python-pptx, pypdf, beautifulsoup4 - for the Translate tab/CLI (docx
+  already required above); optional if you never use that tab
+- pytesseract + the Tesseract-OCR binary - optional, only for translating
+  image inputs (.jpg/.png/etc.) in the Translate tab/CLI; the binary
+  itself is not pip-installable, see
+  https://github.com/tesseract-ocr/tesseract
 
 ---
 
@@ -527,6 +663,19 @@ Not implemented, worth considering if they become a real bottleneck:
   report.
 - **Editable vocabulary in the GUI** instead of only `vocabulary.py`, so
   domain terms can be added without opening a text editor.
+- **Translate tab known limitations**: docx headers/footers/textboxes and
+  nested tables (a table inside another table's cell) are not translated
+  (only body paragraphs, top-level tables, and PowerPoint speaker notes
+  are); a docx/pptx paragraph that mixes formatting mid-sentence (e.g.
+  "Please **confirm** by Friday") keeps only its first run's formatting
+  after translation, since the whole paragraph is translated as one unit
+  (see `doc_translate.py`'s module docstring for why); an HTML text node
+  spanning several fields glued together with `&nbsp;`/other inline
+  separators (e.g. reporter.py's "title &nbsp;|&nbsp; date" meta line)
+  is sent to the LLM as a single chunk, so the exact separator/spacing is
+  not guaranteed to survive translation byte-for-byte; Translate tab
+  settings (target language, output folder) are not yet persisted to
+  `gui_state.json` the way the Run tabs' settings are.
 
 ---
 

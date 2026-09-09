@@ -29,6 +29,12 @@ OLLAMA_MODEL=qwen3:14b
 # Pull command: ollama pull qwen2.5vl:7b
 OLLAMA_VLM_MODEL=qwen2.5vl:7b
 
+# --- Ollama text model for the Translate tab/CLI (optional) ---
+# Leave blank to reuse OLLAMA_MODEL above (the common case - most models
+# that write good notes also translate well). Set this only if you want
+# a different model specifically for document translation.
+OLLAMA_TRANSLATE_MODEL=
+
 # --- HuggingFace token (speaker diarization via pyannote) ---
 # Step 1: Register at https://huggingface.co and create a read token.
 # Step 2: Accept model terms at https://huggingface.co/pyannote/speaker-diarization-3.1

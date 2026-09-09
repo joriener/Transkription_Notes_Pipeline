@@ -67,6 +67,8 @@ class TestSafeParseTime:
 
 MEETING_COLS = ("file", "language", "title", "date", "comments")
 VIDEO_COLS = ("file", "language", "title", "date", "comments", "qa_start", "qa_end")
+VIDEO_COLS_WITH_IMAGE = VIDEO_COLS + ("title_image",)
+VIDEO_COLS_WITH_SRT = VIDEO_COLS_WITH_IMAGE + ("srt_path",)
 
 
 class TestBuildBatchRow:
@@ -122,6 +124,45 @@ class TestBuildBatchRow:
         assert row["qa_start_time_sec"] is None
         assert row["qa_end_time_sec"] is None
 
+    def test_meeting_cols_have_no_title_image_key(self):
+        """Meeting tab's batch table has no title_image column at all -
+        the key must not appear in the output dict, matching qa_start/
+        qa_end's same "not in row_override_keys" absence."""
+        row = gui_logic.build_batch_row(MEETING_COLS, ("a.mp4", "", "", "", ""))
+        assert "title_slide_image_path" not in row
+
+    def test_video_row_title_image_set(self):
+        row = gui_logic.build_batch_row(
+            VIDEO_COLS_WITH_IMAGE,
+            ("a.mp4", "", "", "", "", "", "", "cover.png"))
+        assert row["title_slide_image_path"] == "cover.png"
+
+    def test_video_row_title_image_blank_is_none(self):
+        """A blank per-row cell means None - run_batch_rows then falls
+        back to the shared Video/Webinar tab field for that file."""
+        row = gui_logic.build_batch_row(
+            VIDEO_COLS_WITH_IMAGE,
+            ("a.mp4", "", "", "", "", "", "", ""))
+        assert row["title_slide_image_path"] is None
+
+    def test_meeting_cols_have_no_srt_import_key(self):
+        """Meeting tab's batch table has no srt_path column at all -
+        batch rows there should never carry an srt_import_path key."""
+        row = gui_logic.build_batch_row(MEETING_COLS, ("a.mp4", "", "", "", ""))
+        assert "srt_import_path" not in row
+
+    def test_video_row_srt_path_set(self):
+        row = gui_logic.build_batch_row(
+            VIDEO_COLS_WITH_SRT,
+            ("a.mp4", "", "", "", "", "", "", "", "C:/vids/a.srt"))
+        assert row["srt_import_path"] == "C:/vids/a.srt"
+
+    def test_video_row_srt_path_blank_is_none(self):
+        row = gui_logic.build_batch_row(
+            VIDEO_COLS_WITH_SRT,
+            ("a.mp4", "", "", "", "", "", "", "", ""))
+        assert row["srt_import_path"] is None
+
 
 # -----------------------------------------------------------------
 # parse_list_line
@@ -168,48 +209,104 @@ class TestPersistedKeysFor:
         assert "hash_threshold" not in keys
 
 
-class TestBuildStateDict:
-    def test_drops_unpersisted_keys(self):
-        raw = {"whisper_model": "large-v3", "path_var": "/tmp/a.mp4", "enable_slides": True}
-        out = gui_logic.build_state_dict("meeting", raw)
-        assert out == {"whisper_model": "large-v3"}
+class TestBuildTabStateDict:
+    """Tab-owned keys only: recording_type/prompt_template/output_dir,
+    plus video-only keys for kind="video". Shared engine settings
+    (whisper_model, llm_backend, ...) are deliberately excluded here -
+    see TestBuildSharedStateDict."""
+
+    def test_drops_unpersisted_and_shared_keys(self):
+        raw = {"output_dir": "/tmp/out", "whisper_model": "large-v3",
+               "path_var": "/tmp/a.mp4", "enable_slides": True}
+        out = gui_logic.build_tab_state_dict("meeting", raw)
+        assert out == {"output_dir": "/tmp/out"}
 
     def test_video_keeps_video_only_keys(self):
-        raw = {"whisper_model": "large-v3", "enable_slides": True, "fps": 3}
-        out = gui_logic.build_state_dict("video", raw)
-        assert out == {"whisper_model": "large-v3", "enable_slides": True, "fps": 3}
+        raw = {"output_dir": "/tmp/out", "whisper_model": "large-v3",
+               "enable_slides": True, "fps": 3}
+        out = gui_logic.build_tab_state_dict("video", raw)
+        assert out == {"output_dir": "/tmp/out", "enable_slides": True, "fps": 3}
 
     def test_missing_keys_are_skipped_not_defaulted(self):
-        out = gui_logic.build_state_dict("meeting", {"whisper_model": "base"})
+        out = gui_logic.build_tab_state_dict("meeting", {"output_dir": "/tmp/out"})
+        assert out == {"output_dir": "/tmp/out"}
+
+
+class TestBuildSharedStateDict:
+    def test_keeps_only_shared_keys(self):
+        raw = {
+            "whisper_model": "large-v3", "language": "de", "llm_backend": "ollama",
+            "enable_diarization": True, "no_summary": False, "force_retranscribe": False,
+            "prompt_template": "webinar", "recording_type": "Webinar Transcript",
+            "enable_slides": True, "output_dir": "/tmp/out",
+        }
+        out = gui_logic.build_shared_state_dict(raw)
+        assert out == {
+            "whisper_model": "large-v3", "language": "de", "llm_backend": "ollama",
+            "enable_diarization": True, "no_summary": False, "force_retranscribe": False,
+        }
+
+    def test_missing_keys_are_skipped(self):
+        out = gui_logic.build_shared_state_dict({"whisper_model": "base"})
         assert out == {"whisper_model": "base"}
+
+    def test_empty_input_returns_empty(self):
+        assert gui_logic.build_shared_state_dict({}) == {}
 
 
 class TestMergePersistedState:
-    def test_saved_overrides_defaults(self):
-        defaults = {"whisper_model": "base", "language": "auto"}
-        saved = {"whisper_model": "large-v3"}
-        merged = gui_logic.merge_persisted_state("meeting", saved, defaults)
-        assert merged == {"whisper_model": "large-v3", "language": "auto"}
+    def test_saved_tab_overrides_defaults(self):
+        defaults = {"output_dir": "", "language": "auto"}
+        saved_tab = {"output_dir": "/tmp/out"}
+        merged = gui_logic.merge_persisted_state("meeting", saved_tab, {}, defaults)
+        assert merged == {"output_dir": "/tmp/out", "language": "auto"}
+
+    def test_saved_shared_overrides_defaults(self):
+        defaults = {"whisper_model": "base", "output_dir": ""}
+        saved_shared = {"whisper_model": "large-v3"}
+        merged = gui_logic.merge_persisted_state("meeting", {}, saved_shared, defaults)
+        assert merged == {"whisper_model": "large-v3", "output_dir": ""}
 
     def test_unrecognized_saved_key_ignored(self):
         defaults = {"whisper_model": "base"}
-        saved = {"whisper_model": "large-v3", "some_future_key": "x"}
-        merged = gui_logic.merge_persisted_state("meeting", saved, defaults)
+        saved_shared = {"whisper_model": "large-v3", "some_future_key": "x"}
+        merged = gui_logic.merge_persisted_state("meeting", {}, saved_shared, defaults)
         assert "some_future_key" not in merged
 
     def test_video_only_key_ignored_for_meeting_kind(self):
         """A gui_state.json that somehow has a video-only key under
         "meeting" (e.g. hand-edited, or a downgrade from a future
         version) must not leak into the meeting tab's settings."""
-        defaults = {"whisper_model": "base"}
-        saved = {"whisper_model": "large-v3", "enable_slides": True}
-        merged = gui_logic.merge_persisted_state("meeting", saved, defaults)
+        defaults = {"output_dir": ""}
+        saved_tab = {"output_dir": "/tmp/out", "enable_slides": True}
+        merged = gui_logic.merge_persisted_state("meeting", saved_tab, {}, defaults)
         assert "enable_slides" not in merged
+
+    def test_shared_key_migrated_from_tab_section_when_shared_empty(self):
+        """A pre-centralization gui_state.json has no "shared" section at
+        all - PERSISTED_KEYS_SHARED still live under each tab's own
+        section back then. The first load after updating must carry that
+        value over instead of silently resetting it to CONFIG defaults."""
+        defaults = {"whisper_model": "base"}
+        saved_tab = {"whisper_model": "large-v3"}
+        merged = gui_logic.merge_persisted_state("meeting", saved_tab, {}, defaults)
+        assert merged["whisper_model"] == "large-v3"
+
+    def test_shared_key_in_saved_shared_wins_over_tab_section(self):
+        """Once state["shared"] actually holds a key, that value wins
+        over any (now-stale) copy still sitting in the tab's own
+        section - the migration fallback only fires when saved_shared
+        has no entry for the key at all."""
+        defaults = {"whisper_model": "base"}
+        saved_tab = {"whisper_model": "large-v2"}
+        saved_shared = {"whisper_model": "large-v3"}
+        merged = gui_logic.merge_persisted_state("meeting", saved_tab, saved_shared, defaults)
+        assert merged["whisper_model"] == "large-v3"
 
     def test_empty_saved_returns_defaults_unchanged(self):
         defaults = {"whisper_model": "base", "language": "auto"}
-        assert gui_logic.merge_persisted_state("meeting", {}, defaults) == defaults
-        assert gui_logic.merge_persisted_state("meeting", None, defaults) == defaults
+        assert gui_logic.merge_persisted_state("meeting", {}, {}, defaults) == defaults
+        assert gui_logic.merge_persisted_state("meeting", None, None, defaults) == defaults
 
 
 class TestLoadSaveStateFile:
@@ -238,28 +335,6 @@ class TestLoadSaveStateFile:
         bad_path = tmp_path / "a_directory"
         bad_path.mkdir()
         assert gui_logic.save_state_file(bad_path, {"meeting": {}}) is False
-
-
-class TestExtractCopyableSettings:
-    def test_keeps_only_copyable_keys(self):
-        raw = {
-            "whisper_model": "large-v3", "language": "de", "llm_backend": "ollama",
-            "enable_diarization": True, "no_summary": False, "force_retranscribe": False,
-            "prompt_template": "webinar", "recording_type": "Webinar Transcript",
-            "enable_slides": True, "output_dir": "/tmp/out",
-        }
-        out = gui_logic.extract_copyable_settings(raw)
-        assert out == {
-            "whisper_model": "large-v3", "language": "de", "llm_backend": "ollama",
-            "enable_diarization": True, "no_summary": False, "force_retranscribe": False,
-        }
-
-    def test_missing_keys_are_skipped(self):
-        out = gui_logic.extract_copyable_settings({"whisper_model": "base"})
-        assert out == {"whisper_model": "base"}
-
-    def test_empty_input_returns_empty(self):
-        assert gui_logic.extract_copyable_settings({}) == {}
 
 
 class TestCsvHeaderIndex:

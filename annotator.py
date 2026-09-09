@@ -23,6 +23,27 @@ DEFAULT_PROMPT = (
 )
 
 
+def build_prompt(base_prompt: str, output_language: str = "auto") -> str:
+    """
+    Append a language instruction to the VLM prompt so "title"/"bullets"
+    are always written in a chosen language, independent of the slide's
+    own language (e.g. a German slide deck annotated in English). Blank
+    or "auto" (default) returns base_prompt unchanged: title/bullets
+    follow the slide's own language, same as before this option existed.
+    """
+    if not output_language or output_language == "auto":
+        return base_prompt
+    from config import LANGUAGE_NAMES
+    name = LANGUAGE_NAMES.get(output_language, output_language)
+    return (
+        base_prompt
+        + f' Write "title" and "bullets" in {name}, regardless of the '
+          "slide's own language. Keep proper nouns, product names, and "
+          "abbreviations in their original form where translating them "
+          "would be unnatural."
+    )
+
+
 def _encode_image(image_path: Path) -> str:
     """Base64-encode image for Ollama API payload."""
     with open(image_path, "rb") as fh:
@@ -48,9 +69,13 @@ def annotate_slide(
         "images": [_encode_image(image_path)],
         "stream": False,
         "format": "json",
+        "think": False,
         "options": {
             "num_predict": 512,    # Enough for title + 5 bullets; prevents mid-JSON truncation
             "temperature": 0.1,    # Low temperature for consistent structured output
+            "num_ctx": 4096,       # Caps KV cache; without this Ollama defaults to the
+                                    # model's full native context (262144 for qwen3-vl),
+                                    # which overflows 16 GB VRAM and forces slow CPU offload
         },
     }
 
@@ -62,7 +87,10 @@ def annotate_slide(
                 timeout=timeout_sec,
             )
             response.raise_for_status()
-            raw = response.json().get("response", "")
+            data = response.json()
+            # Thinking models (e.g. qwen3-vl) put the full output in "thinking"
+            # and leave "response" empty, even with think=false.
+            raw = data.get("response", "") or data.get("thinking", "")
             result = _safe_parse_json(raw)
             log.debug("Annotated %s: %s", image_path.name, result.get("title", "?"))
             return result
@@ -99,7 +127,14 @@ def annotate_slide(
                         log.debug("Could not downscale image: %s", resize_exc)
                     time.sleep(2)
             else:
-                log.warning("HTTP error for %s: %s", image_path.name, exc)
+                body = ""
+                if exc.response is not None:
+                    try:
+                        body = exc.response.text[:500]
+                    except Exception:
+                        pass
+                log.warning("HTTP error for %s: %s%s", image_path.name, exc,
+                           f" | Ollama response: {body}" if body else "")
                 return {}
         except Exception as exc:
             log.warning("Annotation failed for %s: %s", image_path.name, exc)

@@ -9,6 +9,11 @@
 #                    VLM annotation, the Q&A section, slide-report
 #                    formats, and Review/Edit Slides + Re-annotate failed
 #                    slides.
+#    Translate     - translate txt/docx/pptx/pdf/image files into a
+#                    chosen language (single file / file list (batch) /
+#                    folder auto-discover), independent of the audio/
+#                    video pipeline above. See translator.py/
+#                    doc_translate.py.
 #    Search        - full-text search (FTS5) over generated notes and
 #                    slide titles/bullets
 #    Settings      - keys.cfg as a structured form (masked API keys),
@@ -37,8 +42,10 @@ from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
-from config import CONFIG, PROMPTS_DIR, SUPPORTED_EXTENSIONS
+from config import CONFIG, PROMPTS_DIR, SUPPORTED_EXTENSIONS, get_ffplay_path
+import correlate_calendar_recordings
 import db
+import doc_translate
 import gui_logic
 import ics_utils
 import keys_loader
@@ -46,12 +53,25 @@ import notes as notes_mod
 import run_pipeline
 import speaker_id
 
+log = logging.getLogger(__name__)
+
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 LANGUAGES = ["auto", "en", "de", "fr", "es", "it", "ja", "zh", "nl", "uk", "pt"]
 LLM_BACKENDS = ["ollama", "anthropic"]
 LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 MODES = ["Single file", "File list (batch)", "Folder (auto-discover)",
         "Notes-only (existing transcript)", "Notes-batch (folder)"]
+
+# Translate tab: only the three generic modes apply (no notes-only/
+# notes-batch equivalent - there is no separate "transcript" stage to
+# redo). Kept as its own list/constant rather than slicing MODES so the
+# two tabs' mode sets can diverge freely later without cross-talk.
+TRANSLATE_MODES = ["Single file", "File list (batch)", "Folder (auto-discover)"]
+
+# Real target languages only - "auto" (valid for whisper_language/
+# output_language, meaning "no instruction") is not meaningful as a
+# translation target.
+TRANSLATE_LANGUAGES = [l for l in LANGUAGES if l != "auto"]
 
 # Persisted GUI settings (task #71): last-used model/language/backend/
 # prompt template/thresholds/output folder/stage checkboxes per tab, so
@@ -332,7 +352,13 @@ class PipelineGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Transkription_Notes_Pipeline")
-        self.root.geometry("980x860")
+        # 1300x860 (was 980x860): wide enough that the Video/Webinar tab's
+        # step 1 "Parameters" row (Whisper model/Language/Output language,
+        # then LLM backend/Hash threshold/Slide fps) shows in full without
+        # having to manually resize the window first. minsize keeps a
+        # user-shrunk window from going back below that point.
+        self.root.geometry("1300x860")
+        self.root.minsize(1100, 700)
 
         self.req_queue: queue.Queue = queue.Queue()
         self._notes_result_paths: dict = {}
@@ -343,20 +369,41 @@ class PipelineGUI:
         notebook.pack(fill="both", expand=True)
         self.meeting_tab = ttk.Frame(notebook)
         self.video_tab = ttk.Frame(notebook)
+        self.translate_tab = ttk.Frame(notebook)
         self.search_tab = ttk.Frame(notebook)
         self.templates_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
         notebook.add(self.meeting_tab, text="Audio/Meeting")
         notebook.add(self.video_tab, text="Video / Webinar")
+        notebook.add(self.translate_tab, text="Translate")
         notebook.add(self.search_tab, text="Search")
         notebook.add(self.templates_tab, text="Templates")
         notebook.add(self.settings_tab, text="Settings")
+
+        # --- Shared Meeting/Video engine settings ---
+        # One tkinter Variable per key, created once here and reused by
+        # BOTH RunTabController instances below (see RunTabController._build,
+        # which points its like-named attributes at these instead of
+        # creating its own copy). Editing the value on either the Meeting
+        # or the Video/Webinar tab updates the other immediately, and
+        # gui_logic.PERSISTED_KEYS_SHARED persists a single copy under
+        # gui_state.json's "shared" key - previously each tab kept its own
+        # independent copy that could silently drift apart (e.g. Meeting's
+        # LLM backend left on "anthropic", Video's still on "ollama").
+        self.shared_whisper_model_var = tk.StringVar(value=CONFIG["whisper_model"])
+        self.shared_language_var = tk.StringVar(value=CONFIG["whisper_language"])
+        self.shared_output_language_var = tk.StringVar(value=CONFIG.get("output_language", "auto"))
+        self.shared_llm_backend_var = tk.StringVar(value=CONFIG["llm_backend"])
+        self.shared_enable_diarization_var = tk.BooleanVar(value=CONFIG["enable_diarization"])
+        self.shared_no_summary_var = tk.BooleanVar(value=False)
+        self.shared_force_retranscribe_var = tk.BooleanVar(value=False)
 
         self._build_search_tab()
         self._build_templates_tab()
         self._build_settings_tab()
         self.meeting_run = RunTabController(self.meeting_tab, "meeting", self)
         self.video_run = RunTabController(self.video_tab, "video", self)
+        self.translate_run = TranslateTabController(self.translate_tab, self)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._poll_req_queue)
@@ -365,10 +412,17 @@ class PipelineGUI:
         """Persist both tabs' settings to gui_state.json (task #71)
         before closing: whisper model, language, LLM backend, prompt
         template, thresholds, output folder, and stage checkboxes. Never
-        blocks shutdown - save_state_file swallows I/O errors."""
+        blocks shutdown - save_state_file swallows I/O errors.
+
+        Shared engine settings (whisper model, language, LLM backend,
+        diarization, no-summary, force-retranscribe) are written once
+        under "shared" rather than duplicated under "meeting"/"video" -
+        both tabs' widgets are backed by the same Variable objects, so
+        reading them from either tab's snapshot gives the same values."""
         state = {
-            "meeting": self.meeting_run._collect_persisted_state(),
-            "video": self.video_run._collect_persisted_state(),
+            "meeting": self.meeting_run._collect_tab_state(),
+            "video": self.video_run._collect_tab_state(),
+            "shared": self.meeting_run._collect_shared_state(),
         }
         gui_logic.save_state_file(STATE_PATH, state)
         self.root.destroy()
@@ -892,14 +946,17 @@ class PipelineGUI:
         ttk.Label(speaker_id_frame,
                  text="Batch review (task #92): after processing several recordings "
                       "overnight, export every detected speaker across all of them into "
-                      "one JSON file, edit the names there, then apply them all at once - "
-                      "instead of opening Rename Speakers per file.",
+                      "one JSON file, listen to each sample and type in names in the "
+                      "Review && Listen window, then apply them all at once - instead of "
+                      "opening Rename Speakers per file.",
                  foreground="#666", wraplength=600).grid(
             row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0))
         roster_btn_row = ttk.Frame(speaker_id_frame)
         roster_btn_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 8))
         ttk.Button(roster_btn_row, text="Export batch speaker roster...",
                   command=self._export_speaker_roster_batch).pack(side="left")
+        ttk.Button(roster_btn_row, text="Review && Listen to roster...",
+                  command=self._open_speaker_roster_review).pack(side="left", padx=(8, 0))
         ttk.Button(roster_btn_row, text="Apply speaker roster JSON...",
                   command=self._apply_speaker_roster_batch).pack(side="left", padx=(8, 0))
 
@@ -964,10 +1021,19 @@ class PipelineGUI:
         overnight batch of several recordings in one sitting instead of
         opening each file's Rename Speakers dialog individually.
         Voiceprint suggestions use the same hf_token/threshold/roster as
-        that dialog. Runs synchronously (like Backup all databases...
-        above) - this is an occasional, manual action, not a per-file
-        live operation, so a brief wait cursor is enough rather than a
-        background thread."""
+        that dialog, and a short .wav sample per speaker is extracted
+        next to the JSON (same "Play sample" clip logic as that dialog)
+        so voices can still be checked by ear across the whole batch.
+        Runs synchronously (like Backup all databases... above) - this
+        is an occasional, manual action, not a per-file live operation,
+        so a brief wait cursor is enough rather than a background
+        thread.
+
+        V1.29: offers to open SpeakerRosterReviewDialog immediately after
+        a successful export, so listening to samples and typing names
+        can start right away instead of the user having to separately
+        open the JSON in a text editor and double-click .wav files in
+        Explorer (still possible, just no longer the main path)."""
         folder = filedialog.askdirectory(title="Select folder with processed recordings")
         if not folder:
             return
@@ -998,11 +1064,35 @@ class PipelineGUI:
         finally:
             self.root.config(cursor="")
 
-        messagebox.showinfo(
+        samples_note = (
+            f"{result['samples']} sample clip(s) were extracted, ready to play in the "
+            f"review window.\n\n"
+            if result.get("samples") else
+            "No sample clips were extracted (ffmpeg missing, or no source media "
+            "found next to the transcripts) - name speakers from labels/context "
+            "alone.\n\n"
+        )
+        review_now = messagebox.askyesno(
             "Speaker roster exported",
             f"{result['files']} file(s), {result['speakers']} speaker(s).\n\n"
-            f"Edit each speaker's \"name\" field in:\n{result['path']}\n\n"
-            f"Then use \"Apply speaker roster JSON...\" to apply your edits.")
+            f"{samples_note}"
+            f"Review and listen to each speaker now?")
+        if review_now:
+            self._open_speaker_roster_review(result["path"])
+
+    def _open_speaker_roster_review(self, json_path: str | None = None):
+        """Opens SpeakerRosterReviewDialog (V1.29, task #92 batch review
+        UI) over json_path, prompting for one via a file picker if not
+        given - e.g. called directly from the "Review & Listen to
+        roster..." button for a previously-exported roster, rather than
+        right after a fresh export."""
+        if not json_path:
+            json_path = filedialog.askopenfilename(
+                title="Select speaker roster JSON",
+                filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+            if not json_path:
+                return
+        SpeakerRosterReviewDialog(self, json_path)
 
     def _apply_speaker_roster_batch(self):
         """Task #92: read back a speaker-roster JSON (see
@@ -1091,6 +1181,48 @@ class PipelineGUI:
                 subprocess.run(["xdg-open", str(path)])
         except Exception as exc:
             messagebox.showerror("Could not open", str(exc))
+
+    def _play_audio(self, path: Path):
+        """Play an audio file (speaker sample preview) via ffplay - a
+        plain window-less player, so it doesn't hand the clip off to
+        whatever the OS's default app for .wav happens to be (Windows
+        Media Player, Groove Music, etc.) with all of that app's own
+        startup time and UI. Falls back to _open_path (the OS default
+        app) if ffplay isn't available (bundled ffmpeg\\bin\\ or PATH,
+        see config.get_ffplay_path).
+
+        V1.28: stops any clip already playing first (_stop_audio) - only
+        one preview should ever be audible at a time, so starting a new
+        one always supersedes the last rather than overlapping it."""
+        if not path.exists():
+            messagebox.showwarning("Not found", f"{path} does not exist yet.")
+            return
+        self._stop_audio()
+        ffplay_exe = get_ffplay_path()
+        if ffplay_exe:
+            try:
+                self._current_playback_proc = subprocess.Popen(
+                    [ffplay_exe, "-autoexit", "-nodisp", "-loglevel", "error", str(path)])
+                return
+            except Exception as exc:
+                log.warning("ffplay launch failed (%s) - falling back to the "
+                            "default player.", exc)
+        self._open_path(path)
+
+    def _stop_audio(self):
+        """Stop button (V1.28): terminates whatever ffplay process
+        _play_audio last launched, if it's still running. Safe to call
+        with nothing playing (no-op) - _current_playback_proc may not
+        exist yet if _play_audio was never called, and ffplay may have
+        already exited on its own (-autoexit, or the clip simply
+        finished)."""
+        proc = getattr(self, "_current_playback_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception as exc:
+                log.warning("Could not stop playback: %s", exc)
+        self._current_playback_proc = None
 
     def _open_project_folder(self):
         self._open_path(Path(__file__).parent.resolve())
@@ -1267,8 +1399,16 @@ class RunTabController:
     Webinar). Each instance owns its own Mode/path/output fields, batch
     table, parameters, stages, formats, Run/Stop button, and log panel,
     built into the ttk.Frame handed to it by PipelineGUI - one instance
-    per tab, so switching tabs never mixes up settings between a meeting
-    run and a video/webinar run.
+    per tab, so switching tabs never mixes up the file/batch/meeting-info
+    being worked on between a meeting run and a video/webinar run.
+
+    Exception: whisper_model_var, language_var, output_language_var,
+    llm_backend_var, enable_diarization_var, no_summary_var, and
+    force_retranscribe_var are NOT this instance's own Variables - they
+    are the same shared objects on both tabs (see PipelineGUI.__init__'s
+    shared_*_var and gui_logic.PERSISTED_KEYS_SHARED), so these specific
+    transcription/LLM engine settings are always identical on the
+    Meeting and Video/Webinar tabs, editable from either.
 
     kind is "meeting" or "video":
       meeting: no slide detection/VLM/Q&A/slide-report formats/Review-
@@ -1278,10 +1418,11 @@ class RunTabController:
                the Q&A section (task #61), slide-report formats, and the
                Review/Edit Slides + Re-annotate failed slides buttons.
 
-    app is the owning PipelineGUI instance, used only for the handful of
+    app is the owning PipelineGUI instance, used for the handful of
     things that stay shared across every tab: the database path field
-    and logging options (both on the Settings tab), and _make_scrollable/
-    _open_prompts_folder/_open_path.
+    and logging options (both on the Settings tab), _make_scrollable/
+    _open_prompts_folder/_open_path, and the shared_*_var Variables
+    described above.
     """
 
     def __init__(self, tab: ttk.Frame, kind: str, app: PipelineGUI):
@@ -1315,14 +1456,26 @@ class RunTabController:
         self.path_var = tk.StringVar()
         self.output_dir_var = tk.StringVar()
         self.output_basename_var = tk.StringVar()
-        self.whisper_model_var = tk.StringVar(value=CONFIG["whisper_model"])
-        self.language_var = tk.StringVar(value=CONFIG["whisper_language"])
+        self.use_date_subject_filename_var = tk.BooleanVar(
+            value=CONFIG.get("use_date_subject_filename", False))
+        self.move_processed_files_var = tk.BooleanVar(
+            value=CONFIG.get("move_processed_files", False))
         self.prompt_var = tk.StringVar()
-        self.llm_backend_var = tk.StringVar(value=CONFIG["llm_backend"])
 
-        self.enable_diarization_var = tk.BooleanVar(value=CONFIG["enable_diarization"])
-        self.no_summary_var = tk.BooleanVar(value=False)
-        self.force_retranscribe_var = tk.BooleanVar(value=False)
+        # Shared with the other Run tab (Meeting <-> Video/Webinar) - see
+        # PipelineGUI.__init__ where these are created once and
+        # gui_logic.PERSISTED_KEYS_SHARED, which persists them under
+        # gui_state.json's "shared" key instead of duplicating them here.
+        # Kept as like-named attributes (self.whisper_model_var, etc.) so
+        # every widget/override/state_vars reference below is unchanged -
+        # only where the Variable comes from is different now.
+        self.whisper_model_var = self.app.shared_whisper_model_var
+        self.language_var = self.app.shared_language_var
+        self.output_language_var = self.app.shared_output_language_var
+        self.llm_backend_var = self.app.shared_llm_backend_var
+        self.enable_diarization_var = self.app.shared_enable_diarization_var
+        self.no_summary_var = self.app.shared_no_summary_var
+        self.force_retranscribe_var = self.app.shared_force_retranscribe_var
 
         self.losslesscut_path_var = tk.StringVar(value=CONFIG.get("losslesscut_path", ""))
 
@@ -1374,18 +1527,72 @@ class RunTabController:
         ttk.Button(top, text="Browse...", command=self._browse_output_dir).grid(row=2, column=2, padx=4)
         ttk.Label(top, text="Blank = write next to the source file (default).",
                  foreground="#666").grid(row=3, column=1, sticky="w")
+        move_processed_cb = ttk.Checkbutton(
+            top, text=f"Move source file to a \"{CONFIG.get('processed_subfolder_name', '_processed')}\" "
+                     "subfolder once fully processed",
+            variable=self.move_processed_files_var)
+        move_processed_cb.grid(row=4, column=0, columnspan=2, sticky="w")
+        Tooltip(move_processed_cb,
+               "Only the ORIGINAL source audio/video file moves, next to where it already is - "
+               "transcript/notes/slide report outputs stay put. Only runs after the file finishes "
+               "completely (never on failure or a dry run). Play Sample, \"Improve audio\", and "
+               "Rename Speakers keep working for archived files afterward. A folder scan of this "
+               "same folder (recursive or not) will not pick the file back up. Off by default.")
 
-        ttk.Label(top, text="Output filename (optional):").grid(row=4, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.output_basename_var, width=60).grid(row=4, column=1, sticky="we")
+        ttk.Label(top, text="Output filename (optional):").grid(row=5, column=0, sticky="w")
+        ttk.Entry(top, textvariable=self.output_basename_var, width=60).grid(row=5, column=1, sticky="we")
         ttk.Label(top, text="Blank = use the source filename for every output file (default).",
-                 foreground="#666").grid(row=5, column=1, sticky="w")
+                 foreground="#666").grid(row=6, column=1, sticky="w")
+        date_subject_cb = ttk.Checkbutton(
+            top, text="Name files \"YYYYMMDD_Subject\" from Meeting info's Title/Date below",
+            variable=self.use_date_subject_filename_var)
+        date_subject_cb.grid(row=7, column=1, sticky="w")
+        Tooltip(date_subject_cb,
+               "Uses the Title/Date fields under \"Meeting info\" (filled manually, from "
+               "--ics/\"Load meeting info...\", or from a correlate_calendar_recordings.py "
+               "batch CSV) to name every output file e.g. \"20260703_Q3 Kickoff\" instead of "
+               "the source filename. Ignored (falls back to the usual naming) for any file "
+               "where Title is blank. An explicit \"Output filename\" above always wins over "
+               "this.")
         top.columnconfigure(1, weight=1)
+
+        # --- Workflow steps (task #61/#112 GUI remodel) ---
+        # The Video/Webinar tab's settings are grouped into an explicit
+        # 3-step sequence matching how a recording is actually worked
+        # through: transcribe + detect first, then review the detected
+        # slides and pin down where Q&A starts, then pick output formats
+        # and generate the reports/summary. The Meeting tab has no
+        # review phase (no slides to check, no Q&A concept), so it keeps
+        # its original flat, single-page layout - step1_target/
+        # step2_target/step3_target all just point at "parent" in that
+        # case, so every LabelFrame below lands exactly where it always
+        # has.
+        if is_video:
+            ttk.Label(parent,
+                     text="Work through the tabs below in order: 1) transcribe and detect "
+                          "slides, 2) review what was found and mark where Q&A starts, "
+                          "3) generate the summary and reports.",
+                     foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 4))
+            self._steps_nb = ttk.Notebook(parent)
+            self._steps_nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+            self._step1_frame = ttk.Frame(self._steps_nb)
+            self._step2_frame = ttk.Frame(self._steps_nb)
+            self._step3_frame = ttk.Frame(self._steps_nb)
+            self._steps_nb.add(self._step1_frame, text="1. Transcribe & Detect")
+            self._steps_nb.add(self._step2_frame, text="2. Review & Q&A")
+            self._steps_nb.add(self._step3_frame, text="3. Reports & Summary")
+            step1_target = self._step1_frame
+            step2_target = self._step2_frame
+            step3_target = self._step3_frame
+        else:
+            self._steps_nb = None
+            step1_target = step2_target = step3_target = parent
 
         # --- Recording type preset ---
         rec_types = VIDEO_RECORDING_TYPES if is_video else MEETING_RECORDING_TYPES
         self._recording_types = rec_types
         self.recording_type_var = tk.StringVar(value=next(iter(rec_types)))
-        rec_frame = ttk.LabelFrame(parent, text="Recording type (preset)")
+        rec_frame = ttk.LabelFrame(step1_target, text="Recording type (preset)")
         rec_frame.pack(fill="x", padx=8, pady=4)
         self._rec_frame = rec_frame
         ttk.Label(rec_frame, text="Type:").pack(side="left", padx=8, pady=8)
@@ -1395,16 +1602,26 @@ class RunTabController:
         rec_box.bind("<<ComboboxSelected>>", lambda e: self._apply_recording_type())
         ttk.Label(rec_frame, text="Sets the prompt template below; still editable afterward.",
                  foreground="#666").pack(side="left", padx=(12, 0))
-        other_tab_label = "Video/Webinar" if self.kind == "meeting" else "Meeting"
-        ttk.Button(rec_frame, text=f"Copy settings to {other_tab_label} tab...",
-                  command=self._copy_settings_to_other_tab).pack(side="right", padx=8)
+        # No more "Copy settings to other tab" button here: whisper model,
+        # language, LLM backend, diarization, no-summary, and
+        # force-retranscribe are now shared live between the Meeting and
+        # Video/Webinar tabs (see PipelineGUI.__init__'s shared_*_var), so
+        # there is nothing left to copy - editing either tab already
+        # updates both.
 
         # --- Meeting info (optional) ---
-        meeting_frame = ttk.LabelFrame(parent, text="Meeting info (optional)")
+        meeting_frame = ttk.LabelFrame(step1_target, text="Meeting info (optional)")
         self._meeting_frame = meeting_frame
         self.meeting_title_var = tk.StringVar()
         self.meeting_date_var = tk.StringVar()
         self.meeting_comments_var = tk.StringVar()
+        # Task #95: attendees loaded alongside Title/Date/Comments from an
+        # .ics invite or a .txt/.docx "Invitees:" line - not shown as its
+        # own entry field, but offered as the speaker-name pick-list (ahead
+        # of a blind guess) when Rename Speakers is opened from this tab.
+        # See _load_meeting_info and _get_invitee_names.
+        self.meeting_attendees: list = []
+        self.meeting_attendees_status_var = tk.StringVar(value="")
         ttk.Label(meeting_frame, text="Title:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(meeting_frame, textvariable=self.meeting_title_var, width=45).grid(
             row=0, column=1, sticky="w", columnspan=2)
@@ -1420,42 +1637,69 @@ class RunTabController:
                       "or a .txt/.docx file with \"Title:\"/\"Date:\"/\"Comments:\" lines. Shown "
                       "in the notes header" + (" and used as the report title." if is_video else "."),
                  foreground="#666").grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(meeting_frame, textvariable=self.meeting_attendees_status_var,
+                 foreground="#666").grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+
+        # --- Title slide image (optional, video/webinar only) ---
+        # Deliberately its OWN frame, not nested in meeting_frame above:
+        # meeting_frame gets hidden in batch mode (its fields are all
+        # per-row there already - see _update_path_label), and this one
+        # must not be, since it is the FALLBACK value for any batch row
+        # whose own "Title image" cell is left blank (see batch_columns/
+        # gui_logic.build_batch_row) - each webinar can have its own cover
+        # image via that per-row column; this field only applies when a
+        # row does not set one (or in single-file mode, where there is no
+        # batch table at all).
+        self._title_slide_frame = None
         if is_video:
-            ttk.Label(meeting_frame, text="Title slide image:").grid(row=4, column=0, sticky="w", padx=8, pady=4)
-            ttk.Entry(meeting_frame, textvariable=self.title_slide_image_var, width=45).grid(
-                row=4, column=1, sticky="w")
-            ttk.Button(meeting_frame, text="Browse...", command=self._browse_title_slide_image).grid(
-                row=4, column=2, sticky="w", padx=(8, 0))
-            ttk.Label(meeting_frame,
+            title_slide_frame = ttk.LabelFrame(step1_target, text="Title slide image (optional, default)")
+            self._title_slide_frame = title_slide_frame
+            ttk.Label(title_slide_frame, text="Image file:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+            ttk.Entry(title_slide_frame, textvariable=self.title_slide_image_var, width=45).grid(
+                row=0, column=1, sticky="w")
+            ttk.Button(title_slide_frame, text="Browse...", command=self._browse_title_slide_image).grid(
+                row=0, column=2, sticky="w", padx=(8, 0))
+            ttk.Label(title_slide_frame,
                      text="Optional cover image (jpg/png) shown as a title page before Slide 1 "
-                          "in the HTML/PDF slide report.",
-                     foreground="#666").grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+                          "in the HTML/PDF slide report. In batch mode, each row's own 'Title "
+                          "image' cell (double-click to edit) takes priority; this field is only "
+                          "the fallback for rows that leave that cell blank.",
+                     foreground="#666").grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
 
         # --- Q&A section (video only, task #61) ---
         self._qa_frame = None
         if is_video:
-            qa_frame = ttk.LabelFrame(parent, text="Q&A section (optional)")
+            qa_frame = ttk.LabelFrame(step2_target, text="Q&A section (optional)")
             self._qa_frame = qa_frame
             self.qa_start_var = tk.StringVar()
             self.qa_end_var = tk.StringVar()
+            self.qa_include_in_summary_var = tk.BooleanVar(
+                value=CONFIG.get("qa_include_in_summary", True))
             ttk.Label(qa_frame, text="Starts at:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
             ttk.Entry(qa_frame, textvariable=self.qa_start_var, width=12).grid(row=0, column=1, sticky="w")
             ttk.Label(qa_frame, text="Ends at (optional):").grid(row=0, column=2, sticky="w", padx=(16, 4), pady=4)
             ttk.Entry(qa_frame, textvariable=self.qa_end_var, width=12).grid(row=0, column=3, sticky="w")
+            ttk.Checkbutton(qa_frame, text="Include Q&A in the summary",
+                            variable=self.qa_include_in_summary_var).grid(
+                row=0, column=4, sticky="w", padx=(16, 4))
             ttk.Label(qa_frame,
                      text="For webinars with a Q&A block at the end where only the speakers are shown. "
                           "If set, no new slides are detected from here onward (to Ends at, or the end "
-                          "of the recording), and this segment gets its own focused Q&A summary "
-                          "(prompts/qa_summary.md) appended to the notes instead of the main summary. "
-                          "Blank Starts at = disabled. Accepts seconds (975), mm:ss (16:15), or hh:mm:ss.",
+                          "of the recording). \"Include Q&A in the summary\" (checked by default) folds "
+                          "that segment into the SAME summary as the rest of the recording, filling in "
+                          "its \"QUESTIONS & ANSWERS\" section; uncheck it to leave the Q&A portion out "
+                          "of the summary entirely (that section then reads \"No Q&A session\"). One "
+                          "prompt, one summary either way. Blank Starts at = disabled. Accepts seconds "
+                          "(975), mm:ss (16:15), or hh:mm:ss.",
                      foreground="#666", wraplength=860).grid(
-                row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+                row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 6))
 
         # --- Batch table (task #62) ---
         self.batch_frame = ttk.LabelFrame(
-            parent, text="Batch list: add files/folder, or load a .txt/.csv - double-click a cell to edit")
+            step1_target, text="Batch list: add files/folder, or load a .txt/.csv - double-click a cell to edit")
         if is_video:
-            self.batch_columns = ("file", "language", "title", "date", "comments", "qa_start", "qa_end")
+            self.batch_columns = ("file", "language", "title", "date", "comments",
+                                  "qa_start", "qa_end", "title_image", "srt_path")
         else:
             self.batch_columns = ("file", "language", "title", "date", "comments")
         # "status" (task #74) is a display-only column, not part of
@@ -1467,9 +1711,10 @@ class RunTabController:
                                        show="headings", height=8)
         _all_labels = {"file": "File", "language": "Lang", "title": "Title", "date": "Date",
                       "comments": "Comments", "qa_start": "Q&A start", "qa_end": "Q&A end",
-                      "status": "Status"}
+                      "title_image": "Title image", "srt_path": "Import .srt", "status": "Status"}
         _all_widths = {"file": 300, "language": 55, "title": 140, "date": 85,
-                      "comments": 160, "qa_start": 75, "qa_end": 75, "status": 90}
+                      "comments": 160, "qa_start": 75, "qa_end": 75, "title_image": 160,
+                      "srt_path": 160, "status": 90}
         for col in self.batch_display_columns:
             self.batch_tree.heading(col, text=_all_labels[col])
             self.batch_tree.column(col, width=_all_widths[col], anchor="w")
@@ -1488,17 +1733,21 @@ class RunTabController:
             side="left", padx=(12, 0))
         ttk.Button(batch_btn_row, text="Save to .csv...", command=self._batch_save_csv).pack(
             side="left", padx=(6, 0))
+        ttk.Button(batch_btn_row, text="Correlate calendar...", command=self._batch_correlate_calendar).pack(
+            side="left", padx=(12, 0))
         qa_note = " Q&A start/end accept seconds (975), mm:ss (16:15), or hh:mm:ss." if is_video else ""
         ttk.Label(self.batch_frame,
                  text="Language/Title/Date/Comments" + (" /Q&A start/end" if is_video else "") +
                       " are optional per row: blank uses the shared fields above." + qa_note +
-                      " Double-click a cell to edit it in place.",
+                      " Double-click a cell to edit it in place. \"Correlate calendar...\" "
+                      "matches a folder of recordings against a .ics calendar export and "
+                      "queues them here with Title/Date/Comments pre-filled.",
                  foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 8))
         # Meeting info/Q&A/batch table visibility is driven by Mode - see
         # _update_path_label(), called once at the end of _build() below.
 
         # --- Parameters ---
-        params = ttk.LabelFrame(parent, text="Parameters")
+        params = ttk.LabelFrame(step1_target, text="Parameters")
         params.pack(fill="x", **pad)
 
         ttk.Label(params, text="Whisper model:").grid(row=0, column=0, sticky="w", **pad)
@@ -1508,6 +1757,17 @@ class RunTabController:
         ttk.Label(params, text="Language:").grid(row=0, column=2, sticky="w", **pad)
         ttk.Combobox(params, textvariable=self.language_var, values=LANGUAGES,
                     state="readonly", width=10).grid(row=0, column=3, sticky="w")
+
+        ttk.Label(params, text="Output language:").grid(row=0, column=4, sticky="w", **pad)
+        output_language_box = ttk.Combobox(params, textvariable=self.output_language_var, values=LANGUAGES,
+                    state="readonly", width=10)
+        output_language_box.grid(row=0, column=5, sticky="w")
+        Tooltip(output_language_box,
+                "Language of the generated notes/summary AND the VLM slide title/bullets, "
+                "independent of \"Language\" above (which only affects transcription accuracy). "
+                "\"auto\" (default): follows the transcript's/slide's own language, no translation. "
+                "Set to e.g. \"de\" to always get German notes even from an English recording. "
+                "The verbatim transcript file itself is never translated.")
 
         ttk.Label(params, text="Prompt template:").grid(row=1, column=0, sticky="w", **pad)
         self.prompt_box = ttk.Combobox(params, textvariable=self.prompt_var,
@@ -1569,7 +1829,7 @@ class RunTabController:
         # Each checkbox gets a Tooltip (task #73) explaining what the
         # stage actually does on hover, keyed by STAGE_TOOLTIPS so the
         # explanation text lives in one place shared by both tabs.
-        toggles = ttk.LabelFrame(parent, text="Stages")
+        toggles = ttk.LabelFrame(step1_target, text="Stages")
         toggles.pack(fill="x", **pad)
         if is_video:
             cb = ttk.Checkbutton(toggles, text="Slide detection (video files only)",
@@ -1617,44 +1877,117 @@ class RunTabController:
             cb.grid(row=0, column=2, sticky="w", **pad)
             Tooltip(cb, STAGE_TOOLTIPS["force_retranscribe"])
 
-        # --- Output formats ---
-        formats = ttk.LabelFrame(parent, text="Output formats")
-        formats.pack(fill="x", **pad)
-        ttk.Label(formats, text="Notes:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Checkbutton(formats, text="txt", variable=self.notes_txt_var).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(formats, text="html", variable=self.notes_html_var).grid(row=0, column=2, sticky="w")
-        ttk.Checkbutton(formats, text="pdf", variable=self.notes_pdf_var).grid(row=0, column=3, sticky="w")
-        ttk.Checkbutton(formats, text="docx", variable=self.notes_docx_var).grid(row=0, column=4, sticky="w")
+        # --- Notes format ---
+        notes_format_frame = ttk.LabelFrame(step3_target, text="Notes format")
+        notes_format_frame.pack(fill="x", **pad)
+        ttk.Checkbutton(notes_format_frame, text="txt", variable=self.notes_txt_var).grid(
+            row=0, column=0, sticky="w", **pad)
+        ttk.Checkbutton(notes_format_frame, text="html", variable=self.notes_html_var).grid(
+            row=0, column=1, sticky="w", **pad)
+        ttk.Checkbutton(notes_format_frame, text="pdf", variable=self.notes_pdf_var).grid(
+            row=0, column=2, sticky="w", **pad)
+        ttk.Checkbutton(notes_format_frame, text="docx", variable=self.notes_docx_var).grid(
+            row=0, column=3, sticky="w", **pad)
 
         if is_video:
-            ttk.Label(formats, text="Slide report:").grid(row=1, column=0, sticky="w", **pad)
-            ttk.Checkbutton(formats, text="html", variable=self.report_html_var).grid(row=1, column=1, sticky="w")
-            ttk.Checkbutton(formats, text="csv", variable=self.report_csv_var).grid(row=1, column=2, sticky="w")
-            ttk.Checkbutton(formats, text="json", variable=self.report_json_var).grid(row=1, column=3, sticky="w")
-            ttk.Checkbutton(formats, text="pdf", variable=self.report_pdf_var).grid(row=1, column=4, sticky="w")
-            ttk.Checkbutton(formats, text="srt", variable=self.report_srt_var).grid(row=1, column=5, sticky="w")
-            ttk.Checkbutton(formats, text="timing summary (txt)",
-                            variable=self.report_slide_timing_var).grid(row=1, column=6, sticky="w")
-            ttk.Checkbutton(formats, text="zip snapshots",
-                            variable=self.zip_snapshots_var).grid(row=1, column=7, sticky="w")
-            ttk.Button(formats, text="Zip an existing snapshots folder...",
-                      command=self._zip_existing_snapshots).grid(
-                row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 0))
-
-            ttk.Label(formats, text="Report content:").grid(row=3, column=0, sticky="w", **pad)
-            ttk.Checkbutton(formats, text="image", variable=self.report_show_image_var).grid(
-                row=3, column=1, sticky="w")
-            ttk.Checkbutton(formats, text="bullet points", variable=self.report_show_bullets_var).grid(
-                row=3, column=2, sticky="w")
-            ttk.Checkbutton(formats, text="transcript", variable=self.report_show_transcript_var).grid(
-                row=3, column=3, sticky="w")
-            ttk.Label(formats, text="Transcript:").grid(row=4, column=0, sticky="w", **pad)
-            ttk.Combobox(formats, textvariable=self.report_transcript_mode_var,
+            # --- Slide report content ---
+            # What's shown ON each slide page, grouped separately from
+            # the file-format choices above. "Transcript mode" sits right
+            # next to the "transcript" checkbox it modifies (previously
+            # two rows apart with a "Report content:"/"Transcript:" label
+            # pair that read like two unrelated settings) instead of
+            # below it, since it only has any effect when that checkbox
+            # is on.
+            report_content_frame = ttk.LabelFrame(step3_target, text="Slide report content")
+            report_content_frame.pack(fill="x", **pad)
+            ttk.Checkbutton(report_content_frame, text="image",
+                            variable=self.report_show_image_var).grid(row=0, column=0, sticky="w", **pad)
+            ttk.Checkbutton(report_content_frame, text="bullet points",
+                            variable=self.report_show_bullets_var).grid(row=0, column=1, sticky="w", **pad)
+            ttk.Checkbutton(report_content_frame, text="transcript",
+                            variable=self.report_show_transcript_var).grid(row=0, column=2, sticky="w", **pad)
+            ttk.Label(report_content_frame, text="Transcript mode:").grid(
+                row=0, column=3, sticky="w", padx=(16, 4), pady=4)
+            ttk.Combobox(report_content_frame, textvariable=self.report_transcript_mode_var,
                         values=["full", "first_sentence"], state="readonly", width=16).grid(
-                row=4, column=1, sticky="w", columnspan=2)
-            ttk.Label(formats, text="'full' = complete transcript segment per slide. "
-                                  "'first_sentence' = first sentence only, so it fits on one page.",
-                     foreground="#666").grid(row=5, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 4))
+                row=0, column=4, sticky="w", pady=4)
+            ttk.Label(report_content_frame,
+                     text="'full' = complete transcript segment per slide. 'first_sentence' = "
+                          "first sentence only, so it fits on one page.",
+                     foreground="#666", wraplength=860).grid(
+                row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
+
+            # --- Slide report format ---
+            # Export-format checkboxes on one row, the two "zip snapshots"
+            # controls grouped together on their own row below (the
+            # checkbox zips THIS run's snapshots as part of the run;
+            # the button zips an already-finished run's snapshots folder
+            # on demand - related actions, kept next to each other).
+            slide_report_frame = ttk.LabelFrame(step3_target, text="Slide report format")
+            slide_report_frame.pack(fill="x", **pad)
+            ttk.Checkbutton(slide_report_frame, text="html", variable=self.report_html_var).grid(
+                row=0, column=0, sticky="w", **pad)
+            ttk.Checkbutton(slide_report_frame, text="csv", variable=self.report_csv_var).grid(
+                row=0, column=1, sticky="w", **pad)
+            ttk.Checkbutton(slide_report_frame, text="json", variable=self.report_json_var).grid(
+                row=0, column=2, sticky="w", **pad)
+            ttk.Checkbutton(slide_report_frame, text="pdf", variable=self.report_pdf_var).grid(
+                row=0, column=3, sticky="w", **pad)
+            ttk.Checkbutton(slide_report_frame, text="srt", variable=self.report_srt_var).grid(
+                row=0, column=4, sticky="w", **pad)
+            ttk.Checkbutton(slide_report_frame, text="timing summary (txt)",
+                            variable=self.report_slide_timing_var).grid(
+                row=0, column=5, sticky="w", **pad)
+
+            ttk.Checkbutton(slide_report_frame, text="zip snapshots",
+                            variable=self.zip_snapshots_var).grid(
+                row=1, column=0, sticky="w", padx=8, pady=(0, 8))
+            ttk.Button(slide_report_frame, text="Zip an existing snapshots folder...",
+                      command=self._zip_existing_snapshots).grid(
+                row=1, column=1, columnspan=5, sticky="w", padx=(4, 8), pady=(0, 8))
+
+        # --- Step-specific tools (task #61/#112 GUI remodel) ---
+        # On the Video/Webinar tab these four actions used to sit in the
+        # run_frame row below; they move into the step they actually
+        # belong to, so each tab is a one-stop place for that phase of
+        # the workflow. The Meeting tab has no steps, so they stay in
+        # run_frame exactly as before.
+        if is_video:
+            step1_tools = ttk.Frame(step1_target)
+            step1_tools.pack(fill="x", padx=8, pady=(0, 8))
+            ttk.Button(step1_tools, text="Open in LosslessCut...",
+                      command=self._open_in_losslesscut).pack(side="left")
+            ttk.Label(step1_tools, text="Trim the source video before processing it (optional).",
+                     foreground="#666").pack(side="left", padx=(8, 0))
+
+            step1_tools2 = ttk.Frame(step1_target)
+            step1_tools2.pack(fill="x", padx=8, pady=(0, 8))
+            ttk.Button(step1_tools2, text="Import .srt as transcript...",
+                      command=self._on_import_srt).pack(side="left")
+            ttk.Label(step1_tools2,
+                     text="Already have captions (e.g. from YouTube)? Import the .srt instead of "
+                          "re-transcribing - Run will then skip whisperx and use it directly.",
+                     foreground="#666").pack(side="left", padx=(8, 0))
+
+            self._step2_button_row = ttk.Frame(step2_target)
+            self._step2_button_row.pack(fill="x", padx=8, pady=(0, 4))
+            ttk.Button(self._step2_button_row, text="Review / Edit Slides...",
+                      command=self._open_slide_review).pack(side="left")
+            ttk.Button(self._step2_button_row, text="Re-annotate failed slides...",
+                      command=self._on_reannotate_failed).pack(side="left", padx=(6, 0))
+            ttk.Button(self._step2_button_row, text="Rename Speakers...",
+                      command=self._on_rename_speakers).pack(side="left", padx=(6, 0))
+            ttk.Label(step2_target,
+                     text="Omit/merge slides and rebuild the slide report, mark where Q&A "
+                          "starts above, or rename speakers - all without re-transcribing.",
+                     foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 8))
+
+            ttk.Label(step3_target,
+                     text="To (re)generate just the summary/reports for a recording already "
+                          "processed in step 1 - e.g. after adjusting Q&A in step 2, or the "
+                          "formats above - set Mode (top of this tab) to \"Notes-only "
+                          "(existing transcript)\" and Run.",
+                     foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(8, 4))
 
         # --- Run button + progress ---
         run_frame = ttk.Frame(parent)
@@ -1663,16 +1996,13 @@ class RunTabController:
         self.run_button.pack(side="left")
         self.stop_button = ttk.Button(run_frame, text="Stop", command=self._on_stop, state="disabled")
         self.stop_button.pack(side="left", padx=(6, 0))
-        if is_video:
-            ttk.Button(run_frame, text="Re-annotate failed slides...",
-                      command=self._on_reannotate_failed).pack(side="left", padx=(6, 0))
-        ttk.Button(run_frame, text="Open in LosslessCut...",
-                  command=self._open_in_losslesscut).pack(side="left", padx=(6, 0))
-        ttk.Button(run_frame, text="Rename Speakers...",
-                  command=self._on_rename_speakers).pack(side="left", padx=(6, 0))
-        if is_video:
-            ttk.Button(run_frame, text="Review / Edit Slides...",
-                      command=self._open_slide_review).pack(side="left", padx=(6, 0))
+        if not is_video:
+            ttk.Button(run_frame, text="Open in LosslessCut...",
+                      command=self._open_in_losslesscut).pack(side="left", padx=(6, 0))
+            ttk.Button(run_frame, text="Rename Speakers...",
+                      command=self._on_rename_speakers).pack(side="left", padx=(6, 0))
+            ttk.Button(run_frame, text="Import .srt as transcript...",
+                      command=self._on_import_srt).pack(side="left", padx=(6, 0))
         self.status_label = ttk.Label(run_frame, text="Ready.")
         self.status_label.pack(side="left", padx=12)
 
@@ -1697,14 +2027,21 @@ class RunTabController:
         # --- Persisted settings (task #71) ---
         # Maps each gui_logic.persisted_keys_for(self.kind) key to the
         # tkinter Variable holding it, so _apply_persisted_state/
-        # _collect_persisted_state can read/write them generically.
+        # _collect_tab_state/_collect_shared_state can read/write them
+        # generically. Note some of these Variables (whisper_model,
+        # language, output_language, llm_backend, enable_diarization,
+        # no_summary, force_retranscribe) are the SAME objects as the
+        # other Run tab's - see PipelineGUI.__init__.
         self._state_vars = {
             "recording_type":    self.recording_type_var,
             "prompt_template":   self.prompt_var,
             "whisper_model":     self.whisper_model_var,
             "language":          self.language_var,
+            "output_language":   self.output_language_var,
             "llm_backend":       self.llm_backend_var,
             "output_dir":        self.output_dir_var,
+            "use_date_subject_filename": self.use_date_subject_filename_var,
+            "move_processed_files": self.move_processed_files_var,
             "enable_diarization": self.enable_diarization_var,
             "no_summary":        self.no_summary_var,
             "force_retranscribe": self.force_retranscribe_var,
@@ -1730,6 +2067,7 @@ class RunTabController:
                 "report_show_bullets":    self.report_show_bullets_var,
                 "report_show_transcript": self.report_show_transcript_var,
                 "report_transcript_mode": self.report_transcript_mode_var,
+                "qa_include_in_summary":  self.qa_include_in_summary_var,
             })
 
         self._apply_recording_type()
@@ -1743,13 +2081,20 @@ class RunTabController:
         _refresh_prompt_templates so a saved prompt_template correctly
         wins over the recording-type preset's default. Missing file,
         first run, or a corrupt gui_state.json are all silently treated
-        as "nothing saved yet" (see gui_logic.load_state_file)."""
+        as "nothing saved yet" (see gui_logic.load_state_file).
+
+        Reads both this tab's own section AND the shared section (task:
+        centralize Meeting/Video common settings) - applying the shared
+        values here is idempotent even though both tabs call this, since
+        their shared Variables are the same objects and state["shared"]
+        is a single dict."""
         state = gui_logic.load_state_file(STATE_PATH)
-        saved = state.get(self.kind) or {}
-        if not saved:
+        saved_tab = state.get(self.kind) or {}
+        saved_shared = state.get("shared") or {}
+        if not saved_tab and not saved_shared:
             return
         defaults = {k: v.get() for k, v in self._state_vars.items()}
-        merged = gui_logic.merge_persisted_state(self.kind, saved, defaults)
+        merged = gui_logic.merge_persisted_state(self.kind, saved_tab, saved_shared, defaults)
         for key, var in self._state_vars.items():
             if key == "recording_type" and merged[key] not in self._recording_types:
                 continue
@@ -1758,32 +2103,23 @@ class RunTabController:
             except Exception:
                 pass
 
-    def _collect_persisted_state(self) -> dict:
-        """Task #71: snapshot this tab's current settings for
-        gui_state.json, filtered to just the keys this tab kind persists
-        (gui_logic.build_state_dict) - never the path, batch table, or
-        meeting info/Q&A fields."""
+    def _collect_tab_state(self) -> dict:
+        """Task #71: snapshot this tab's OWN settings for gui_state.json
+        (recording_type/prompt_template/output_dir, plus video-only keys
+        for the video tab) - excludes the shared keys, see
+        _collect_shared_state. Never the path, batch table, or meeting
+        info/Q&A fields."""
         raw = {k: v.get() for k, v in self._state_vars.items()}
-        return gui_logic.build_state_dict(self.kind, raw)
+        return gui_logic.build_tab_state_dict(self.kind, raw)
 
-    def _copy_settings_to_other_tab(self):
-        """Task #72: copy whisper model, language, LLM backend, and the
-        diarization/no-summary/force-retranscribe toggles to the other
-        tab (Meeting <-> Video/Webinar). Deliberately narrower than
-        gui_state.json's persisted keys - NOT the prompt template (each
-        tab has its own presets/recording types) and NOT meeting info,
-        path, or batch table contents (see gui_logic.COPYABLE_KEYS)."""
-        other = self.app.video_run if self.kind == "meeting" else self.app.meeting_run
+    def _collect_shared_state(self) -> dict:
+        """Snapshot the settings shared with the other Run tab (whisper
+        model, language, LLM backend, diarization, no-summary,
+        force-retranscribe) for gui_state.json's "shared" key. Either
+        tab's values are equally valid here since both are backed by the
+        same Variable objects."""
         raw = {k: v.get() for k, v in self._state_vars.items()}
-        settings = gui_logic.extract_copyable_settings(raw)
-        for key, value in settings.items():
-            var = other._state_vars.get(key)
-            if var is not None:
-                try:
-                    var.set(value)
-                except Exception:
-                    pass
-        other.status_label.config(text=f"Settings copied from the {self._label()} tab.")
+        return gui_logic.build_shared_state_dict(raw)
 
     def _label(self) -> str:
         return "Video/Webinar" if self.kind == "video" else "Meeting"
@@ -1807,9 +2143,12 @@ class RunTabController:
         Shows/hides the batch table vs the Meeting info/Q&A sections
         based on Mode: in batch mode, Meeting info/Q&A are per-row in the
         batch table already, so the shared single-file fields would be
-        misleading left visible. Both frames are always re-anchored via
-        after=self._rec_frame, so toggling never reorders the rest of the
-        tab (Parameters/Stages/Formats/Run/Log stay put).
+        misleading left visible. Meeting info is always re-anchored via
+        after=self._rec_frame (both live in step1_target - step1's tab
+        for the Video/Webinar tab, "parent" directly for the Meeting
+        tab), so toggling never reorders the rest of that tab/step. Q&A
+        (Video/Webinar only, lives in step2_target) is re-anchored via
+        before=self._step2_button_row instead, for the same reason.
         """
         mode = self.mode_var.get()
         labels = {
@@ -1821,18 +2160,38 @@ class RunTabController:
         }
         self.path_label.config(text=labels.get(mode, "File:"))
 
+        if self._steps_nb is not None:
+            self._steps_nb.select(
+                self._step3_frame if mode in (MODES[3], MODES[4]) else self._step1_frame)
+
         is_batch = mode == MODES[1]
         self._meeting_frame.pack_forget()
         if self._qa_frame is not None:
             self._qa_frame.pack_forget()
         self.batch_frame.pack_forget()
 
+        # Title slide image (if this tab has one - is_video only) is
+        # deliberately NOT pack_forget()-ed above: it has no per-row batch
+        # equivalent (unlike meeting_frame's fields), so it must stay
+        # visible/enterable in every Mode, batch included. Re-packing an
+        # already-packed widget with the same options is a no-op, so this
+        # runs safely on every call, not just the first.
+        if self._title_slide_frame is not None:
+            self._title_slide_frame.pack(fill="x", padx=8, pady=4, after=self._rec_frame)
+        meeting_anchor = self._title_slide_frame if self._title_slide_frame is not None else self._rec_frame
+
         if is_batch:
-            self.batch_frame.pack(fill="both", expand=False, padx=8, pady=4, after=self._rec_frame)
+            self.batch_frame.pack(fill="both", expand=False, padx=8, pady=4, after=meeting_anchor)
         else:
-            self._meeting_frame.pack(fill="x", padx=8, pady=4, after=self._rec_frame)
+            self._meeting_frame.pack(fill="x", padx=8, pady=4, after=meeting_anchor)
             if self._qa_frame is not None:
-                self._qa_frame.pack(fill="x", padx=8, pady=4, after=self._meeting_frame)
+                # qa_frame lives in step2_target now (a different Notebook
+                # tab than meeting_frame's step1_target), so it can't be
+                # anchored to meeting_frame any more - anchor it to the
+                # permanent button row within its own tab instead, so it
+                # always reinserts above those buttons rather than at
+                # whatever position pack_forget()/pack() happens to leave it.
+                self._qa_frame.pack(fill="x", padx=8, pady=4, before=self._step2_button_row)
 
     def _load_meeting_info(self):
         """Task #93: pre-fill Title/Date/Comments from an .ics calendar
@@ -1868,8 +2227,37 @@ class RunTabController:
             existing = self.meeting_comments_var.get().strip()
             combined = f"{existing} {parsed['comments']}" if existing else parsed["comments"]
             self.meeting_comments_var.set(combined)
-        if not any(parsed.get(k) for k in ("title", "date", "comments")):
-            messagebox.showinfo("Nothing found", "No title, date, or comments found in this file.")
+        # Task #95: Agenda (if present) is folded into Comments too, since
+        # there is no separate Agenda entry field in this dialog - it still
+        # reaches the notes header/LLM context via meeting_comments.
+        if parsed.get("agenda"):
+            existing = self.meeting_comments_var.get().strip()
+            agenda_line = f"Agenda: {parsed['agenda']}"
+            combined = f"{existing}\n{agenda_line}" if existing else agenda_line
+            self.meeting_comments_var.set(combined)
+        attendees = parsed.get("attendees") or []
+        if attendees:
+            self.meeting_attendees = attendees
+            names = ics_utils.attendee_names(attendees)
+            preview = ", ".join(names[:5]) + (", ..." if len(names) > 5 else "")
+            self.meeting_attendees_status_var.set(
+                f"Loaded {len(names)} invitee(s): {preview} - offered first when naming "
+                f"speakers in Rename Speakers.")
+        else:
+            self.meeting_attendees_status_var.set("")
+        if not any(parsed.get(k) for k in ("title", "date", "comments", "agenda")) and not attendees:
+            messagebox.showinfo("Nothing found",
+                                "No title, date, comments, agenda, or invitees found in this file.")
+
+    def _get_invitee_names(self) -> list:
+        """Task #95: the display names from the currently-loaded meeting
+        info's attendees (an .ics invite or a "Invitees:" line loaded via
+        _load_meeting_info for this tab), for use as a speaker-name
+        suggestion/autocomplete pick-list in Rename Speakers - offered
+        ahead of a blind guess, since these are the real people invited to
+        this recording. Empty list if no meeting info with attendees has
+        been loaded for this tab."""
+        return ics_utils.attendee_names(self.meeting_attendees)
 
     def _browse_title_slide_image(self):
         path = filedialog.askopenfilename(
@@ -1978,7 +2366,8 @@ class RunTabController:
                 ".txt file alone is not enough).")
             return
         source_media_path = run_pipeline.find_source_media(segments_json_path)
-        SpeakerRenameDialog(self, segments_json_path, labels, source_media_path)
+        SpeakerRenameDialog(self, segments_json_path, labels, source_media_path,
+                           invitee_names=self._get_invitee_names())
 
     def _run_rename_speakers_worker(self, segments_json_path: str, mapping: dict, regenerate_notes: bool,
                                     speaker_suggestions: dict | None = None, db_path: str | None = None):
@@ -2066,7 +2455,9 @@ class RunTabController:
         """Inline cell editor: tkinter's Treeview has no built-in editable
         cell, so a temporary Entry is placed exactly over the clicked
         cell's bbox, pre-filled with its current value, and its result is
-        written back into the row on Enter/focus-out."""
+        written back into the row on Enter/focus-out. "title_image" is the
+        one exception (see below): a file path is better picked than
+        typed/pasted, so that column opens a file dialog instead."""
         region = self.batch_tree.identify("region", event.x, event.y)
         if region != "cell":
             return
@@ -2078,6 +2469,38 @@ class RunTabController:
         if col_index >= len(self.batch_columns):
             return
         col_name = self.batch_columns[col_index]
+
+        if col_name == "title_image":
+            # Matches the shared field's own "Browse..." button
+            # (_browse_title_slide_image) rather than the plain-text
+            # inline editor every other column uses - a per-webinar cover
+            # image is a file to pick, not a value to type. Leaves the
+            # existing cell value untouched if the dialog is cancelled.
+            path = filedialog.askopenfilename(
+                title="Select title slide cover image",
+                filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")],
+            )
+            if path:
+                # os.path.normpath (task #97): tkinter's file dialogs
+                # return forward-slash paths on Windows; normalized here
+                # to match the "file" column's own existing convention.
+                self.batch_tree.set(row_iid, col_name, os.path.normpath(path))
+            return
+
+        if col_name == "srt_path":
+            # Same file-picker treatment as title_image (task: batch
+            # YouTube import) - a per-row .srt is a file to pick, not a
+            # value to type. A blank cell (dialog cancelled, or never
+            # set) means this row gets a real transcription like any
+            # other - see gui_logic.build_batch_row's srt_import_path key.
+            path = filedialog.askopenfilename(
+                title="Select .srt subtitle file to import for this row",
+                filetypes=[("SRT subtitles", "*.srt"), ("All files", "*.*")],
+            )
+            if path:
+                self.batch_tree.set(row_iid, col_name, os.path.normpath(path))
+            return
+
         bbox = self.batch_tree.bbox(row_iid, col)
         if not bbox:
             return
@@ -2131,13 +2554,19 @@ class RunTabController:
         return rows, iids
 
     def _batch_add_files(self):
+        # os.path.normpath (task #97): tkinter's file dialogs return paths
+        # with forward slashes on Windows (a Tk/Tcl quirk, not a pathlib
+        # one) unless normalized - without this, a file added here would
+        # sit in the batch table as "X:/Agilent/.../file.mp4" instead of
+        # "X:\Agilent\...\file.mp4", inconsistent with every other path in
+        # the table.
         patterns = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXTENSIONS))
         paths = filedialog.askopenfilenames(
             title="Select audio/video files to add",
             filetypes=[("Audio/Video", patterns), ("All files", "*.*")],
         )
         for p in paths:
-            self._batch_insert_row(file=p)
+            self._batch_insert_row(file=os.path.normpath(p))
 
     def _batch_add_folder(self):
         folder = filedialog.askdirectory(
@@ -2150,7 +2579,89 @@ class RunTabController:
             messagebox.showinfo("Nothing found", "No supported audio/video files found in this folder.")
             return
         for f in files:
-            self._batch_insert_row(file=str(f))
+            self._batch_insert_row(file=os.path.normpath(str(f)))
+
+    def _batch_correlate_calendar(self):
+        """Task #96: GUI front-end for correlate_calendar_recordings.py -
+        matches every recording in a chosen folder against a .ics
+        calendar export's events (by comparing the recording's own
+        end-of-file timestamp to each event's end time; see that
+        module's docstring for the full matching philosophy) and queues
+        every recording here with Title/Date/Comments pre-filled from
+        its matched event, exactly like importing that script's
+        "..._batch.csv" output via "Load .txt/.csv...", but without
+        leaving the GUI or a command line. Unmatched recordings are
+        still queued, just with those fields blank. Also writes the two
+        CSV reports next to the folder (same as the CLI script) so
+        there is still a record to review afterward."""
+        folder = filedialog.askdirectory(
+            title="Select folder with recordings (and the .ics calendar export)")
+        if not folder:
+            return
+        folder_path = Path(folder)
+
+        ics_path = correlate_calendar_recordings.find_ics_file(folder_path)
+        if ics_path is None:
+            picked = filedialog.askopenfilename(
+                title="Select the .ics calendar file",
+                initialdir=folder, filetypes=[("Calendar", "*.ics"), ("All files", "*.*")])
+            if not picked:
+                return
+            ics_path = Path(picked)
+
+        recursive = messagebox.askyesno(
+            "Include subfolders?",
+            "Also scan subfolders of this folder for recordings?", default="no")
+
+        tolerance = simpledialog.askfloat(
+            "Match tolerance",
+            "Max minutes between a recording's end time and a calendar event's end "
+            "time to still count as a match:",
+            initialvalue=correlate_calendar_recordings.DEFAULT_TOLERANCE_MIN, minvalue=0.0,
+            parent=self.root)
+        if tolerance is None:
+            return
+
+        try:
+            events = ics_utils.parse_ics_events(str(ics_path))
+            recordings = correlate_calendar_recordings.find_recordings(folder_path, recursive=recursive)
+            if not recordings:
+                messagebox.showinfo(
+                    "Nothing found",
+                    f"No supported audio/video files found in:\n{folder_path}")
+                return
+            rows = correlate_calendar_recordings.correlate(events, recordings, tolerance_min=tolerance)
+
+            report_path = folder_path / "calendar_recording_correlation.csv"
+            correlate_calendar_recordings.write_report_csv(rows, report_path)
+            batch_path = report_path.with_name(report_path.stem + "_batch.csv")
+            correlate_calendar_recordings.write_batch_csv(rows, batch_path)
+        except Exception as exc:
+            messagebox.showerror("Calendar correlation failed", str(exc))
+            return
+
+        for r in rows:
+            comments_parts = []
+            if r.get("description"):
+                comments_parts.append(r["description"])
+            if r.get("agenda"):
+                comments_parts.append(f"Agenda: {r['agenda']}")
+            if r.get("attendees"):
+                comments_parts.append(f"Invitees: {ics_utils.format_attendees(r['attendees'])}")
+            self._batch_insert_row(
+                file=os.path.normpath(str(r["recording"])),
+                title=r["matched_title"] or "",
+                date=r["event_start"].strftime("%Y-%m-%d") if r["event_start"] else "",
+                comments="\n".join(comments_parts),
+            )
+
+        matched = sum(1 for r in rows if r["status"] == "matched")
+        messagebox.showinfo(
+            "Calendar correlation done",
+            f"{len(events)} calendar event(s), {len(recordings)} recording(s): "
+            f"{matched} matched within {tolerance:g} min, {len(rows) - matched} not matched.\n\n"
+            f"Queued {len(rows)} row(s) into the batch table below.\n\n"
+            f"Reports written to:\n{report_path}\n{batch_path}")
 
     def _batch_remove_selected(self):
         for iid in self.batch_tree.selection():
@@ -2254,6 +2765,7 @@ class RunTabController:
             "prompt_template":    self.prompt_var.get() or None,
             "whisper_model":      self.whisper_model_var.get(),
             "whisper_language":   self.language_var.get(),
+            "output_language":    self.output_language_var.get(),
             "llm_backend":        self.llm_backend_var.get(),
             "enable_diarization": self.enable_diarization_var.get(),
             "no_summary":         self.no_summary_var.get(),
@@ -2267,6 +2779,8 @@ class RunTabController:
             "meeting_date":       self.meeting_date_var.get().strip(),
             "meeting_comments":   self.meeting_comments_var.get().strip(),
             "output_basename_override": self.output_basename_var.get().strip(),
+            "use_date_subject_filename": self.use_date_subject_filename_var.get(),
+            "move_processed_files": self.move_processed_files_var.get(),
             "db_path":            self.app.db_path_var.get().strip() or None,
         }
         if self.kind == "video":
@@ -2280,6 +2794,7 @@ class RunTabController:
                 "min_slide_duration_sec": self.min_slide_duration_var.get(),
                 "qa_start_time_sec":   self._parse_qa_time(self.qa_start_var.get()),
                 "qa_end_time_sec":     self._parse_qa_time(self.qa_end_var.get()),
+                "qa_include_in_summary": self.qa_include_in_summary_var.get(),
                 "recording_speed":     self.recording_speed_var.get(),
                 "convert_video_to_realtime": self.convert_video_to_realtime_var.get(),
                 "title_slide_image_path": self.title_slide_image_var.get().strip(),
@@ -2388,6 +2903,65 @@ class RunTabController:
         self.stop_event.set()
         self.stop_button.config(state="disabled")
         self.status_label.config(text="Stopping (finishing current step)...")
+
+    def _on_import_srt(self):
+        """Import an existing .srt (e.g. downloaded alongside a YouTube
+        video, together with its description.txt) as the transcript for
+        the file selected above, instead of running whisperx. See
+        run_pipeline.import_srt_transcript: writes the same cache files a
+        real transcription run would, so a later Run (Notes-only, or a
+        full Video/Webinar run with slides) picks it up via process_file's
+        existing cache-aware shortcut and skips re-transcription entirely.
+        Refuses to overwrite an existing transcript cache unless "Force
+        re-transcribe" (shared with the CLI's --force-retranscribe) is
+        checked above."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Busy", "A run is already in progress.")
+            return
+        video_path = self.path_var.get().strip()
+        if not video_path or not Path(video_path).exists():
+            messagebox.showwarning("No file selected", "Select a source file above first.")
+            return
+        srt_path = filedialog.askopenfilename(
+            title="Select .srt subtitle file to import",
+            filetypes=[("SRT subtitles", "*.srt"), ("All files", "*.*")],
+        )
+        if not srt_path:
+            return
+
+        self._clear_log()
+        self.run_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.stop_event.clear()
+        self.status_label.config(text="Importing .srt as transcript...")
+        self.progress_var.set(0)
+        self.stage_label.config(text="")
+
+        overrides = self._build_overrides()
+
+        self.worker_thread = threading.Thread(
+            target=self._import_srt_worker, args=(video_path, srt_path, overrides), daemon=True
+        )
+        self.worker_thread.start()
+
+    def _import_srt_worker(self, video_path: str, srt_path: str, overrides: dict):
+        handler = QueueLogHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        level = getattr(logging, self.app.log_level_var.get().upper(), logging.INFO)
+        root_logger.setLevel(level)
+        try:
+            ok = run_pipeline.import_srt_transcript(video_path, srt_path, overrides)
+            self.log_queue.put(
+                "=== IMPORT .SRT DONE ===" if ok else "=== IMPORT .SRT FAILED (see log above) ===")
+        except Exception as exc:
+            self.log_queue.put(f"FATAL ERROR: {exc}")
+            import traceback
+            self.log_queue.put(traceback.format_exc())
+        finally:
+            root_logger.removeHandler(handler)
+            self.log_queue.put("__RUN_COMPLETE__")
 
     def _on_reannotate_failed(self):
         """Pick an existing *_slides.json and re-run VLM annotation only for
@@ -2540,6 +3114,396 @@ class RunTabController:
         self.root.after(100, self._poll_log_queue)
 
 
+class TranslateTabController:
+    """
+    Controls the "Translate" tab: translate txt/docx/pptx/pdf/image files
+    into a chosen target language. Independent of the audio/video
+    pipeline (no whisper/notes/slides involved - see translator.py/
+    doc_translate.py for the actual translation logic). Deliberately
+    much simpler than RunTabController: one mode selector (Single file /
+    File list (batch) / Folder (auto-discover)), a target-language
+    dropdown, an optional output-folder override, and the same
+    worker-thread + queue-log pattern as the Run tabs, minus the
+    per-stage progress bar (translation has no distinct stages).
+    """
+
+    def __init__(self, tab: ttk.Frame, app):
+        self.tab = tab
+        self.app = app
+        self.log_queue: queue.Queue = queue.Queue()
+        self.worker_thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self._batch_run_iids: list = []
+        self._build()
+        self.app.root.after(100, self._poll_log_queue)
+
+    def _build(self):
+        parent = self.app._make_scrollable(self.tab)
+        pad = {"padx": 8, "pady": 4}
+
+        self.mode_var = tk.StringVar(value=TRANSLATE_MODES[0])
+        self.path_var = tk.StringVar()
+        self.output_dir_var = tk.StringVar()
+        self.target_language_var = tk.StringVar(value=CONFIG.get("translate_target_language", "en"))
+        self.ocr_language_var = tk.StringVar(value=CONFIG.get("translate_ocr_language", "auto"))
+
+        # --- Mode + source ---
+        source = ttk.LabelFrame(parent, text="Source")
+        source.pack(fill="x", **pad)
+        self._source_frame = source
+        ttk.Label(source, text="Mode:").grid(row=0, column=0, sticky="w", **pad)
+        mode_box = ttk.Combobox(source, textvariable=self.mode_var, values=TRANSLATE_MODES,
+                                state="readonly", width=24)
+        mode_box.grid(row=0, column=1, sticky="w")
+        mode_box.bind("<<ComboboxSelected>>", lambda e: self._update_mode_visibility())
+
+        self.path_label = ttk.Label(source, text="File:")
+        self.path_label.grid(row=1, column=0, sticky="w", **pad)
+        self.path_entry = ttk.Entry(source, textvariable=self.path_var, width=68)
+        self.path_entry.grid(row=1, column=1, sticky="w")
+        ttk.Button(source, text="Browse...", command=self._browse_path).grid(
+            row=1, column=2, sticky="w", padx=(4, 0))
+
+        supported = ", ".join(sorted(doc_translate.TRANSLATABLE_EXTENSIONS))
+        ttk.Label(source,
+                 text=f"Supported: {supported}. Legacy .doc/.ppt are not supported - "
+                      "save as .docx/.pptx first. pdf and images are written as a "
+                      "translated .docx (no editable layout to translate into).",
+                 foreground="#666", wraplength=860).grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+
+        # --- Batch table (File list mode only; hidden otherwise) ---
+        self.batch_frame = ttk.LabelFrame(parent, text="Files to translate (one per row)")
+        self.batch_columns = ("file",)
+        self.batch_tree = ttk.Treeview(self.batch_frame, columns=("file", "status"),
+                                       show="headings", height=8)
+        self.batch_tree.heading("file", text="File")
+        self.batch_tree.heading("status", text="Status")
+        self.batch_tree.column("file", width=580, anchor="w")
+        self.batch_tree.column("status", width=90, anchor="w")
+        self.batch_tree.pack(fill="both", expand=True, padx=4, pady=(4, 4))
+        self.batch_tree.bind("<Double-1>", self._on_batch_double_click)
+
+        batch_btn_row = ttk.Frame(self.batch_frame)
+        batch_btn_row.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(batch_btn_row, text="Add files...", command=self._batch_add_files).pack(side="left")
+        ttk.Button(batch_btn_row, text="Remove selected", command=self._batch_remove_selected).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(batch_btn_row, text="Clear", command=self._batch_clear).pack(side="left", padx=(6, 0))
+        ttk.Button(batch_btn_row, text="Load .txt...", command=self._batch_load_path).pack(
+            side="left", padx=(12, 0))
+        ttk.Button(batch_btn_row, text="Save box to .txt...", command=self._batch_save_path).pack(
+            side="left", padx=(6, 0))
+        ttk.Label(self.batch_frame,
+                 text="Double-click a row to open its containing folder. Leave the table empty "
+                      "and use \"File:\" above to point at an existing list.txt instead.",
+                 foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 6))
+
+        # --- Parameters ---
+        params = ttk.LabelFrame(parent, text="Parameters")
+        params.pack(fill="x", **pad)
+        ttk.Label(params, text="Target language:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Combobox(params, textvariable=self.target_language_var, values=TRANSLATE_LANGUAGES,
+                    state="readonly", width=10).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(params, text="OCR language (images only):").grid(row=0, column=2, sticky="w", **pad)
+        ocr_lang_box = ttk.Combobox(params, textvariable=self.ocr_language_var,
+                                    values=["auto"] + TRANSLATE_LANGUAGES, state="readonly", width=10)
+        ocr_lang_box.grid(row=0, column=3, sticky="w")
+        Tooltip(ocr_lang_box,
+                "What script Tesseract should expect to see in an IMAGE input (.jpg/.png/etc.) "
+                "before translation - NOT the translation target above. Wrong here silently "
+                "garbles non-Latin scripts (e.g. Chinese slides) into fluent-sounding nonsense "
+                "once the LLM 'translates' the garbled OCR text. \"auto\" = \"eng+deu\". Set to "
+                "the slide's actual language, e.g. \"zh\" for Chinese.")
+
+        ttk.Label(params, text="Output folder (blank = next to source):").grid(
+            row=1, column=0, sticky="w", **pad)
+        ttk.Entry(params, textvariable=self.output_dir_var, width=50).grid(
+            row=1, column=1, sticky="w", columnspan=2)
+        ttk.Button(params, text="Browse...", command=self._browse_output_dir).grid(
+            row=1, column=3, sticky="w", padx=(4, 0))
+
+        # --- Run button + progress ---
+        run_frame = ttk.Frame(parent)
+        run_frame.pack(fill="x", **pad)
+        self.run_button = ttk.Button(run_frame, text="Translate", command=self._on_run)
+        self.run_button.pack(side="left")
+        self.stop_button = ttk.Button(run_frame, text="Stop", command=self._on_stop, state="disabled")
+        self.stop_button.pack(side="left", padx=(6, 0))
+        self.status_label = ttk.Label(run_frame, text="Ready.")
+        self.status_label.pack(side="left", padx=12)
+
+        progress_frame = ttk.Frame(parent)
+        progress_frame.pack(fill="x", **pad)
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate",
+                                            maximum=100, variable=self.progress_var, length=320)
+        self.progress_bar.pack(side="left")
+
+        log_frame = ttk.LabelFrame(parent, text="Log")
+        log_frame.pack(fill="both", expand=True, **pad)
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, state="disabled", height=14, wrap="word",
+            bg=_theme_color("neutral_100"), fg=_theme_color("neutral_900"),
+            insertbackground=_theme_color("neutral_900"),
+            selectbackground=_theme_color("primary_300"))
+        self.log_text.pack(fill="both", expand=True)
+
+        self._update_mode_visibility()
+
+    # -----------------------------------------------------------------
+    # Mode/path helpers
+    # -----------------------------------------------------------------
+
+    def _update_mode_visibility(self):
+        """Toggle the batch table for File list (batch) mode. Always
+        re-anchored via after=self._source_frame (see RunTabController's
+        _update_path_label for the same pattern), so showing/hiding it
+        never reorders Parameters/Run/Log below it."""
+        mode = self.mode_var.get()
+        self.batch_frame.pack_forget()
+        if mode == TRANSLATE_MODES[1]:  # File list (batch)
+            self.path_label.config(text="Or existing list.txt:")
+            self.batch_frame.pack(fill="both", expand=True, padx=8, pady=4, after=self._source_frame)
+        elif mode == TRANSLATE_MODES[2]:  # Folder (auto-discover)
+            self.path_label.config(text="Folder:")
+        else:
+            self.path_label.config(text="File:")
+
+    def _browse_path(self):
+        mode = self.mode_var.get()
+        if mode == TRANSLATE_MODES[2]:
+            path = filedialog.askdirectory(title="Select folder")
+        elif mode == TRANSLATE_MODES[1]:
+            path = filedialog.askopenfilename(
+                title="Select list.txt", filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        else:
+            exts = sorted(doc_translate.TRANSLATABLE_EXTENSIONS)
+            pattern = " ".join(f"*{e}" for e in exts)
+            path = filedialog.askopenfilename(
+                title="Select file to translate",
+                filetypes=[("Supported documents", pattern), ("All files", "*.*")])
+        if path:
+            self.path_var.set(path)
+
+    def _browse_output_dir(self):
+        path = filedialog.askdirectory(title="Select output folder")
+        if path:
+            self.output_dir_var.set(path)
+
+    # -----------------------------------------------------------------
+    # Batch table helpers (File list (batch) mode)
+    # -----------------------------------------------------------------
+
+    def _batch_add_files(self):
+        exts = sorted(doc_translate.TRANSLATABLE_EXTENSIONS)
+        pattern = " ".join(f"*{e}" for e in exts)
+        paths = filedialog.askopenfilenames(
+            title="Add files to translate",
+            filetypes=[("Supported documents", pattern), ("All files", "*.*")])
+        for p in paths:
+            self.batch_tree.insert("", "end", values=(p, ""))
+
+    def _batch_remove_selected(self):
+        for iid in self.batch_tree.selection():
+            self.batch_tree.delete(iid)
+
+    def _batch_clear(self):
+        for iid in self.batch_tree.get_children():
+            self.batch_tree.delete(iid)
+
+    def _on_batch_double_click(self, event):
+        region = self.batch_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        iid = self.batch_tree.identify_row(event.y)
+        if not iid:
+            return
+        file_path = self.batch_tree.item(iid, "values")[0]
+        if file_path:
+            self.app._open_path(Path(file_path).parent)
+
+    def _batch_load_path(self):
+        path = filedialog.askopenfilename(
+            title="Load file list", filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Could not read file", str(exc))
+            return
+        added = 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            self.batch_tree.insert("", "end", values=(line, ""))
+            added += 1
+        messagebox.showinfo("Loaded", f"Added {added} file(s).")
+
+    def _batch_save_path(self):
+        path = filedialog.asksaveasfilename(
+            title="Save file list", defaultextension=".txt", filetypes=[("Text", "*.txt")])
+        if not path:
+            return
+        lines = [self.batch_tree.item(iid, "values")[0] for iid in self.batch_tree.get_children()]
+        try:
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        messagebox.showinfo("Saved", f"Saved {len(lines)} file(s) to:\n{path}")
+
+    # -----------------------------------------------------------------
+    # Run
+    # -----------------------------------------------------------------
+
+    def _on_run(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Busy", "A translation is already in progress.")
+            return
+
+        mode = self.mode_var.get()
+        path = self.path_var.get().strip()
+        target_language = self.target_language_var.get()
+        output_dir = self.output_dir_var.get().strip()
+        overrides = {"translate_ocr_language": self.ocr_language_var.get()}
+        if output_dir:
+            overrides["output_dir_override"] = output_dir
+
+        batch_paths = None
+        self._batch_run_iids = []
+        if mode == TRANSLATE_MODES[1]:
+            rows = list(self.batch_tree.get_children())
+            batch_paths = [self.batch_tree.item(iid, "values")[0] for iid in rows
+                          if self.batch_tree.item(iid, "values")[0]]
+            if not batch_paths and not path:
+                messagebox.showwarning(
+                    "Missing input",
+                    "Add files to the table above, or choose an existing list.txt.")
+                return
+            if batch_paths:
+                self._batch_run_iids = rows
+                for iid in rows:
+                    self.batch_tree.set(iid, "status", "")
+        elif not path:
+            messagebox.showwarning("Missing input", "Please choose a file/folder first.")
+            return
+
+        self._clear_log()
+        self.run_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.stop_event.clear()
+        self.status_label.config(text="Translating...")
+        self.progress_var.set(0)
+
+        self.worker_thread = threading.Thread(
+            target=self._run_worker, args=(mode, path, target_language, overrides, batch_paths),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _on_stop(self):
+        self.stop_event.set()
+        self.stop_button.config(state="disabled")
+        self.status_label.config(text="Stopping (finishing current file)...")
+
+    def _run_worker(self, mode: str, path: str, target_language: str, overrides: dict,
+                    batch_paths: list | None):
+        handler = QueueLogHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        level = getattr(logging, self.app.log_level_var.get().upper(), logging.INFO)
+        root_logger.setLevel(level)
+        try:
+            if batch_paths:
+                self._run_batch_paths(batch_paths, target_language, overrides)
+            elif mode == TRANSLATE_MODES[1]:
+                run_pipeline.translate_file_list(
+                    path, target_language, overrides,
+                    stop_check=self.stop_event.is_set, progress_callback=self._on_batch_progress)
+            elif mode == TRANSLATE_MODES[2]:
+                run_pipeline.translate_batch_folder(
+                    path, target_language, overrides,
+                    stop_check=self.stop_event.is_set, progress_callback=self._on_batch_progress)
+            else:
+                dest = run_pipeline.translate_single_file(path, target_language, overrides)
+                self.log_queue.put(f"=== TRANSLATION DONE: {dest} ===")
+        except Exception as exc:
+            self.log_queue.put(f"FATAL ERROR: {exc}")
+            import traceback
+            self.log_queue.put(traceback.format_exc())
+        finally:
+            root_logger.removeHandler(handler)
+            self.log_queue.put("__RUN_COMPLETE__")
+
+    def _run_batch_paths(self, batch_paths: list, target_language: str, overrides: dict):
+        """Translate the GUI batch table's rows directly (not via a
+        list.txt written to disk first), mirroring translate_file_list's
+        per-file try/except + progress-callback behaviour."""
+        cfg = run_pipeline.build_run_config(overrides)
+        translate_fn = run_pipeline._make_translate_fn(cfg, target_language)
+        ok, errors = 0, 0
+        total = len(batch_paths)
+        for i, file_path in enumerate(batch_paths, 1):
+            if self.stop_event.is_set():
+                self.log_queue.put(f"Stop requested - halting after {i - 1}/{total} file(s).")
+                break
+            self._on_batch_progress(i, "running")
+            try:
+                dest = doc_translate.translate_file(
+                    file_path, target_language, translate_fn,
+                    output_dir_override=cfg.get("output_dir_override", ""),
+                    ocr_lang=run_pipeline._resolve_ocr_language(cfg))
+                self.log_queue.put(f"[{i}/{total}] OK: {Path(file_path).name} -> {dest.name}")
+                ok += 1
+                self._on_batch_progress(i, "done")
+            except Exception as e:
+                self.log_queue.put(f"[{i}/{total}] ERROR: {Path(file_path).name} -- {e}")
+                errors += 1
+                self._on_batch_progress(i, "failed")
+        self.log_queue.put(f"=== TRANSLATION BATCH DONE: OK={ok} Errors={errors} ===")
+
+    def _on_batch_progress(self, index: int, status: str):
+        self.log_queue.put(f"__BATCH_STATUS__:{index}:{status}")
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+    def _poll_log_queue(self):
+        try:
+            while True:
+                line = self.log_queue.get_nowait()
+                if line == "__RUN_COMPLETE__":
+                    self.run_button.config(state="normal")
+                    self.stop_button.config(state="disabled")
+                    self.stop_event.clear()
+                    self.status_label.config(text="Ready.")
+                    self.progress_var.set(0)
+                    continue
+                if line.startswith("__BATCH_STATUS__:"):
+                    try:
+                        _, idx_str, status = line.split(":", 2)
+                        idx = int(idx_str) - 1
+                        if 0 <= idx < len(self._batch_run_iids):
+                            self.batch_tree.set(self._batch_run_iids[idx], "status", status)
+                    except (ValueError, IndexError):
+                        pass
+                    continue
+                self.log_text.config(state="normal")
+                self.log_text.insert("end", line + "\n")
+                self.log_text.see("end")
+                self.log_text.config(state="disabled")
+        except queue.Empty:
+            pass
+        self.app.root.after(100, self._poll_log_queue)
+
+
 class KnownSpeakersDialog(tk.Toplevel):
     """
     Modal window (task #82): manage the global known_speakers roster
@@ -2667,21 +3631,65 @@ class SpeakerRenameDialog(tk.Toplevel):
     the global known_speakers roster, pre-filling the name field when a
     match clears the configured threshold and always showing the
     confidence next to it. Each row also gets a "Play sample" button that
-    extracts and plays that speaker's longest segment (ffmpeg + the
-    system default player, via the same _open_path used elsewhere) so the
-    suggestion can be confirmed by ear before accepting it. On Apply, any
-    name the user settled on is committed back into known_speakers
+    extracts and plays up to CONFIG["speaker_sample_seconds"] of that
+    speaker's speech (speaker_id.extract_speaker_sample_clip, longest
+    segments first, concatenated if needed) so the suggestion can be
+    confirmed by ear before accepting it. On Apply, any name the user
+    settled on is committed back into known_speakers
     (run_pipeline.commit_speaker_identities) in the same worker thread
     that performs the actual local rename.
+
+    V1.27 additions: an "Improve audio" button next to Play sample runs
+    the sample clip through the same ffmpeg cleanup filter chain as the
+    opt-in pre-transcription enhance_audio pass (highpass + mild denoise
+    + loudness normalization, see transcriber.enhance_audio) before
+    playing it - useful when a quiet or noisy speaker is hard to judge by
+    ear from the raw sample. Both buttons now play via ffplay
+    (config.get_ffplay_path: a bundled ffmpeg\\bin\\ or PATH, windowless,
+    -autoexit) instead of handing the clip to the OS's default app for
+    .wav (_play_audio on the App class), falling back to that default
+    app only if ffplay isn't available.
+
+    V1.28 additions:
+    - "Stop playback" (bottom button row) stops whatever sample is
+      currently playing (App._stop_audio) - also called automatically
+      whenever a new sample starts playing, and when this dialog closes.
+    - "Edit sample..." per row opens SampleEditDialog, listing the
+      chunks speaker_id.select_sample_segments picked for that speaker
+      (chronologically, with their time range) so individual ones can be
+      removed (e.g. cross-talk, noise, a diarization mix-up) before
+      re-rendering (speaker_id.render_sample_clip) and replaying the
+      clip. The active (possibly user-edited) segment list per label is
+      cached in self._sample_segments so Play sample/Improve audio reuse
+      it instead of recomputing the original, unedited selection.
+
+    V1.30 additions (task #95): each row's name field is now a Combobox
+    rather than a plain Entry, pre-populated with the real invitee names
+    from this recording's loaded meeting info (an .ics calendar invite
+    or a "Invitees:" line - see RunTabController._get_invitee_names),
+    when any were loaded. This puts the actual people invited to the
+    meeting ahead of a blind guess without ever auto-assigning a
+    specific name to a specific speaker (that would require knowing who
+    spoke, which nothing here can determine acoustically). If a
+    voiceprint suggestion's name matches one of the invitees (case-
+    insensitively), the prefilled text is snapped to the invitee's exact
+    spelling/casing.
     """
 
     def __init__(self, controller, segments_json_path: str, labels: list,
-                 source_media_path: str | None = None):
+                 source_media_path: str | None = None,
+                 invitee_names: list | None = None):
         super().__init__(controller.root)
         _style_toplevel(self)
         self.controller = controller
         self.segments_json_path = segments_json_path
         self.source_media_path = source_media_path
+        # Task #95: real invitee names from the calendar invite/meeting
+        # info loaded for this recording (if any) - offered as a pick-list
+        # in each row's Combobox, ahead of a blind guess, and used to snap
+        # a voiceprint suggestion to its correctly-spelled/-cased form
+        # when the two agree (see _poll_suggestions_queue).
+        self._invitee_names = invitee_names or []
         self.title("Rename Speakers")
         self.resizable(False, False)
         self.transient(controller.root)
@@ -2690,6 +3698,11 @@ class SpeakerRenameDialog(tk.Toplevel):
         self._suggestions: dict = {}
         self._suggestions_queue: queue.Queue = queue.Queue()
         self._sample_dir = tempfile.mkdtemp(prefix="tnp_speaker_samples_")
+        # label -> list of {"start", "end"} dicts actually in use for that
+        # speaker's preview clip: the original speaker_id.select_sample_segments
+        # pick until "Edit sample..." (SampleEditDialog) removes some, at
+        # which point this is the edited list instead (V1.28).
+        self._sample_segments: dict = {}
 
         ttk.Label(self, text=f"File: {Path(segments_json_path).name}",
                  foreground="#666").pack(anchor="w", padx=10, pady=(10, 4))
@@ -2705,7 +3718,8 @@ class SpeakerRenameDialog(tk.Toplevel):
             ttk.Label(rows_frame, text=label, width=16).grid(row=i, column=0, sticky="w", pady=2)
             ttk.Label(rows_frame, text="->").grid(row=i, column=1, padx=6)
             var = tk.StringVar(value=label)
-            ttk.Entry(rows_frame, textvariable=var, width=20).grid(row=i, column=2, sticky="w")
+            ttk.Combobox(rows_frame, textvariable=var, width=18,
+                        values=self._invitee_names).grid(row=i, column=2, sticky="w")
             self._vars[label] = var
             suggestion_var = tk.StringVar(value="")
             ttk.Label(rows_frame, textvariable=suggestion_var, foreground="#666",
@@ -2713,6 +3727,10 @@ class SpeakerRenameDialog(tk.Toplevel):
             self._suggestion_vars[label] = suggestion_var
             ttk.Button(rows_frame, text="Play sample", width=11,
                       command=lambda l=label: self._play_sample(l)).grid(row=i, column=4, padx=(8, 0))
+            ttk.Button(rows_frame, text="Improve audio", width=13,
+                      command=lambda l=label: self._improve_audio(l)).grid(row=i, column=5, padx=(6, 0))
+            ttk.Button(rows_frame, text="Edit sample...", width=13,
+                      command=lambda l=label: self._edit_sample(l)).grid(row=i, column=6, padx=(6, 0))
 
         self.regenerate_notes_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self, text="Also regenerate notes with the new names",
@@ -2726,6 +3744,8 @@ class SpeakerRenameDialog(tk.Toplevel):
         btn_row.pack(fill="x", padx=10, pady=10)
         ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="right")
         ttk.Button(btn_row, text="Cancel", command=self._on_close).pack(side="right", padx=(0, 6))
+        ttk.Button(btn_row, text="Stop playback",
+                  command=self.controller.app._stop_audio).pack(side="left")
 
         # Tracks whether _compute_suggestions_worker is still running (V1.20),
         # and the error text if it already finished but failed (V1.21).
@@ -2740,16 +3760,20 @@ class SpeakerRenameDialog(tk.Toplevel):
         self._suggestions_pending = False
         self._suggestions_error: str | None = None
 
+        invitee_note = (f" {len(self._invitee_names)} invitee(s) from the loaded meeting info "
+                        f"are offered in each name field's dropdown." if self._invitee_names else "")
         if self.controller.app.enable_speaker_id_var.get():
             if self.source_media_path and Path(self.source_media_path).exists():
                 self._suggestions_pending = True
-                self._status_var.set("Computing voiceprint suggestions...")
+                self._status_var.set("Computing voiceprint suggestions..." + invitee_note)
                 threading.Thread(target=self._compute_suggestions_worker, daemon=True).start()
                 self.after(200, self._poll_suggestions_queue)
             else:
                 self._status_var.set(
                     "Source media not found next to this transcript - voiceprint "
-                    "suggestions unavailable, renaming still works.")
+                    "suggestions unavailable, renaming still works." + invitee_note)
+        elif self._invitee_names:
+            self._status_var.set("Voiceprint speaker ID is off." + invitee_note)
 
     def _compute_suggestions_worker(self):
         try:
@@ -2777,19 +3801,28 @@ class SpeakerRenameDialog(tk.Toplevel):
             return
         self._suggestions = payload
         threshold = self.controller.app.speaker_id_threshold_var.get()
+        invitees_lower = {n.lower(): n for n in self._invitee_names}
         for label, info in payload.items():
             suggestion_var = self._suggestion_vars.get(label)
             if suggestion_var is None:
                 continue
             if info["suggested_name"]:
-                suggestion_var.set(f"suggests: {info['suggested_name']} ({info['score']:.2f})")
+                # Task #95: snap to the invitee's exact spelling/casing
+                # when the voiceprint match and a real invitee agree -
+                # never invents a name outright, only corrects one
+                # already suggested by the roster match.
+                suggested_name = invitees_lower.get(info["suggested_name"].lower(), info["suggested_name"])
+                suggestion_var.set(f"suggests: {suggested_name} ({info['score']:.2f})")
                 entry_var = self._vars.get(label)
                 if entry_var is not None and entry_var.get() == label:
-                    entry_var.set(info["suggested_name"])
+                    entry_var.set(suggested_name)
             elif info["score"] > 0:
                 suggestion_var.set(f"closest match {info['score']:.2f} (below threshold {threshold:.2f})")
             else:
-                suggestion_var.set("no match - looks like a new speaker")
+                if self._invitee_names:
+                    suggestion_var.set("no match - pick a name from the invitee list")
+                else:
+                    suggestion_var.set("no match - looks like a new speaker")
         self._status_var.set(f"Voiceprint suggestions ready for {len(payload)} speaker(s).")
 
     def _play_sample(self, label: str):
@@ -2802,22 +3835,122 @@ class SpeakerRenameDialog(tk.Toplevel):
 
     def _play_sample_worker(self, label: str):
         try:
-            segments = json.loads(Path(self.segments_json_path).read_text(encoding="utf-8"))
+            picked = self._get_active_segments(label)
+            if not picked:
+                self.after(0, lambda: messagebox.showinfo(
+                    "No sample available",
+                    f"Could not extract an audio sample for {label} "
+                    f"(no long-enough segment found, or ffmpeg is not installed)."))
+                return
             clip_path = str(Path(self._sample_dir) / f"{label}.wav")
-            result = speaker_id.extract_speaker_sample_clip(
-                self.source_media_path, segments, label, clip_path)
+            result = speaker_id.render_sample_clip(self.source_media_path, picked, clip_path)
         except Exception as exc:
-            self.after(0, lambda: messagebox.showerror("Playback failed", str(exc)))
+            # str(exc) must be captured here, not inside the lambda: "except
+            # ... as exc" implicitly deletes exc when this block exits, and
+            # self.after(0, ...) only runs the lambda later, once tkinter's
+            # event loop gets to it - by then exc no longer exists in this
+            # scope, raising NameError instead of showing the real error.
+            err_msg = str(exc)
+            self.after(0, lambda: messagebox.showerror("Playback failed", err_msg))
             return
         if result:
-            self.after(0, lambda: self.controller.app._open_path(Path(result)))
+            self.after(0, lambda: self.controller.app._play_audio(Path(result)))
         else:
             self.after(0, lambda: messagebox.showinfo(
                 "No sample available",
                 f"Could not extract an audio sample for {label} "
                 f"(no long-enough segment found, or ffmpeg is not installed)."))
 
+    def _get_active_segments(self, label: str) -> list:
+        """Returns the segment list currently in use for label's preview
+        clip: the cached, possibly user-edited (SampleEditDialog) list if
+        one already exists for this dialog session, else the original
+        speaker_id.select_sample_segments pick (computed and cached here
+        for the first time). Both Play sample/Improve audio and
+        "Edit sample..." go through this so an edit made via one button
+        is reflected the next time either of the others is used."""
+        if label in self._sample_segments:
+            return self._sample_segments[label]
+        segments = json.loads(Path(self.segments_json_path).read_text(encoding="utf-8"))
+        picked = speaker_id.select_sample_segments(
+            segments, label, max_duration=CONFIG.get("speaker_sample_seconds", 15.0))
+        self._sample_segments[label] = picked
+        return picked
+
+    def _edit_sample(self, label: str):
+        """"Edit sample..." button (V1.28): opens SampleEditDialog over
+        the segments _get_active_segments picked for label, so individual
+        chunks (e.g. cross-talk, noise, a diarization mix-up) can be
+        removed before re-rendering the preview clip."""
+        if not self.source_media_path or not Path(self.source_media_path).exists():
+            messagebox.showinfo(
+                "No source media",
+                "The original audio/video file was not found next to this transcript.")
+            return
+        picked = self._get_active_segments(label)
+        if not picked:
+            messagebox.showinfo(
+                "No sample available",
+                f"Could not find any usable segment for {label} to edit.")
+            return
+        SampleEditDialog(self, label, picked)
+
+    def _improve_audio(self, label: str):
+        """"Improve audio" button (V1.27): runs the same ffmpeg cleanup
+        filter chain used for the opt-in pre-transcription enhance_audio
+        pass (highpass + mild denoise + loudness normalization, see
+        transcriber.enhance_audio) on that speaker's sample clip instead
+        of the raw extract, then plays the cleaned result - useful when a
+        quiet/noisy speaker is hard to judge by ear from the raw sample."""
+        if not self.source_media_path or not Path(self.source_media_path).exists():
+            messagebox.showinfo(
+                "No source media",
+                "The original audio/video file was not found next to this transcript.")
+            return
+        threading.Thread(target=self._improve_audio_worker, args=(label,), daemon=True).start()
+
+    def _improve_audio_worker(self, label: str):
+        try:
+            picked = self._get_active_segments(label)
+            if not picked:
+                self.after(0, lambda: messagebox.showinfo(
+                    "No sample available",
+                    f"Could not extract an audio sample for {label} "
+                    f"(no long-enough segment found, or ffmpeg is not installed)."))
+                return
+            # Always re-render from the current active segment list (rather
+            # than reusing a cached raw_clip file) so an edit made via
+            # "Edit sample..." since the last Improve audio click is
+            # reflected here too, not just in Play sample.
+            raw_clip = Path(self._sample_dir) / f"{label}.wav"
+            result = speaker_id.render_sample_clip(self.source_media_path, picked, str(raw_clip))
+            if not result:
+                self.after(0, lambda: messagebox.showinfo(
+                    "No sample available",
+                    f"Could not extract an audio sample for {label} "
+                    f"(no long-enough segment found, or ffmpeg is not installed)."))
+                return
+            enhanced_clip = Path(self._sample_dir) / f"{label}_enhanced.wav"
+            enhanced_ok = run_pipeline.transcriber.enhance_audio(str(raw_clip), str(enhanced_clip))
+        except Exception as exc:
+            # See _play_sample_worker's except block: capture the message
+            # now, since "except ... as exc" deletes exc as soon as this
+            # block exits, before the deferred self.after(0, ...) lambda
+            # ever runs.
+            err_msg = str(exc)
+            self.after(0, lambda: messagebox.showerror("Improve audio failed", err_msg))
+            return
+        if enhanced_ok:
+            self.after(0, lambda: self.controller.app._play_audio(enhanced_clip))
+        else:
+            self.after(0, lambda: messagebox.showinfo(
+                "Enhancement unavailable",
+                "Could not enhance this clip (ffmpeg not found, or the filter pass "
+                "failed) - playing the original sample instead."))
+            self.after(0, lambda: self.controller.app._play_audio(raw_clip))
+
     def _on_close(self):
+        self.controller.app._stop_audio()
         shutil.rmtree(self._sample_dir, ignore_errors=True)
         self.destroy()
 
@@ -2852,6 +3985,7 @@ class SpeakerRenameDialog(tk.Toplevel):
         segments_json_path = self.segments_json_path
         speaker_suggestions = self._suggestions
         db_path = self.controller.app.db_path_var.get().strip() or CONFIG["db_path"]
+        self.controller.app._stop_audio()
         shutil.rmtree(self._sample_dir, ignore_errors=True)
         self.destroy()
 
@@ -2869,6 +4003,415 @@ class SpeakerRenameDialog(tk.Toplevel):
             daemon=True,
         )
         c.worker_thread.start()
+
+
+class SampleEditDialog(tk.Toplevel):
+    """
+    "Edit sample..." dialog (V1.28), opened from SpeakerRenameDialog:
+    lets the user remove one or more of the chunks that make up a
+    speaker's preview clip (speaker_id.select_sample_segments's pick, or
+    a previously-edited subset of it) before naming them - e.g. a chunk
+    that turned out to be cross-talk, background noise, or another
+    speaker bleeding through from a diarization mistake.
+
+    Segments are listed chronologically with their time range and
+    duration in a multi-select Listbox; "Remove selected" drops them
+    from THIS dialog's working copy only (does not touch the transcript/
+    segments.json - purely affects the preview clip); "Rebuild & play"
+    re-renders the clip from whatever remains (speaker_id.render_sample_clip)
+    via App._play_audio, and commits the edited list back into the
+    parent SpeakerRenameDialog's _sample_segments cache so Play sample/
+    Improve audio pick it up too from then on. Closing without rebuilding
+    leaves the parent's cached selection unchanged.
+    """
+
+    def __init__(self, parent_dialog, label: str, segments: list):
+        super().__init__(parent_dialog)
+        _style_toplevel(self)
+        self.parent_dialog = parent_dialog
+        self.label = label
+        self.segments = [dict(s) for s in segments]  # working copy, chronological
+        self.title(f"Edit sample - {label}")
+        self.resizable(False, False)
+        self.transient(parent_dialog)
+
+        ttk.Label(
+            self, text="Remove any part(s) you don't want in this speaker's preview "
+                       "clip (e.g. cross-talk, noise, another speaker mixed in), then "
+                       "rebuild and listen.",
+            wraplength=380).pack(anchor="w", padx=10, pady=(10, 6))
+
+        self._listbox = tk.Listbox(self, selectmode="extended", width=48, height=8)
+        self._listbox.pack(padx=10, pady=(0, 6), fill="both", expand=True)
+        self._reload_listbox()
+
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._status_var, foreground="#666",
+                 wraplength=380).pack(anchor="w", padx=10, pady=(0, 4))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_row, text="Remove selected",
+                  command=self._remove_selected).pack(side="left")
+        ttk.Button(btn_row, text="Stop playback",
+                  command=self.parent_dialog.controller.app._stop_audio).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(btn_row, text="Rebuild && play",
+                  command=self._rebuild_and_play).pack(side="right", padx=(0, 6))
+
+    def _reload_listbox(self):
+        self._listbox.delete(0, "end")
+        for seg in self.segments:
+            duration = seg["end"] - seg["start"]
+            self._listbox.insert(
+                "end", f"{seg['start']:.1f}s - {seg['end']:.1f}s   ({duration:.1f}s)")
+
+    def _remove_selected(self):
+        idxs = sorted(self._listbox.curselection(), reverse=True)
+        if not idxs:
+            return
+        for i in idxs:
+            del self.segments[i]
+        self._reload_listbox()
+        self._status_var.set(f"{len(self.segments)} part(s) remaining - "
+                             f"click \"Rebuild && play\" to hear the result.")
+
+    def _rebuild_and_play(self):
+        if not self.segments:
+            messagebox.showinfo(
+                "Nothing left", "At least one part must remain - close this dialog "
+                                "instead if you want to discard the whole sample.")
+            return
+        self._status_var.set("Rebuilding...")
+        threading.Thread(target=self._rebuild_worker, daemon=True).start()
+
+    def _rebuild_worker(self):
+        try:
+            clip_path = str(Path(self.parent_dialog._sample_dir) / f"{self.label}.wav")
+            result = speaker_id.render_sample_clip(
+                self.parent_dialog.source_media_path, self.segments, clip_path)
+            if result:
+                # Invalidate any stale enhanced version so a later "Improve
+                # audio" click regenerates it from this edited clip rather
+                # than replaying an enhancement of the old, unedited one.
+                enhanced = Path(self.parent_dialog._sample_dir) / f"{self.label}_enhanced.wav"
+                enhanced.unlink(missing_ok=True)
+                self.parent_dialog._sample_segments[self.label] = [dict(s) for s in self.segments]
+        except Exception as exc:
+            # See SpeakerRenameDialog._play_sample_worker's except block:
+            # capture the message now, since "except ... as exc" deletes
+            # exc as soon as this block exits, before the deferred
+            # self.after(0, ...) lambda ever runs.
+            err_msg = str(exc)
+            self.after(0, lambda: messagebox.showerror("Rebuild failed", err_msg))
+            return
+        if result:
+            self.after(0, lambda: self.parent_dialog.controller.app._play_audio(Path(result)))
+            self.after(0, lambda: self._status_var.set(
+                f"Rebuilt from {len(self.segments)} part(s) and playing."))
+        else:
+            self.after(0, lambda: messagebox.showerror(
+                "Rebuild failed", "ffmpeg extraction failed - see the log for details."))
+
+
+class SpeakerRosterReviewDialog(tk.Toplevel):
+    """
+    Review & listen to a batch speaker roster JSON (V1.29, task #92
+    export via run_pipeline.export_speaker_roster_json) before typing in
+    names or applying it. Lists every speaker across every file in one
+    scrollable Treeview (recording, label, voiceprint suggestion, sample
+    availability, current name) instead of requiring the JSON to be
+    hand-edited in a text editor and each .wav double-clicked in
+    Explorer separately (still possible as a fallback, just no longer
+    the only way).
+
+    Sample clips were already extracted to disk by the export step (one
+    "<recording>__<label>.wav" per speaker, path in each entry's
+    "sample_clip") - this dialog only ever plays those existing files
+    via App._play_audio (ffplay); it never re-renders anything, unlike
+    SpeakerRenameDialog/SampleEditDialog which build clips on demand from
+    a single file's segments.
+
+    Workflow: select a row (or let "Auto-play on select" do it for you),
+    listen, type the name in the Name field, press Enter - the name is
+    committed into the loaded JSON structure in memory and the dialog
+    advances to the next row automatically, so a whole batch can be
+    named without touching the mouse beyond scrolling. "Next unnamed"
+    jumps ahead to the next speaker whose name is still blank (or still
+    just the raw label), skipping ones already reviewed. "Save" writes
+    the edited roster back to its JSON file in the same structure
+    apply_speaker_roster_json expects; "Save && Apply now" does that and
+    then runs apply_speaker_roster_json immediately, in the background,
+    in one step.
+    """
+
+    def __init__(self, app, json_path: str):
+        super().__init__(app.root)
+        _style_toplevel(self)
+        self.app = app
+        self.json_path = json_path
+        self.title(f"Review Speaker Roster - {Path(json_path).name}")
+        self.geometry("900x580")
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._dirty = False
+        self._rows: list = []  # parallel to Treeview iids ("0", "1", ...): the actual
+                                # speaker-entry dicts from self._payload, edited in place.
+
+        try:
+            self._payload = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not load roster", str(exc), parent=app.root)
+            self.destroy()
+            return
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text=f"File: {Path(json_path).name}", foreground="#666").pack(side="left")
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self._status_var, foreground="#666").pack(side="right")
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        columns = ("recording", "label", "suggested", "sample", "name")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=18)
+        headers = {
+            "recording": ("Recording", 220), "label": ("Label", 100),
+            "suggested": ("Suggested (score)", 170), "sample": ("Sample", 60),
+            "name": ("Name", 190),
+        }
+        for col, (text, width) in headers.items():
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.tree.tag_configure("named", foreground=_theme_color("primary_700"))
+        self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
+        self.tree.bind("<Double-1>", lambda e: self._play_selected())
+
+        name_row = ttk.Frame(self)
+        name_row.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(name_row, text="Name:").pack(side="left")
+        self.name_var = tk.StringVar(value="")
+        self.name_entry = ttk.Entry(name_row, textvariable=self.name_var, width=32)
+        self.name_entry.pack(side="left", padx=(6, 6))
+        self.name_entry.bind("<Return>", lambda e: self._apply_and_advance())
+        ttk.Button(name_row, text="Apply", command=self._apply_and_advance).pack(side="left")
+        ttk.Button(name_row, text="Play sample", command=self._play_selected).pack(
+            side="left", padx=(12, 0))
+        ttk.Button(name_row, text="Stop playback", command=self.app._stop_audio).pack(
+            side="left", padx=(6, 0))
+        self.autoplay_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(name_row, text="Auto-play on select", variable=self.autoplay_var).pack(
+            side="left", padx=(12, 0))
+
+        nav_row = ttk.Frame(self)
+        nav_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(nav_row, text="Next unnamed", command=self._select_next_unnamed).pack(side="left")
+        ttk.Label(nav_row, text="Jumps to the next speaker whose name is still blank.",
+                 foreground="#666").pack(side="left", padx=(8, 0))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_row, text="Close", command=self._on_close).pack(side="right")
+        ttk.Button(btn_row, text="Save", command=self._save).pack(side="right", padx=(0, 6))
+        ttk.Button(btn_row, text="Save && Apply now", command=self._save_and_apply).pack(
+            side="right", padx=(0, 6))
+
+        self._reload_tree()
+        if self._rows:
+            self._select_index(0)
+
+    # -----------------------------------------------------------------
+    # Populating / refreshing the Treeview
+    # -----------------------------------------------------------------
+
+    def _reload_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self._rows = []
+        for file_entry in self._payload.get("files", []):
+            recording = (Path(file_entry.get("segments_json", "")).stem.replace("_segments", "")
+                        or file_entry.get("output_prefix", ""))
+            for speaker_entry in file_entry.get("speakers", []):
+                iid = str(len(self._rows))
+                self._rows.append(speaker_entry)
+                self._insert_row(iid, recording, speaker_entry)
+        self._update_status()
+
+    def _insert_row(self, iid: str, recording: str, speaker_entry: dict):
+        suggested = speaker_entry.get("suggested_name")
+        score = speaker_entry.get("score")
+        if suggested and score is not None:
+            suggested_text = f"{suggested} ({score:.2f})"
+        elif score is not None:
+            suggested_text = f"(closest {score:.2f})"
+        else:
+            suggested_text = ""
+        sample_text = "Yes" if speaker_entry.get("sample_clip") else "No"
+        name = speaker_entry.get("name", "")
+        is_named = bool(name) and name != speaker_entry.get("label")
+        self.tree.insert("", "end", iid=iid, values=(
+            recording, speaker_entry.get("label", ""), suggested_text, sample_text, name),
+            tags=("named",) if is_named else ())
+
+    def _refresh_row(self, idx: int):
+        """Re-render one existing row's displayed values/tag from
+        self._rows[idx] after an edit, without touching the others or
+        losing the current scroll position/selection."""
+        iid = str(idx)
+        recording = self.tree.item(iid, "values")[0]
+        entry = self._rows[idx]
+        suggested = entry.get("suggested_name")
+        score = entry.get("score")
+        if suggested and score is not None:
+            suggested_text = f"{suggested} ({score:.2f})"
+        elif score is not None:
+            suggested_text = f"(closest {score:.2f})"
+        else:
+            suggested_text = ""
+        sample_text = "Yes" if entry.get("sample_clip") else "No"
+        name = entry.get("name", "")
+        is_named = bool(name) and name != entry.get("label")
+        self.tree.item(iid, values=(
+            recording, entry.get("label", ""), suggested_text, sample_text, name),
+            tags=("named",) if is_named else ())
+
+    def _update_status(self):
+        total = len(self._rows)
+        named = sum(1 for r in self._rows if r.get("name") and r.get("name") != r.get("label"))
+        dirty_marker = "  (unsaved changes)" if self._dirty else ""
+        self._status_var.set(f"{named}/{total} named{dirty_marker}")
+
+    # -----------------------------------------------------------------
+    # Selection / navigation / playback
+    # -----------------------------------------------------------------
+
+    def _current_index(self) -> int | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return int(sel[0])
+
+    def _on_row_selected(self, event=None):
+        idx = self._current_index()
+        if idx is None:
+            return
+        entry = self._rows[idx]
+        self.name_var.set(entry.get("name", ""))
+        if self.autoplay_var.get():
+            self._play_selected()
+
+    def _play_selected(self):
+        idx = self._current_index()
+        if idx is None:
+            return
+        entry = self._rows[idx]
+        clip = entry.get("sample_clip")
+        if not clip or not Path(clip).exists():
+            self._status_var.set("No sample available for this speaker.")
+            return
+        self.app._play_audio(Path(clip))
+
+    def _select_index(self, idx: int):
+        if idx < 0 or idx >= len(self._rows):
+            return
+        iid = str(idx)
+        self.tree.selection_set(iid)
+        self.tree.see(iid)
+        self.name_entry.focus_set()
+
+    def _select_next_unnamed(self):
+        start = (self._current_index() or -1) + 1
+        search_order = list(range(start, len(self._rows))) + list(range(0, start))
+        for idx in search_order:
+            entry = self._rows[idx]
+            name = entry.get("name", "")
+            if not name or name == entry.get("label"):
+                self._select_index(idx)
+                return
+        messagebox.showinfo("All named", "Every speaker already has a name.", parent=self)
+
+    # -----------------------------------------------------------------
+    # Editing / saving / applying
+    # -----------------------------------------------------------------
+
+    def _apply_and_advance(self):
+        idx = self._current_index()
+        if idx is None:
+            return
+        entry = self._rows[idx]
+        new_name = self.name_var.get().strip()
+        if new_name != entry.get("name", ""):
+            entry["name"] = new_name
+            self._dirty = True
+        self._refresh_row(idx)
+        self._update_status()
+        self._select_index(idx + 1)
+
+    def _save(self) -> bool:
+        try:
+            Path(self.json_path).write_text(
+                json.dumps(self._payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self)
+            return False
+        self._dirty = False
+        self._update_status()
+        return True
+
+    def _save_and_apply(self):
+        if not self._save():
+            return
+        regenerate_notes = messagebox.askyesno(
+            "Regenerate notes?",
+            "Also regenerate each file's notes/summary, for files where at least "
+            "one speaker was actually renamed?", parent=self)
+        self.app.root.config(cursor="watch")
+        self.app.root.update()
+        threading.Thread(
+            target=self._apply_worker, args=(regenerate_notes,), daemon=True).start()
+
+    def _apply_worker(self, regenerate_notes: bool):
+        try:
+            result = run_pipeline.apply_speaker_roster_json(
+                self.json_path, regenerate_notes=regenerate_notes)
+        except Exception as exc:
+            # See SpeakerRenameDialog._play_sample_worker's except block:
+            # capture the message now, since "except ... as exc" deletes
+            # exc as soon as this block exits, before the deferred
+            # self.after(0, ...) lambda ever runs.
+            err_msg = str(exc)
+            self.after(0, lambda: self._apply_done(error=err_msg))
+            return
+        self.after(0, lambda: self._apply_done(result=result))
+
+    def _apply_done(self, result: dict | None = None, error: str | None = None):
+        self.app.root.config(cursor="")
+        if error:
+            messagebox.showerror("Apply failed", error, parent=self)
+            return
+        msg = (f"{result['files_updated']} file(s) updated, "
+               f"{result['speakers_renamed']} segment(s) renamed, "
+               f"{result['roster_updates']} roster update(s).")
+        if result["errors"]:
+            details = "\n".join(f"- {e['file']}: {e['error']}" for e in result["errors"][:10])
+            msg += f"\n\n{len(result['errors'])} file(s) failed:\n{details}"
+        messagebox.showinfo("Speaker roster applied", msg, parent=self)
+
+    def _on_close(self):
+        self.app._stop_audio()
+        if self._dirty:
+            proceed = messagebox.askyesnocancel(
+                "Unsaved changes", "Save changes to the roster JSON before closing?",
+                parent=self)
+            if proceed is None:
+                return
+            if proceed and not self._save():
+                return
+        self.destroy()
 
 
 class SlideReviewDialog(tk.Toplevel):

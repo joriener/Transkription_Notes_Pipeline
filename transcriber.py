@@ -14,12 +14,29 @@
 #  a `token=` keyword argument, NOT `whisperx.DiarizationPipeline(
 #  use_auth_token=...)`. Using the wrong form raises a TypeError.
 #
+#  Diarization model (2026-08): explicitly pinned to
+#  pyannote/speaker-diarization-community-1 via DiarizationPipeline's
+#  model_name= argument, rather than relying on whisperx's own internal
+#  default. Free, fully local/offline (no cloud calls, unlike pyannoteAI's
+#  paid "precision-2" model), gated on HuggingFace the same way the
+#  previous default (pyannote/speaker-diarization-3.1) was - accept once
+#  at https://huggingface.co/pyannote/speaker-diarization-community-1
+#  with the same HF_TOKEN already used for 3.1. Benchmarked lower
+#  diarization error rate than 3.1 across every dataset pyannote
+#  publishes (AMI, AliMeeting, VoxConverse, etc. - see the model card).
+#  Note: whisperx>=3.8.6 already defaults to community-1 internally when
+#  model_name is omitted, so relying on that default would have picked
+#  this up silently anyway; pinning it explicitly here means a future
+#  whisperx release changing that default again won't silently change
+#  what this pipeline uses without it showing up in a diff.
+#
 #  Supported languages for alignment (auto-loaded from torchaudio/HF):
 #    en, de, fr, es, it, ja, zh, nl, uk, pt
 # =============================================================
 
 import gc
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +50,22 @@ except ImportError:
 
 SUPPORTED_LANGUAGES = {"en", "de", "fr", "es", "it", "ja", "zh", "nl", "uk", "pt"}
 PRIMARY_LANGUAGES   = {"en", "de"}
+
+# Diarization model - see the module docstring's "Diarization model" note
+# for why this is pinned explicitly rather than left to whisperx's own
+# internal default.
+DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+
+
+def _build_diarization_pipeline(hf_token: str, device):
+    """
+    Construct whisperx's DiarizationPipeline with DIARIZATION_MODEL
+    explicitly pinned. Split out of transcribe() so the model-name choice
+    is unit-testable (monkeypatch whisperx.diarize.DiarizationPipeline)
+    without needing a full transcribe() run - see tests/test_transcriber.py.
+    """
+    from whisperx.diarize import DiarizationPipeline
+    return DiarizationPipeline(model_name=DIARIZATION_MODEL, token=hf_token, device=device)
 
 
 def validate_language(language: str | None) -> str | None:
@@ -132,16 +165,17 @@ def enhance_audio(input_path: str, output_path: str) -> bool:
     fatal to transcription; callers should fall back to the original
     file.
     """
-    import shutil as _shutil
     import subprocess
+    import config
 
-    if _shutil.which("ffmpeg") is None:
-        log.warning("ffmpeg not found in PATH - skipping audio enhancement, "
-                    "using original audio.")
+    ffmpeg_exe = config.get_ffmpeg_path()
+    if ffmpeg_exe is None:
+        log.warning("ffmpeg not found (bundled ffmpeg\\bin\\ or PATH) - skipping "
+                    "audio enhancement, using original audio.")
         return False
 
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
+        ffmpeg_exe, "-y", "-i", str(input_path),
         "-af", "highpass=f=100,afftdn,dynaudnorm",
         "-ar", "16000", "-ac", "1",
         str(output_path),
@@ -252,9 +286,7 @@ def transcribe(
         else:
             try:
                 log.info("Running speaker diarization.")
-                # Correct API for whisperx 3.8.x - see module docstring.
-                from whisperx.diarize import DiarizationPipeline
-                diarize_model = DiarizationPipeline(token=hf_token, device=device)
+                diarize_model = _build_diarization_pipeline(hf_token, device)
                 diarize_kwargs = {}
                 if min_speakers:
                     diarize_kwargs["min_speakers"] = min_speakers
@@ -398,6 +430,85 @@ def write_transcript_files(source_file: str, segments: list[dict], output_prefix
 
     log.info("Transcript saved: %s", paths["speakers"])
     return paths
+
+
+def parse_srt(srt_path: str) -> list[dict]:
+    """
+    Parse a standard .srt subtitle file into the whisperx segment schema
+    ({"start", "end", "text", "speaker", "words"}) used everywhere else in
+    this pipeline (see the module docstring's three-step pipeline and
+    write_transcript_files above). This lets an already-captioned video
+    (e.g. a YouTube download that already has a description.txt + .srt +
+    video file) skip whisperx transcription entirely via process_file's
+    existing cache-aware shortcut - see run_pipeline.import_srt_transcript,
+    which writes this function's output into the same *_segments.json +
+    *_transcript_speakers.txt cache a real transcription run produces.
+
+    Handles:
+      - the standard "index / HH:MM:SS,mmm --> HH:MM:SS,mmm / text..."
+        block form (comma OR period as the fractional separator - both
+        appear in the wild, and YouTube's own downloads use comma).
+      - multi-line cue text (joined into one line with a single space).
+      - inline formatting/positioning tags such as <i>, <b>, <font ...>,
+        {\an8}, and the per-word karaoke timing tags like
+        <00:00:01,234> that YouTube's auto-generated captions embed -
+        all stripped.
+      - consecutive cues with byte-identical text after tag-stripping
+        (common in YouTube's rolling auto-captions, where each new cue
+        repeats the previous line verbatim plus new scrolling words)
+        are collapsed into one, keeping the first cue's start time and
+        the last's end time.
+
+    speaker is always "" (plain .srt carries no speaker labels) and
+    words is always [] (no word-level timing in an .srt) - both are
+    already tolerated by every consumer of this schema (see
+    align_transcript_to_slides, notes generation): they only ever read
+    "start"/"end"/"text"/"speaker" with a get(..., default) fallback for
+    the rest.
+
+    Returns [] if the file has no parseable cues (wrong format, empty
+    file, or a non-SRT file like a raw .vtt with a "WEBVTT" header and
+    no HH:MM:SS,mmm timestamps) - callers must treat that as a hard
+    failure, not a valid empty transcript.
+    """
+    raw = Path(srt_path).read_text(encoding="utf-8-sig")  # tolerate a BOM (common from Windows-saved .srt)
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+    time_re = re.compile(r"(\d{2}):(\d{2}):(\d{2})[.,](\d{3})")
+    tag_re = re.compile(r"<[^>]*>|\{[^}]*\}")
+
+    def _to_sec(groups) -> float:
+        h, m, s, ms = (int(x) for x in groups)
+        return h * 3600 + m * 60 + s + ms / 1000.0
+
+    segments: list[dict] = []
+    for block in re.split(r"\n\s*\n", raw.strip()):
+        lines = [ln for ln in block.split("\n") if ln.strip() != ""]
+        if not lines:
+            continue
+        idx = 1 if lines[0].strip().isdigit() else 0  # skip the numeric cue index, if present
+        if idx >= len(lines):
+            continue
+        tm = re.search(
+            r"(\d{2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3})",
+            lines[idx],
+        )
+        if not tm:
+            continue  # not a cue block (e.g. a "WEBVTT" header line) - skip
+        start = _to_sec(time_re.match(tm.group(1)).groups())
+        end = _to_sec(time_re.match(tm.group(2)).groups())
+        text = " ".join(tag_re.sub("", ln).strip() for ln in lines[idx + 1:])
+        text = " ".join(text.split())
+        if not text:
+            continue
+        if segments and segments[-1]["text"] == text:
+            segments[-1]["end"] = end  # collapse duplicate rolling-caption cue
+            continue
+        segments.append({
+            "start": round(start, 3), "end": round(end, 3),
+            "text": text, "speaker": "", "words": [],
+        })
+    return segments
 
 
 def read_transcript_text(speakers_file: str) -> str:

@@ -10,6 +10,7 @@
 # =============================================================
 
 import importlib
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -40,6 +41,10 @@ REQUIREMENTS = [
     Requirement("playwright", "playwright>=1.45.0",  "Playwright (PDF, preferred)", False),
     Requirement("weasyprint", "weasyprint>=62.0",    "weasyprint (PDF fallback)",   False),
     Requirement("anthropic",  "anthropic>=0.40.0",   "anthropic (Claude backend)",  False),
+    Requirement("pptx",       "python-pptx>=1.0.2",  "python-pptx (Translate tab)", False),
+    Requirement("pypdf",      "pypdf>=4.3.0",        "pypdf (Translate tab, PDF)",  False),
+    Requirement("pytesseract","pytesseract>=0.3.13", "pytesseract (Translate tab, image OCR)", False),
+    Requirement("bs4",        "beautifulsoup4>=4.12.0", "beautifulsoup4 (Translate tab, HTML)", False),
 ]
 
 
@@ -60,6 +65,19 @@ def check_all() -> list[dict]:
     return results
 
 
+def tesseract_binary_found() -> bool:
+    """
+    The pytesseract Python package is only a wrapper - it needs the
+    actual Tesseract-OCR binary installed separately and on PATH
+    (https://github.com/tesseract-ocr/tesseract). Not pip-installable,
+    so not part of REQUIREMENTS/install_missing; checked separately and
+    surfaced as an extra line in format_report/the GUI's requirements
+    output, since "pytesseract: OK" alone would be misleading if the
+    binary itself is missing (image translation would still fail).
+    """
+    return shutil.which("tesseract") is not None
+
+
 def missing_required(results: list[dict] | None = None) -> list[dict]:
     results = results if results is not None else check_all()
     return [r for r in results if r["required"] and not r["installed"]]
@@ -77,6 +95,9 @@ def format_report(results: list[dict] | None = None) -> str:
         mark = "OK  " if r["installed"] else "MISSING "
         tag = "" if r["required"] else " (optional)"
         lines.append(f"  [{mark}] {r['label']}{tag}")
+    mark = "OK  " if tesseract_binary_found() else "MISSING "
+    lines.append(f"  [{mark}] Tesseract-OCR binary on PATH (optional, image translation only, "
+                 "not pip-installable: https://github.com/tesseract-ocr/tesseract)")
     return "\n".join(lines)
 
 

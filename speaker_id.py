@@ -12,8 +12,8 @@
 #  already an installed dependency (whisperx pulls it in for diarization,
 #  see requirements.txt), so speaker ID adds zero new pip packages. It
 #  also reuses the exact hf_token/gated-model-acceptance flow already in
-#  place for pyannote/speaker-diarization-3.1 (see config.py, transcriber.py
-#  known-issues table): accept the terms once at
+#  place for pyannote/speaker-diarization-community-1 (see config.py,
+#  transcriber.py known-issues table): accept the terms once at
 #  https://huggingface.co/pyannote/embedding, same as the diarization model.
 #
 #  Everything in this module that does NOT need torch/pyannote (vector
@@ -28,6 +28,8 @@
 import logging
 
 import numpy as np
+
+import config
 
 log = logging.getLogger(__name__)
 
@@ -240,47 +242,123 @@ def match_speaker(embedding: np.ndarray, known_speakers: list[dict],
 def check_ffmpeg() -> bool:
     """Same check as extractor.check_ffmpeg (video mode), duplicated here
     to keep speaker_id.py's only project-internal dependency being
-    numpy - avoids importing extractor.py (which pulls in Pillow/
-    ImageHash for slide detection, irrelevant to audio-only speaker ID)."""
-    import shutil as _shutil
-    return _shutil.which("ffmpeg") is not None
+    numpy + config - avoids importing extractor.py (which pulls in
+    Pillow/ImageHash for slide detection, irrelevant to audio-only
+    speaker ID). Uses config.get_ffmpeg_path so a bundled ffmpeg\\bin\\
+    next to the project (see config.py) counts too, not just PATH."""
+    return config.get_ffmpeg_path() is not None
+
+
+def select_sample_segments(segments: list[dict], speaker_label: str,
+                            max_duration: float = 15.0) -> list[dict]:
+    """
+    Decide which of speaker_label's own segments to use for a preview
+    clip: longest segments first, taken (and trimmed) until their total
+    approaches max_duration seconds, skipping anything under 0.3s as too
+    short to be useful either alone or concatenated. Returns
+    [{"start": float, "end": float}, ...] sorted chronologically (by
+    start) for display - a stable reading order, distinct from the
+    longest-first order used internally to decide inclusion.
+
+    Pure selection logic, no ffmpeg - split out of the old single
+    extract_speaker_sample_clip (task #81/#92) so the Rename Speakers
+    dialog's "Edit sample" feature (V1.28) can show the user exactly
+    which chunks were picked and let them remove ones they don't want
+    (cross-talk, noise, a diarization mix-up) before render_sample_clip
+    actually extracts audio for them.
+    """
+    own_segments = [s for s in segments if s.get("speaker") == speaker_label]
+    if not own_segments:
+        return []
+
+    # Longest segments first: most informative for voice ID per second
+    # spent listening, and gets us to max_duration with fewer concat
+    # inputs than a chronological pass would need.
+    by_length = sorted(own_segments, key=lambda s: s["end"] - s["start"], reverse=True)
+    picked: list[dict] = []
+    total = 0.0
+    for seg in by_length:
+        if total >= max_duration - 0.05:
+            break
+        start = max(0.0, float(seg["start"]))
+        available = float(seg["end"]) - start
+        take = min(available, max_duration - total)
+        if take < 0.3:
+            continue
+        picked.append({"start": start, "end": start + take})
+        total += take
+
+    picked.sort(key=lambda s: s["start"])
+    return picked
+
+
+def render_sample_clip(source_media_path: str, picked_segments: list[dict],
+                        out_path: str) -> str | None:
+    """
+    Render an already-decided list of {"start", "end"} segments (see
+    select_sample_segments, or that same list with some entries removed
+    by the user via the Rename Speakers dialog's "Edit sample" feature)
+    into out_path via ffmpeg: a single -ss/-t extract for one segment, or
+    the concat filter for several, same as the old extract_speaker_sample_clip
+    did internally.
+
+    Returns out_path on success, or None if picked_segments is empty,
+    ffmpeg is unavailable (bundled or PATH, see config.get_ffmpeg_path),
+    or extraction fails - a missing preview should never be fatal to the
+    renaming workflow itself, so callers show a message rather than raise.
+    """
+    if not picked_segments:
+        return None
+    ffmpeg_exe = config.get_ffmpeg_path()
+    if not ffmpeg_exe:
+        log.warning("ffmpeg not found (bundled ffmpeg\\bin\\ or PATH) - cannot "
+                    "render a speaker sample clip.")
+        return None
+
+    import subprocess
+    if len(picked_segments) == 1:
+        seg = picked_segments[0]
+        start, duration = seg["start"], seg["end"] - seg["start"]
+        cmd = [
+            ffmpeg_exe, "-y", "-ss", str(start), "-i", str(source_media_path),
+            "-t", str(duration), "-vn", "-ac", "1", "-ar", "16000", str(out_path),
+        ]
+    else:
+        # Multiple segments: one -ss/-t/-i triple per segment, stitched
+        # together with the concat filter (audio-only, single output).
+        cmd = [ffmpeg_exe, "-y"]
+        for seg in picked_segments:
+            start, duration = seg["start"], seg["end"] - seg["start"]
+            cmd += ["-ss", str(start), "-t", str(duration), "-i", str(source_media_path)]
+        concat_inputs = "".join(f"[{i}:a]" for i in range(len(picked_segments)))
+        cmd += [
+            "-filter_complex", f"{concat_inputs}concat=n={len(picked_segments)}:v=0:a=1[outa]",
+            "-map", "[outa]", "-ac", "1", "-ar", "16000", str(out_path),
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.warning("ffmpeg sample-clip render failed: %s", result.stderr[-500:])
+        return None
+    return out_path
 
 
 def extract_speaker_sample_clip(source_media_path: str, segments: list[dict],
                                  speaker_label: str, out_path: str,
-                                 max_duration: float = 6.0) -> str | None:
+                                 max_duration: float = 15.0) -> str | None:
     """
-    Extract a short audio clip of speaker_label's longest segment from
+    Extract a short audio clip of speaker_label's speech from
     source_media_path via ffmpeg, for the Rename Speakers dialog's
-    "Play sample" button (task #81).
-
-    Returns out_path on success, or None if speaker_label has no
-    segments, ffmpeg is unavailable, or extraction fails - a missing
-    preview should never be fatal to the renaming workflow itself, so
-    callers show a message rather than raise.
+    "Play sample"/"Improve audio" buttons (task #81) and the batch
+    speaker-roster export's sample_clip files (task #92). Thin
+    convenience wrapper for callers that don't need the intermediate,
+    editable segment list: select_sample_segments (picking rule) then
+    render_sample_clip (ffmpeg extraction) in one call. See those two
+    for details.
     """
-    own_segments = [s for s in segments if s.get("speaker") == speaker_label]
-    if not own_segments:
+    picked = select_sample_segments(segments, speaker_label, max_duration)
+    if not picked:
         return None
-    if not check_ffmpeg():
-        log.warning("ffmpeg not found in PATH - cannot extract a speaker sample clip.")
-        return None
-    longest = max(own_segments, key=lambda s: s["end"] - s["start"])
-    start = max(0.0, float(longest["start"]))
-    duration = min(max_duration, float(longest["end"]) - start)
-    if duration < 0.3:
-        return None
-
-    import subprocess
-    cmd = [
-        "ffmpeg", "-y", "-ss", str(start), "-i", str(source_media_path),
-        "-t", str(duration), "-vn", "-ac", "1", "-ar", "16000", str(out_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.warning("ffmpeg sample-clip extraction failed: %s", result.stderr[-500:])
-        return None
-    return out_path
+    return render_sample_clip(source_media_path, picked, out_path)
 
 
 def update_running_average(old_vector: np.ndarray, old_sample_count: int,

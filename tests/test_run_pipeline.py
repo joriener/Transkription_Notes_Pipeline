@@ -12,6 +12,7 @@
 import base64
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import run_pipeline
 import db
+import anthropic
 
 
 # -----------------------------------------------------------------
@@ -228,6 +230,58 @@ class TestRunBatchRows:
         rows = [{"file": str(tmp_path / "bad.mp4")}, {"file": str(tmp_path / "good.mp4")}]
         run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
         assert len(calls) == 2
+
+    def test_row_srt_import_path_calls_import_before_process_file(self, monkeypatch, tmp_path):
+        """Task: batch YouTube import - a row with srt_import_path set
+        should import the .srt (skipping transcription for that file)
+        BEFORE process_file runs, not instead of it."""
+        self._patch_db(monkeypatch)
+        calls = []
+        monkeypatch.setattr(
+            run_pipeline, "import_srt_transcript",
+            lambda file, srt, overrides: calls.append(("import", file, srt)) or True)
+        monkeypatch.setattr(
+            run_pipeline, "process_file",
+            lambda file, overrides, stop_check=None: calls.append(("process", file)) or True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        rows = [{"file": str(tmp_path / "a.mp4"), "srt_import_path": str(tmp_path / "a.srt")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
+
+        assert calls == [
+            ("import", str(tmp_path / "a.mp4"), str(tmp_path / "a.srt")),
+            ("process", str(tmp_path / "a.mp4")),
+        ]
+
+    def test_row_without_srt_import_path_skips_import_entirely(self, monkeypatch, tmp_path):
+        self._patch_db(monkeypatch)
+        import_calls = []
+        monkeypatch.setattr(
+            run_pipeline, "import_srt_transcript",
+            lambda file, srt, overrides: import_calls.append(file) or True)
+        monkeypatch.setattr(run_pipeline, "process_file",
+                            lambda file, overrides, stop_check=None: True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        rows = [{"file": str(tmp_path / "a.mp4")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
+        assert import_calls == []
+
+    def test_failed_srt_import_skips_file_and_counts_as_error(self, monkeypatch, tmp_path):
+        """A failed import must NOT fall through to a real transcription -
+        that would silently defeat the point of specifying the .srt."""
+        self._patch_db(monkeypatch)
+        process_calls = []
+        monkeypatch.setattr(run_pipeline, "import_srt_transcript",
+                            lambda file, srt, overrides: False)
+        monkeypatch.setattr(
+            run_pipeline, "process_file",
+            lambda file, overrides, stop_check=None: process_calls.append(file) or True)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+        rows = [{"file": str(tmp_path / "a.mp4"), "srt_import_path": str(tmp_path / "a.srt")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
+        assert process_calls == []
 
 
 # -----------------------------------------------------------------
@@ -586,26 +640,53 @@ class TestDeriveHeadingFromFilename:
         assert run_pipeline.derive_heading_from_filename("Meeting_2026-07-04.mp4") == "2026-07-04"
 
 
+class TestExtractDatetimeFromFilename:
+    """extract_datetime_from_filename (task #94): same pattern as
+    derive_heading_from_filename, but returns a real datetime for
+    correlate_calendar_recordings.py to compare against calendar event
+    times, instead of a formatted heading string."""
+
+    def test_date_and_time_extracted(self):
+        result = run_pipeline.extract_datetime_from_filename("Video_2020-04-07_154005.mp4")
+        assert result == datetime(2020, 4, 7, 15, 40, 5)
+
+    def test_compact_date_and_time_extracted(self):
+        result = run_pipeline.extract_datetime_from_filename("20260704_143022_Weekly_Sync.mp4")
+        assert result == datetime(2026, 7, 4, 14, 30, 22)
+
+    def test_date_only_no_time_returns_none(self):
+        # No HHMMSS component - not precise enough to compare against
+        # calendar event times, caller should fall back to file mtime.
+        assert run_pipeline.extract_datetime_from_filename("2026-07-04.wav") is None
+
+    def test_no_date_returns_none(self):
+        assert run_pipeline.extract_datetime_from_filename("random_filename.mp4") is None
+
+    def test_out_of_range_values_return_none_not_raise(self):
+        # Matches the regex shape but is not a real date/time (month 13).
+        assert run_pipeline.extract_datetime_from_filename("20261304_250000.mp4") is None
+
+
 class TestResolveOutputPrefixDateHeading:
     def test_auto_derives_stem_from_filename_date(self):
         cfg = {"use_filename_date_heading": True}
         result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
-        assert result == "/tmp/2020-04-07_154005"
+        assert result == str(Path("/tmp") / "2020-04-07_154005")
 
     def test_disabled_keeps_raw_stem(self):
         cfg = {"use_filename_date_heading": False}
         result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
-        assert result == "/tmp/Video_2020-04-07_154005"
+        assert result == str(Path("/tmp") / "Video_2020-04-07_154005")
 
     def test_basename_override_always_wins(self):
         cfg = {"output_basename_override": "MyCustomName", "use_filename_date_heading": True}
         result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
-        assert result == "/tmp/MyCustomName"
+        assert result == str(Path("/tmp") / "MyCustomName")
 
     def test_no_date_in_filename_falls_back_to_raw_stem(self):
         cfg = {"use_filename_date_heading": True}
         result = run_pipeline.resolve_output_prefix("/tmp/random_no_date.mp4", cfg)
-        assert result == "/tmp/random_no_date"
+        assert result == str(Path("/tmp") / "random_no_date")
 
     def test_output_dir_override_combined_with_date_stem(self, tmp_path):
         out_dir = tmp_path / "out"
@@ -618,7 +699,311 @@ class TestResolveOutputPrefixDateHeading:
         # missing from cfg entirely (matches config.py's default).
         cfg = {}
         result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
-        assert result == "/tmp/2020-04-07_154005"
+        assert result == str(Path("/tmp") / "2020-04-07_154005")
+
+
+# -----------------------------------------------------------------
+# _sanitize_filename_component / build_date_subject_filename /
+# resolve_output_prefix's use_date_subject_filename option
+# -----------------------------------------------------------------
+
+class TestSanitizeFilenameComponent:
+    def test_strips_windows_illegal_characters(self):
+        assert run_pipeline._sanitize_filename_component('Q3: Review <Draft>?') == "Q3 Review Draft"
+
+    def test_collapses_whitespace_and_newlines(self):
+        assert run_pipeline._sanitize_filename_component("Weekly\n  Sync   Call") == "Weekly Sync Call"
+
+    def test_strips_trailing_dots_and_spaces(self):
+        assert run_pipeline._sanitize_filename_component("Draft v2. ") == "Draft v2"
+
+    def test_truncates_to_max_length(self):
+        long_subject = "A" * 200
+        out = run_pipeline._sanitize_filename_component(long_subject)
+        assert len(out) == run_pipeline._MAX_SUBJECT_LEN
+
+    def test_blank_input_returns_blank(self):
+        assert run_pipeline._sanitize_filename_component("") == ""
+        assert run_pipeline._sanitize_filename_component("   ") == ""
+
+
+class TestBuildDateSubjectFilename:
+    def test_uses_meeting_date_when_valid_iso(self):
+        result = run_pipeline.build_date_subject_filename(
+            "2026-07-03", "Q3 Kickoff", "/tmp/random_no_date.mp4")
+        assert result == "20260703_Q3 Kickoff"
+
+    def test_falls_back_to_filename_date_when_meeting_date_blank(self):
+        result = run_pipeline.build_date_subject_filename(
+            "", "Q3 Kickoff", "/tmp/Video_2020-04-07_154005.mp4")
+        assert result == "20200407_Q3 Kickoff"
+
+    def test_falls_back_to_filename_date_when_meeting_date_invalid(self):
+        result = run_pipeline.build_date_subject_filename(
+            "not-a-date", "Q3 Kickoff", "/tmp/Video_2020-04-07_154005.mp4")
+        assert result == "20200407_Q3 Kickoff"
+
+    def test_blank_title_returns_none(self):
+        assert run_pipeline.build_date_subject_filename(
+            "2026-07-03", "", "/tmp/Video_2020-04-07_154005.mp4") is None
+        assert run_pipeline.build_date_subject_filename(
+            "2026-07-03", "   ", "/tmp/Video_2020-04-07_154005.mp4") is None
+
+    def test_falls_back_to_file_mtime_when_no_other_date(self, tmp_path):
+        f = tmp_path / "random_no_date.mp4"
+        f.write_bytes(b"x")
+        result = run_pipeline.build_date_subject_filename("", "Q3 Kickoff", str(f))
+        assert result.endswith("_Q3 Kickoff")
+        assert len(result.split("_")[0]) == 8  # YYYYMMDD
+
+    def test_sanitizes_title(self):
+        result = run_pipeline.build_date_subject_filename(
+            "2026-07-03", "Q3: Review?", "/tmp/random_no_date.mp4")
+        assert result == "20260703_Q3 Review"
+
+
+class TestResolveOutputPrefixDateSubject:
+    def test_uses_date_subject_when_enabled_and_title_set(self):
+        cfg = {"use_date_subject_filename": True, "meeting_date": "2026-07-03",
+               "meeting_title": "Q3 Kickoff"}
+        result = run_pipeline.resolve_output_prefix("/tmp/random_no_date.mp4", cfg)
+        assert result == str(Path("/tmp") / "20260703_Q3 Kickoff")
+
+    def test_falls_back_to_filename_date_heading_when_title_blank(self):
+        cfg = {"use_date_subject_filename": True, "meeting_title": "",
+               "use_filename_date_heading": True}
+        result = run_pipeline.resolve_output_prefix("/tmp/Video_2020-04-07_154005.mp4", cfg)
+        assert result == str(Path("/tmp") / "2020-04-07_154005")
+
+    def test_basename_override_wins_over_date_subject(self):
+        cfg = {"use_date_subject_filename": True, "meeting_title": "Q3 Kickoff",
+               "output_basename_override": "MyCustomName"}
+        result = run_pipeline.resolve_output_prefix("/tmp/random_no_date.mp4", cfg)
+        assert result == str(Path("/tmp") / "MyCustomName")
+
+    def test_disabled_by_default(self):
+        # use_date_subject_filename defaults to False - a meeting_title
+        # being set must not silently change naming unless the option is
+        # explicitly turned on.
+        cfg = {"meeting_title": "Q3 Kickoff", "meeting_date": "2026-07-03"}
+        result = run_pipeline.resolve_output_prefix("/tmp/random_no_date.mp4", cfg)
+        assert result == str(Path("/tmp") / "random_no_date")
+
+
+# -----------------------------------------------------------------
+# _dedupe_date_subject_stem: two different recordings on the same day
+# with the same meeting title must not silently overwrite each other's
+# output files under use_date_subject_filename.
+# -----------------------------------------------------------------
+
+class TestDedupeDateSubjectStem:
+    def test_no_sidecar_yet_stem_used_as_is(self, tmp_path):
+        result = run_pipeline._dedupe_date_subject_stem(
+            tmp_path, "20260703_Q3 Kickoff", str(tmp_path / "a.mp4"))
+        assert result == "20260703_Q3 Kickoff"
+
+    def test_same_source_reuses_stem_for_cache_hit(self, tmp_path):
+        # Simulates a cache-aware re-run of the SAME source file: the
+        # sidecar from the earlier run already points at this exact file,
+        # so the stem must be reused, not de-duplicated away, or the
+        # *_segments.json cache would never be hit again.
+        source = tmp_path / "a.mp4"
+        source.write_bytes(b"x")
+        sidecar = tmp_path / "20260703_Q3 Kickoff_source_media.txt"
+        sidecar.write_text(str(source), encoding="utf-8")
+        result = run_pipeline._dedupe_date_subject_stem(
+            tmp_path, "20260703_Q3 Kickoff", str(source))
+        assert result == "20260703_Q3 Kickoff"
+
+    def test_different_source_appends_numeric_suffix(self, tmp_path):
+        other_source = tmp_path / "b.mp4"
+        other_source.write_bytes(b"x")
+        sidecar = tmp_path / "20260703_Q3 Kickoff_source_media.txt"
+        sidecar.write_text(str(other_source), encoding="utf-8")
+
+        new_source = tmp_path / "c.mp4"
+        new_source.write_bytes(b"x")
+        result = run_pipeline._dedupe_date_subject_stem(
+            tmp_path, "20260703_Q3 Kickoff", str(new_source))
+        assert result == "20260703_Q3 Kickoff_2"
+
+    def test_skips_taken_suffixes_until_free_one_found(self, tmp_path):
+        other_source = tmp_path / "b.mp4"
+        other_source.write_bytes(b"x")
+        (tmp_path / "20260703_Q3 Kickoff_source_media.txt").write_text(
+            str(other_source), encoding="utf-8")
+        (tmp_path / "20260703_Q3 Kickoff_2_source_media.txt").write_text(
+            str(other_source), encoding="utf-8")
+
+        new_source = tmp_path / "c.mp4"
+        new_source.write_bytes(b"x")
+        result = run_pipeline._dedupe_date_subject_stem(
+            tmp_path, "20260703_Q3 Kickoff", str(new_source))
+        assert result == "20260703_Q3 Kickoff_3"
+
+    def test_resolve_output_prefix_applies_dedup_end_to_end(self, tmp_path):
+        other_source = tmp_path / "b.mp4"
+        other_source.write_bytes(b"x")
+        (tmp_path / "20260703_Q3 Kickoff_source_media.txt").write_text(
+            str(other_source), encoding="utf-8")
+
+        new_source = tmp_path / "c.mp4"
+        new_source.write_bytes(b"x")
+        cfg = {"use_date_subject_filename": True, "meeting_date": "2026-07-03",
+               "meeting_title": "Q3 Kickoff"}
+        result = run_pipeline.resolve_output_prefix(str(new_source), cfg)
+        assert result == str(tmp_path / "20260703_Q3 Kickoff_2")
+
+
+# -----------------------------------------------------------------
+# db.update_source_path / move_processed_source_file / run_batch_folder's
+# processed_subfolder_name exclusion (post-run archiving option)
+# -----------------------------------------------------------------
+
+class TestUpdateSourcePath:
+    def _make_db(self, tmp_path):
+        path = str(tmp_path / "test.db")
+        db.validate_schema(path)
+        return path
+
+    def test_updates_transcripts_file_path_and_name(self, tmp_path):
+        db_path = self._make_db(tmp_path)
+        conn = db.get_connection(db_path)
+        db.upsert_transcript(conn, "/old/a.mp4", "large-v2", "en", 10, 100.0)
+        db.update_source_path(conn, "/old/a.mp4", "/new/_processed/a.mp4")
+        row = conn.execute("SELECT file_path, file_name FROM transcripts").fetchone()
+        conn.close()
+        assert row["file_path"] == "/new/_processed/a.mp4"
+        assert row["file_name"] == "a.mp4"
+
+    def test_no_matching_row_is_a_silent_no_op(self, tmp_path):
+        db_path = self._make_db(tmp_path)
+        conn = db.get_connection(db_path)
+        db.update_source_path(conn, "/old/nope.mp4", "/new/nope.mp4")  # must not raise
+        conn.close()
+
+
+class TestMoveProcessedSourceFile:
+    def _make_db(self, tmp_path):
+        path = str(tmp_path / "test.db")
+        db.validate_schema(path)
+        return path
+
+    def test_disabled_returns_original_path_unchanged(self, tmp_path):
+        f = tmp_path / "a.mp4"
+        f.write_bytes(b"x")
+        cfg = {"move_processed_files": False}
+        result = run_pipeline.move_processed_source_file(str(f), str(tmp_path / "a"), cfg)
+        assert result == str(f)
+        assert f.exists()
+
+    def test_moves_file_into_processed_subfolder(self, tmp_path):
+        f = tmp_path / "a.mp4"
+        f.write_bytes(b"x")
+        cfg = {"move_processed_files": True, "db_path": self._make_db(tmp_path)}
+        result = run_pipeline.move_processed_source_file(str(f), str(tmp_path / "a"), cfg)
+        assert result == str(tmp_path / "_processed" / "a.mp4")
+        assert not f.exists()
+        assert Path(result).exists()
+
+    def test_custom_subfolder_name(self, tmp_path):
+        f = tmp_path / "a.mp4"
+        f.write_bytes(b"x")
+        cfg = {"move_processed_files": True, "processed_subfolder_name": "Archive",
+               "db_path": self._make_db(tmp_path)}
+        result = run_pipeline.move_processed_source_file(str(f), str(tmp_path / "a"), cfg)
+        assert result == str(tmp_path / "Archive" / "a.mp4")
+
+    def test_rewrites_source_media_sidecar(self, tmp_path):
+        f = tmp_path / "a.mp4"
+        f.write_bytes(b"x")
+        output_prefix = str(tmp_path / "a")
+        sidecar = Path(output_prefix + "_source_media.txt")
+        sidecar.write_text(str(f), encoding="utf-8")
+        cfg = {"move_processed_files": True, "db_path": self._make_db(tmp_path)}
+        result = run_pipeline.move_processed_source_file(str(f), output_prefix, cfg)
+        assert sidecar.read_text(encoding="utf-8") == result
+
+    def test_updates_db_source_path(self, tmp_path):
+        f = tmp_path / "a.mp4"
+        f.write_bytes(b"x")
+        db_path = self._make_db(tmp_path)
+        conn = db.get_connection(db_path)
+        db.upsert_transcript(conn, str(f), "large-v2", "en", 10, 100.0)
+        conn.close()
+        cfg = {"move_processed_files": True, "db_path": db_path}
+        result = run_pipeline.move_processed_source_file(str(f), str(tmp_path / "a"), cfg)
+        conn = db.get_connection(db_path)
+        row = conn.execute("SELECT file_path FROM transcripts").fetchone()
+        conn.close()
+        assert row["file_path"] == result
+
+    def test_does_not_overwrite_existing_file_at_destination(self, tmp_path):
+        f = tmp_path / "a.mp4"
+        f.write_bytes(b"original")
+        dest_dir = tmp_path / "_processed"
+        dest_dir.mkdir()
+        (dest_dir / "a.mp4").write_bytes(b"already there")
+        cfg = {"move_processed_files": True, "db_path": self._make_db(tmp_path)}
+        result = run_pipeline.move_processed_source_file(str(f), str(tmp_path / "a"), cfg)
+        assert result == str(f)
+        assert f.read_bytes() == b"original"
+        assert (dest_dir / "a.mp4").read_bytes() == b"already there"
+
+
+class TestRunBatchFolderExcludesProcessedSubfolder:
+    def test_processed_subfolder_excluded_from_scan(self, tmp_path, monkeypatch):
+        (tmp_path / "a.mp4").write_bytes(b"x")
+        processed = tmp_path / "_processed"
+        processed.mkdir()
+        (processed / "already_done.mp4").write_bytes(b"x")
+
+        seen = []
+        monkeypatch.setattr(
+            run_pipeline, "process_file",
+            lambda f, overrides, stop_check=None: (seen.append(f), True)[1])
+
+        run_pipeline.run_batch_folder(str(tmp_path), {}, recursive=True)
+
+        # Exact list, not a substring check: tmp_path itself is derived
+        # from this test's own name ("..._excluded_from_scan"), which
+        # happens to contain the literal text "_processed" - a substring
+        # check on the full path would false-positive on that, unrelated
+        # to whether the _processed SUBFOLDER was actually excluded.
+        assert seen == [str(tmp_path / "a.mp4")]
+
+    def test_custom_subfolder_name_excluded(self, tmp_path, monkeypatch):
+        (tmp_path / "a.mp4").write_bytes(b"x")
+        archive = tmp_path / "Archive"
+        archive.mkdir()
+        (archive / "already_done.mp4").write_bytes(b"x")
+
+        seen = []
+        monkeypatch.setattr(
+            run_pipeline, "process_file",
+            lambda f, overrides, stop_check=None: (seen.append(f), True)[1])
+
+        run_pipeline.run_batch_folder(
+            str(tmp_path), {"processed_subfolder_name": "Archive"}, recursive=True)
+
+        assert seen == [str(tmp_path / "a.mp4")]
+
+    def test_enhanced_tmp_wav_stray_file_excluded(self, tmp_path, monkeypatch):
+        # A leftover "<prefix>_enhanced_tmp.wav" from an interrupted
+        # enhance_audio run (see process_file, Step 1) matches "*.wav" and
+        # must not be picked up as its own source recording - it points
+        # at audio that was already unlink()d, so processing it fails.
+        (tmp_path / "a.mp4").write_bytes(b"x")
+        (tmp_path / "a_enhanced_tmp.wav").write_bytes(b"x")
+
+        seen = []
+        monkeypatch.setattr(
+            run_pipeline, "process_file",
+            lambda f, overrides, stop_check=None: (seen.append(f), True)[1])
+
+        run_pipeline.run_batch_folder(str(tmp_path), {}, recursive=True)
+
+        assert seen == [str(tmp_path / "a.mp4")]
 
 
 # -----------------------------------------------------------------
@@ -773,6 +1158,76 @@ class TestExportSpeakerRosterJson:
         payload = json.loads(out_json.read_text(encoding="utf-8"))
         assert payload["files"][0]["source_media"] == str(src)
 
+    def test_extracts_sample_clip_per_speaker_when_ffmpeg_available(self, tmp_path, monkeypatch):
+        # No real ffmpeg/audio in the test sandbox: stub check_ffmpeg and
+        # extract_speaker_sample_clip so this covers the wiring (clip path
+        # built, mkdir'd, entry/count updated) without needing a real
+        # media file or binary.
+        import speaker_id
+        monkeypatch.setattr(speaker_id, "check_ffmpeg", lambda: True)
+
+        def fake_extract(source_media_path, segments, speaker_label, out_path, max_duration=6.0):
+            Path(out_path).write_bytes(b"fake-wav")
+            return out_path
+        monkeypatch.setattr(speaker_id, "extract_speaker_sample_clip", fake_extract)
+
+        self._make_processed_file(tmp_path, "call_one", ["SPEAKER_00", "SPEAKER_01"])
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        result = run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        assert result["samples"] == 2
+        samples_dir = Path(result["samples_dir"])
+        assert samples_dir == tmp_path / "roster_samples"
+        assert (samples_dir / "call_one__SPEAKER_00.wav").exists()
+        assert (samples_dir / "call_one__SPEAKER_01.wav").exists()
+
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        speakers = payload["files"][0]["speakers"]
+        assert all(s["sample_clip"] for s in speakers)
+
+    def test_sample_clip_is_null_when_ffmpeg_unavailable(self, tmp_path, monkeypatch):
+        import speaker_id
+        monkeypatch.setattr(speaker_id, "check_ffmpeg", lambda: False)
+
+        self._make_processed_file(tmp_path, "call_one", ["SPEAKER_00"])
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        result = run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        assert result["samples"] == 0
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        assert payload["files"][0]["speakers"][0]["sample_clip"] is None
+
+    def test_one_speakers_failed_clip_does_not_block_others(self, tmp_path, monkeypatch):
+        import speaker_id
+        monkeypatch.setattr(speaker_id, "check_ffmpeg", lambda: True)
+
+        def flaky_extract(source_media_path, segments, speaker_label, out_path, max_duration=6.0):
+            if speaker_label == "SPEAKER_00":
+                raise RuntimeError("ffmpeg exploded")
+            Path(out_path).write_bytes(b"fake-wav")
+            return out_path
+        monkeypatch.setattr(speaker_id, "extract_speaker_sample_clip", flaky_extract)
+
+        self._make_processed_file(tmp_path, "call_one", ["SPEAKER_00", "SPEAKER_01"])
+        db_path = self._make_db(tmp_path)
+        out_json = tmp_path / "roster.json"
+
+        result = run_pipeline.export_speaker_roster_json(
+            str(tmp_path), str(out_json), hf_token="", threshold=0.75, db_path=db_path)
+
+        assert result["files"] == 1
+        assert result["samples"] == 1
+        payload = json.loads(out_json.read_text(encoding="utf-8"))
+        speakers = {s["label"]: s["sample_clip"] for s in payload["files"][0]["speakers"]}
+        assert speakers["SPEAKER_00"] is None
+        assert speakers["SPEAKER_01"] is not None
+
 
 class TestApplySpeakerRosterJson:
     def _make_db(self, tmp_path):
@@ -909,3 +1364,211 @@ class TestApplySpeakerRosterJson:
         assert result["files_updated"] == 1
         assert len(result["errors"]) == 1
         assert "missing_segments.json" in result["errors"][0]["file"]
+
+
+# -----------------------------------------------------------------
+# _resolve_ocr_language (Translate tab/CLI, image inputs)
+# -----------------------------------------------------------------
+
+class TestResolveOcrLanguage:
+    def test_auto_resolves_to_eng_plus_deu(self):
+        assert run_pipeline._resolve_ocr_language({"translate_ocr_language": "auto"}) == "eng+deu"
+
+    def test_missing_key_defaults_to_auto_behaviour(self):
+        assert run_pipeline._resolve_ocr_language({}) == "eng+deu"
+
+    def test_blank_defaults_to_auto_behaviour(self):
+        assert run_pipeline._resolve_ocr_language({"translate_ocr_language": ""}) == "eng+deu"
+
+    def test_known_code_mapped_via_tesseract_lang_map(self):
+        assert run_pipeline._resolve_ocr_language({"translate_ocr_language": "zh"}) == "chi_sim"
+        assert run_pipeline._resolve_ocr_language({"translate_ocr_language": "de"}) == "deu"
+
+    def test_raw_tesseract_string_passed_through(self):
+        # Not a key in LANGUAGE_NAMES/TESSERACT_LANG_MAP - a power user
+        # typing a raw Tesseract --lang string directly should reach
+        # Tesseract unchanged.
+        assert run_pipeline._resolve_ocr_language({"translate_ocr_language": "deu+fra"}) == "deu+fra"
+
+
+# -----------------------------------------------------------------
+# run_notes_batch_via_batch_api: Anthropic Message Batches API path.
+# Only anthropic.Anthropic itself is faked (via monkeypatch.setattr, not
+# a sys.modules stub) - the real, installed anthropic SDK still supplies
+# MessageCreateParamsNonStreaming/Request, which are harmless local
+# dataclass-like constructors with no network access.
+# -----------------------------------------------------------------
+
+class _FakeTextBlock:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeRequestCounts:
+    def __init__(self, processing=0, succeeded=0, errored=0):
+        self.processing = processing
+        self.succeeded = succeeded
+        self.errored = errored
+
+
+class _FakeBatch:
+    def __init__(self, id, processing_status):
+        self.id = id
+        self.processing_status = processing_status
+        self.request_counts = _FakeRequestCounts()
+
+
+class _FakeSucceededResult:
+    def __init__(self, custom_id, text):
+        self.custom_id = custom_id
+        self.result = type("R", (), {
+            "type": "succeeded",
+            "message": type("M", (), {"content": [_FakeTextBlock(text)]})(),
+        })()
+
+
+class _FakeErroredResult:
+    def __init__(self, custom_id):
+        self.custom_id = custom_id
+        self.result = type("R", (), {"type": "errored"})()
+
+
+class _FakeBatchesAPI:
+    """retrieve() always reports "ended" on first poll - these tests
+    exercise the happy/error paths, not the actual polling loop timing."""
+    def __init__(self, results):
+        self._results = results
+        self.created_requests = None
+        self.canceled_id = None
+
+    def create(self, requests):
+        self.created_requests = requests
+        return _FakeBatch("batch_test123", "in_progress")
+
+    def retrieve(self, batch_id):
+        return _FakeBatch(batch_id, "ended")
+
+    def results(self, batch_id):
+        return self._results
+
+    def cancel(self, batch_id):
+        self.canceled_id = batch_id
+        return _FakeBatch(batch_id, "canceling")
+
+
+def _install_fake_anthropic_client(monkeypatch, batches_api):
+    fake_messages = type("Messages", (), {"batches": batches_api})()
+    fake_client = type("Client", (), {"messages": fake_messages})()
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: fake_client)
+    return fake_client
+
+
+class TestRunNotesBatchViaBatchAPI:
+    def _make_transcript(self, tmp_path, name="call"):
+        tf = tmp_path / f"{name}_transcript_speakers.txt"
+        tf.write_text("[00:00:00] [SPEAKER_00] Hello world.", encoding="utf-8")
+        return tf
+
+    def _base_cfg_overrides(self, tmp_path, monkeypatch):
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "meeting.md").write_text("## Summary\nWrite a summary.\n", encoding="utf-8")
+        monkeypatch.setattr(run_pipeline, "PROMPTS_DIR", prompts_dir)
+
+        db_path = tmp_path / "test.db"
+        db.validate_schema(str(db_path))
+
+        return {
+            "llm_backend": "anthropic",
+            "anthropic_api_key": "sk-ant-real-key",
+            "claude_model": "claude-sonnet-5",
+            "prompt_template": "meeting",
+            "db_path": str(db_path),
+            "notes_format_txt": True,
+            "notes_format_html": False,
+            "notes_format_docx": False,
+            "notes_format_pdf": False,
+        }
+
+    def test_non_anthropic_backend_rejected(self, tmp_path, monkeypatch, caplog):
+        self._make_transcript(tmp_path)
+        overrides = self._base_cfg_overrides(tmp_path, monkeypatch)
+        overrides["llm_backend"] = "ollama"
+        batches_api = _FakeBatchesAPI(results=[])
+        client = _install_fake_anthropic_client(monkeypatch, batches_api)
+
+        run_pipeline.run_notes_batch_via_batch_api(str(tmp_path), overrides)
+
+        assert batches_api.created_requests is None  # never even submitted
+
+    def test_missing_api_key_rejected(self, tmp_path, monkeypatch):
+        self._make_transcript(tmp_path)
+        overrides = self._base_cfg_overrides(tmp_path, monkeypatch)
+        overrides["anthropic_api_key"] = ""
+        batches_api = _FakeBatchesAPI(results=[])
+        _install_fake_anthropic_client(monkeypatch, batches_api)
+
+        run_pipeline.run_notes_batch_via_batch_api(str(tmp_path), overrides)
+
+        assert batches_api.created_requests is None
+
+    def test_skips_files_that_already_have_notes(self, tmp_path, monkeypatch):
+        tf = self._make_transcript(tmp_path)
+        Path(str(tf).replace("_transcript_speakers.txt", "_notes.txt")).write_text(
+            "already done", encoding="utf-8")
+        overrides = self._base_cfg_overrides(tmp_path, monkeypatch)
+        batches_api = _FakeBatchesAPI(results=[])
+        _install_fake_anthropic_client(monkeypatch, batches_api)
+
+        run_pipeline.run_notes_batch_via_batch_api(str(tmp_path), overrides)
+
+        assert batches_api.created_requests is None  # nothing pending, never submitted
+
+    def test_successful_batch_writes_notes_file(self, tmp_path, monkeypatch):
+        tf = self._make_transcript(tmp_path)
+        overrides = self._base_cfg_overrides(tmp_path, monkeypatch)
+
+        # custom_id "item-1" for the first (only) pending file, matching
+        # run_notes_batch_via_batch_api's own 1-based numbering scheme.
+        batches_api = _FakeBatchesAPI(
+            results=[_FakeSucceededResult("item-1", "## Summary\ngenerated notes body")])
+        _install_fake_anthropic_client(monkeypatch, batches_api)
+
+        run_pipeline.run_notes_batch_via_batch_api(str(tmp_path), overrides)
+
+        assert batches_api.created_requests is not None
+        assert len(batches_api.created_requests) == 1
+        assert batches_api.created_requests[0]["custom_id"] == "item-1"
+
+        notes_file = Path(str(tf).replace("_transcript_speakers.txt", "_notes.txt"))
+        assert notes_file.exists()
+        assert "generated notes body" in notes_file.read_text(encoding="utf-8")
+
+    def test_errored_result_logged_not_written(self, tmp_path, monkeypatch):
+        tf = self._make_transcript(tmp_path)
+        overrides = self._base_cfg_overrides(tmp_path, monkeypatch)
+        batches_api = _FakeBatchesAPI(results=[_FakeErroredResult("item-1")])
+        _install_fake_anthropic_client(monkeypatch, batches_api)
+
+        run_pipeline.run_notes_batch_via_batch_api(str(tmp_path), overrides)
+
+        notes_file = Path(str(tf).replace("_transcript_speakers.txt", "_notes.txt"))
+        assert not notes_file.exists()
+
+    def test_multiple_files_get_distinct_custom_ids(self, tmp_path, monkeypatch):
+        self._make_transcript(tmp_path, name="call_a")
+        self._make_transcript(tmp_path, name="call_b")
+        overrides = self._base_cfg_overrides(tmp_path, monkeypatch)
+        batches_api = _FakeBatchesAPI(results=[
+            _FakeSucceededResult("item-1", "## Summary\nnotes A"),
+            _FakeSucceededResult("item-2", "## Summary\nnotes B"),
+        ])
+        _install_fake_anthropic_client(monkeypatch, batches_api)
+
+        run_pipeline.run_notes_batch_via_batch_api(str(tmp_path), overrides)
+
+        assert len(batches_api.created_requests) == 2
+        ids = {r["custom_id"] for r in batches_api.created_requests}
+        assert ids == {"item-1", "item-2"}

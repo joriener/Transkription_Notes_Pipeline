@@ -273,6 +273,30 @@ def get_completed_transcript(conn: sqlite3.Connection, file_path: str) -> dict |
     return dict(row) if row else None
 
 
+def update_source_path(conn: sqlite3.Connection, old_path: str, new_path: str) -> None:
+    """
+    Repoint every DB row that references old_path to new_path - used when
+    move_processed_files (see config.py) relocates a source file to its
+    processed_subfolder_name after a successful run. Updates both
+    transcripts.file_path/file_name (keyed UNIQUE on file_path, so this is
+    an UPDATE not another upsert) and slides.video_path (video mode only,
+    no UNIQUE constraint there so a plain UPDATE across all matching rows
+    is safe). A no-op (0 rows affected) is not an error: audio-only runs
+    have no slides rows, and a --no-whisper run has no transcripts row
+    either.
+    """
+    conn.execute(
+        "UPDATE transcripts SET file_path = ?, file_name = ? WHERE file_path = ?",
+        (new_path, Path(new_path).name, old_path),
+    )
+    conn.execute(
+        "UPDATE slides SET video_path = ? WHERE video_path = ?",
+        (new_path, old_path),
+    )
+    conn.commit()
+    log.info("DB: source path updated after move: %s -> %s", old_path, new_path)
+
+
 # ---------------------------------------------------------------------------
 # Known speakers (task #79)
 # ---------------------------------------------------------------------------

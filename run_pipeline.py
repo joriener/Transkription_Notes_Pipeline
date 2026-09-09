@@ -32,6 +32,7 @@
 #    python run_pipeline.py --pdf "file.mp4"                  (also write notes .pdf)
 #    python run_pipeline.py --notes-only "file_transcript_speakers.txt"
 #    python run_pipeline.py --notes-batch "D:/Videos"
+#    python run_pipeline.py --notes-batch-api "D:/Videos"      (Anthropic Batches API: 50% cheaper, slower)
 #    python run_pipeline.py --file-list "list.txt"             (resumes automatically, skips already-done files)
 #    python run_pipeline.py --batch-folder "D:/Videos"         (every supported file in a folder)
 #    python run_pipeline.py --search "retention index"         (full-text search notes + slides)
@@ -42,10 +43,14 @@
 #    python run_pipeline.py --ics "invite.ics" "call.mp4"       (meeting title/date from a calendar invite)
 #    python run_pipeline.py --comments "Follow-up needed on pricing" "call.mp4"
 #    python run_pipeline.py --output-name "2026-07-03_Q3-Kickoff" "call.mp4"  (custom base filename)
+#    python run_pipeline.py --date-subject-filename --meeting-title "Q3 Kickoff" "call.mp4"
+#                                                               (output files named 20260703_Q3 Kickoff)
 #    python run_pipeline.py --reannotate-failed "file_slides/file_slides.json"  (retry failed VLM slides only)
 #    python run_pipeline.py --min-slide-duration 3.5 "webinar.mp4"  (animation debounce override)
 #    python run_pipeline.py --qa-start 1215 "webinar.mp4"       (Q&A from 20:15 to the end: no new
-#                                                                 slides there, separate Q&A summary)
+#                                                                 slides there; Q&A folded into the
+#                                                                 same summary unless --qa-exclude-
+#                                                                 from-summary is also given)
 #    python run_pipeline.py --gui                             (parameter GUI)
 #
 #  FORMAT list.txt (pipe separator for language is optional):
@@ -180,6 +185,217 @@ def derive_heading_from_filename(filename: str) -> str | None:
     return f"{date_part}_{topic}" if topic else date_part
 
 
+def extract_datetime_from_filename(filename: str) -> datetime | None:
+    """
+    Same date/time pattern as derive_heading_from_filename above, but
+    returns an actual datetime instead of a formatted heading string -
+    used by correlate_calendar_recordings.py (task #94) to compare a
+    recording's filename-embedded timestamp against calendar event
+    times. Returns None if no recognizable date is found, or if a time
+    component is missing: a date-only filename (no HHMMSS) isn't precise
+    enough to usefully compare against calendar event times, so callers
+    should fall back to the file's own last-modified time instead in
+    that case rather than getting a misleadingly exact midnight
+    timestamp.
+    """
+    stem = Path(filename).stem
+    match = _FILENAME_DATETIME_RE.search(stem)
+    if not match or not match.group("h"):
+        return None
+    try:
+        return datetime(
+            int(match.group("y")), int(match.group("m")), int(match.group("d")),
+            int(match.group("h")), int(match.group("mi")), int(match.group("s")))
+    except ValueError:
+        return None  # e.g. an out-of-range value that still matched the regex shape
+
+
+# Characters illegal in a Windows filename, plus control characters -
+# stripped from meeting_title before it becomes part of an output
+# filename (see build_date_subject_filename). Not just cosmetic: the
+# project's own NAS paths (X:\Agilent\...) run on Windows/SMB, where
+# writing any of these raises WinError 123 ("filename, directory name,
+# or volume label syntax is incorrect") rather than something obvious.
+_FILENAME_ILLEGAL_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+# Meeting/webinar titles (calendar subjects especially) can run long;
+# cap the Subject portion so "YYYYMMDD_<subject>" plus this project's own
+# suffixes (_transcript_speakers.txt, _slides/<name>_report_pdf.html,
+# etc.) stays comfortably under Windows' historical 260-char path limit
+# even several directories deep on a NAS share.
+_MAX_SUBJECT_LEN = 80
+
+
+def _sanitize_filename_component(text: str) -> str:
+    """
+    Make an arbitrary string (e.g. a calendar event's Subject) safe to use
+    as part of a Windows filename: strips illegal characters, collapses
+    whitespace runs (including the newlines some calendar exports embed
+    in SUMMARY) to single spaces, trims trailing dots/spaces (Windows
+    silently strips these anyway, but leaving them in causes confusing
+    mismatches versus what actually gets created on disk), and truncates
+    to _MAX_SUBJECT_LEN.
+    """
+    cleaned = _FILENAME_ILLEGAL_CHARS_RE.sub("", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:_MAX_SUBJECT_LEN].strip(" .")
+
+
+def build_date_subject_filename(meeting_date: str, meeting_title: str, source_file: str) -> str | None:
+    """
+    Build a "YYYYMMDD_Subject" output basename (CONFIG["use_date_subject_filename"]).
+    Returns None if meeting_title is blank after sanitizing - there is no
+    sensible Subject to build around, and resolve_output_prefix falls
+    back to its own default in that case rather than naming the file
+    "20260703_" with nothing after the underscore.
+
+    Date resolution order: 1) meeting_date, if it parses as an ISO
+    "YYYY-MM-DD" (the format --meeting-date/--ics/the GUI's Meeting info
+    fields already normalise to); 2) a date embedded in the source
+    filename (extract_datetime_from_filename); 3) the source file's own
+    last-modified date - always produces a date, never blocks naming
+    just because neither of the above matched.
+    """
+    subject = _sanitize_filename_component(meeting_title or "")
+    if not subject:
+        return None
+
+    date_obj = None
+    if meeting_date:
+        try:
+            date_obj = datetime.strptime(meeting_date.strip(), "%Y-%m-%d")
+        except ValueError:
+            log.warning("meeting_date '%s' is not YYYY-MM-DD - falling back to filename/mtime "
+                       "for the YYYYMMDD_Subject filename.", meeting_date)
+    if date_obj is None:
+        date_obj = extract_datetime_from_filename(Path(source_file).name)
+    if date_obj is None:
+        try:
+            date_obj = datetime.fromtimestamp(Path(source_file).stat().st_mtime)
+        except OSError:
+            date_obj = datetime.now()
+
+    return f"{date_obj.strftime('%Y%m%d')}_{subject}"
+
+
+def _dedupe_date_subject_stem(out_dir: Path, stem: str, source_file: str) -> str:
+    """
+    Guard against two different recordings on the same day with the same
+    (or same-after-sanitizing) meeting title computing to the identical
+    "YYYYMMDD_Subject" stem and silently overwriting each other's output
+    files - build_date_subject_filename() itself has no way to know about
+    sibling files, so this runs afterwards, once we know the target
+    directory.
+
+    Uses the "<stem>_source_media.txt" sidecar (written near the end of
+    Step 1 in process_file, see build_date_subject_filename's docstring)
+    as the source of truth for "who does this stem already belong to":
+      - no sidecar yet at this stem -> stem is free, use it as-is (first
+        run, or a legacy pre-V1.19 output with no sidecar - unchanged
+        behavior, we can't tell those apart and assume the best).
+      - sidecar exists and points at THIS source_file -> this is a
+        cache-aware re-run of the same recording (force_retranscribe=False,
+        --no-summary re-run, etc.) - reuse the stem so the *_segments.json
+        cache actually gets hit, exactly like before this change.
+      - sidecar exists and points at a DIFFERENT file -> real collision,
+        append "_2", "_3", ... until a free or same-source stem is found.
+    """
+    source_resolved = str(Path(source_file).resolve())
+    candidate = stem
+    n = 2
+    while True:
+        sidecar = out_dir / f"{candidate}_source_media.txt"
+        if not sidecar.exists():
+            return candidate
+        try:
+            recorded = sidecar.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        if recorded and str(Path(recorded).resolve()) == source_resolved:
+            return candidate
+        candidate = f"{stem}_{n}"
+        n += 1
+
+
+def import_srt_transcript(video_file: str, srt_file: str, overrides: dict | None = None) -> bool:
+    """
+    Import an already-existing .srt (e.g. downloaded alongside a YouTube
+    video, together with its description.txt) as this video's transcript,
+    writing the exact same cache files a real whisperx transcription run
+    would (*_segments.json, *_transcript_speakers.txt, *_text.txt,
+    *_transcript.srt, *_source_media.txt) plus a transcripts DB row - so
+    process_file's existing cache-aware shortcut picks it up and skips
+    whisperx entirely on the next run against this file (see Step 1 of
+    process_file: "Transcript cache found - loading ..."). This is the
+    building block for both the --import-srt CLI flag and the GUI's
+    "Import .srt as transcript..." button.
+
+    Refuses to overwrite an existing transcript cache unless
+    overrides["force_retranscribe"] is set (mirrors the
+    --force-retranscribe convention used for a real re-transcription),
+    since the whole point of importing an .srt is normally to AVOID
+    redoing a transcription that has already happened - accidentally
+    clobbering one with a lower-quality caption file would be a silent
+    downgrade rather than a helpful shortcut.
+
+    Returns True on success, False on any failure (missing files, an
+    .srt with no parseable cues, or an existing cache without
+    force_retranscribe) - every failure is logged, never raised.
+    """
+    video_path = Path(video_file)
+    srt_path = Path(srt_file)
+    if not video_path.exists():
+        log.error("Import .srt: video file not found: %s", video_file)
+        return False
+    if not srt_path.exists():
+        log.error("Import .srt: .srt file not found: %s", srt_file)
+        return False
+
+    cfg = build_run_config(overrides or {})
+    db.validate_schema(cfg["db_path"])
+    output_prefix = resolve_output_prefix(str(video_path), cfg)
+    segments_cache = Path(output_prefix + "_segments.json")
+    force = bool(cfg.get("force_retranscribe"))
+    if not force and transcriber.transcript_cache_exists(output_prefix) and segments_cache.exists():
+        log.error(
+            "Import .srt: a transcript cache already exists for %s (%s) - pass "
+            "--force-retranscribe (CLI) or enable it in the GUI to overwrite it "
+            "with this .srt.", video_path.name, segments_cache.name)
+        return False
+
+    segments = transcriber.parse_srt(str(srt_path))
+    if not segments:
+        log.error("Import .srt: no parseable cues found in %s.", srt_file)
+        return False
+
+    if cfg.get("enable_diarization"):
+        log.info(
+            "Import .srt: diarization is enabled but has no effect here - an "
+            "imported .srt carries no speaker labels (no audio pass is run). "
+            "Diarize a real whisperx transcription instead if per-speaker "
+            "labels are needed.")
+
+    segments = _rescale_segments(segments, cfg.get("recording_speed", 1.0))
+    transcriber.write_transcript_files(str(video_path), segments, output_prefix,
+                                       recording_speed=cfg.get("recording_speed", 1.0))
+    segments_cache.write_text(
+        json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    Path(output_prefix + "_source_media.txt").write_text(str(video_path), encoding="utf-8")
+
+    duration = segments[-1].get("end", 0) if segments else 0
+    conn = db.get_connection(cfg["db_path"])
+    db.upsert_transcript(
+        conn, str(video_path), "imported-srt",
+        cfg.get("whisper_language") or "auto", len(segments), duration,
+    )
+    conn.close()
+
+    log.info("Import .srt: %d segment(s) imported from %s -> %s.",
+             len(segments), srt_path.name, segments_cache.name)
+    return True
+
+
 def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     """
     Return the "<dir>/<stem>" prefix used to name every output file.
@@ -189,6 +405,12 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     set, ALL output files use this name instead of the source file's stem
     (e.g. "2026-07-02_Q3-Kickoff" instead of "Video_2026-07-02_100348").
 
+    Otherwise, when use_date_subject_filename is on and meeting_title is
+    set, the stem is "YYYYMMDD_Subject" (see build_date_subject_filename),
+    de-duplicated against sibling files in the target directory (see
+    _dedupe_date_subject_stem) in case another recording already used the
+    same date/title.
+
     Otherwise, when use_filename_date_heading is on (default), the stem
     is derived from a date found in the source filename via
     derive_heading_from_filename - the same cleanup shown in the example
@@ -197,18 +419,26 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     use_filename_date_heading is off.
     """
     override_stem = (cfg.get("output_basename_override") or "").strip()
+    date_subject_stem = None
+    if not override_stem and cfg.get("use_date_subject_filename", False):
+        date_subject_stem = build_date_subject_filename(
+            cfg.get("meeting_date", ""), cfg.get("meeting_title", ""), source_file)
+
+    override = (cfg.get("output_dir_override") or "").strip()
+    out_dir = Path(override) if override else Path(source_file).parent
+
     if override_stem:
         stem = override_stem
+    elif date_subject_stem:
+        stem = _dedupe_date_subject_stem(out_dir, date_subject_stem, source_file)
     elif cfg.get("use_filename_date_heading", True):
         stem = derive_heading_from_filename(Path(source_file).name) or Path(source_file).stem
     else:
         stem = Path(source_file).stem
-    override = (cfg.get("output_dir_override") or "").strip()
+
     if override:
-        out_dir = Path(override)
         out_dir.mkdir(parents=True, exist_ok=True)
-        return str(out_dir / stem)
-    return str(Path(source_file).parent / stem)
+    return str(out_dir / stem)
 
 
 def _unique_snapshot_path(snapshot_dir: Path, base_name: str, slide_idx: int) -> Path:
@@ -531,7 +761,8 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                     slides=changes, snapshot_dir=snap_tmp_dir,
                     model=cfg["ollama_vlm_model"],
                     ollama_url=cfg["ollama_base_url"].rstrip("/") + "/api/generate",
-                    prompt=cfg["vlm_prompt"], timeout_sec=cfg["vlm_timeout_sec"],
+                    prompt=annotator.build_prompt(cfg["vlm_prompt"], cfg.get("output_language", "auto")),
+                    timeout_sec=cfg["vlm_timeout_sec"],
                     stop_check=stop_check,
                 )
             else:
@@ -598,10 +829,19 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
             m_title = cfg.get("meeting_title", "")
             m_date = cfg.get("meeting_date", "")
             m_comments = cfg.get("meeting_comments", "")
-            if cfg["report_csv"]:
-                reporter.save_csv(slides_annotated, slides_dir / f"{stem}_slides.csv")
             if cfg["report_json"]:
                 reporter.save_json(slides_annotated, slides_dir / f"{stem}_slides.json")
+            # Q&A slide (task: separate Q&A slide + parsed pairs in the
+            # report): must run AFTER _slides.json is saved above - that
+            # file is the pristine raw-detection record Slide Review /
+            # rebuild_outputs reads back later and must never contain this
+            # synthetic entry (see _add_qa_slide's docstring). Everything
+            # below this point (CSV/HTML/PDF/timing summary) uses the
+            # now-extended list.
+            if segments:
+                _add_qa_slide(slides_annotated, segments, cfg)
+            if cfg["report_csv"]:
+                reporter.save_csv(slides_annotated, slides_dir / f"{stem}_slides.csv")
             show_image = cfg.get("report_show_image", True)
             show_bullets = cfg.get("report_show_bullets", True)
             show_transcript = cfg.get("report_show_transcript", True)
@@ -669,24 +909,38 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
         if prompt_path:
             log.info("STAGE:notes")
 
-            # Q&A section (task #61): if configured, keep the Q&A portion
-            # out of the main transcript fed to the main prompt (so it
-            # does not dilute the main summary), and collect it
-            # separately for its own focused Q&A summary below. Times use
+            # Q&A section (task #61, single-prompt behavior task #112): a
+            # Q&A block at the end of a webinar is, by default, kept in the
+            # transcript and summarised by the SAME prompt/pass as the rest
+            # of the recording (its content lands in the prompt's own
+            # "## QUESTIONS & ANSWERS" section - see prompts/webinar.md),
+            # rather than being run through a second prompt
+            # (prompts/qa_summary.md) and appended afterwards. Set
+            # cfg["qa_include_in_summary"] to False (GUI: "Include Q&A in
+            # the summary" checkbox; CLI: --qa-exclude-from-summary) to drop
+            # the Q&A portion from the summary entirely instead. Times use
             # the already-converted real-time clock, same as segments
             # (segments were rescaled by recording_speed back in Step 1).
             qa_start = cfg.get("qa_start_time_sec")
             qa_end = cfg.get("qa_end_time_sec")
-            qa_segments: list[dict] = []
-            if qa_start:
+            qa_include_in_summary = cfg.get("qa_include_in_summary", True)
+
+            if qa_start and not qa_include_in_summary:
                 main_segments = [s for s in segments if s.get("start", 0) < qa_start]
-                qa_segments = [
-                    s for s in segments
-                    if s.get("start", 0) >= qa_start and (not qa_end or s.get("start", 0) < qa_end)
-                ]
+                if len(main_segments) == len(segments):
+                    log.warning(
+                        "qa_start_time_sec (%.0fs) is set but no transcript segments start "
+                        "at/after it - check the value: it must be already-converted real "
+                        "time in seconds, matching the transcript/slide report timestamps.",
+                        qa_start)
                 transcript_text = notes.build_transcript_text_from_segments(main_segments)
             elif enable_slides:
-                transcript_text = notes.build_transcript_text_from_segments(segments)
+                # qa_start may be None here (nothing configured - plain
+                # transcript, no marker) or set with qa_include_in_summary
+                # True (folded in, WITH the marker so the model reliably
+                # finds it - see build_transcript_text_with_qa_marker).
+                transcript_text = notes.build_transcript_text_with_qa_marker(
+                    segments, qa_start, qa_end)
             else:
                 speakers_file = transcriber.transcript_cache_paths(output_prefix)["speakers"]
                 transcript_text = transcriber.read_transcript_text(speakers_file)
@@ -705,43 +959,9 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                 meeting_title=cfg.get("meeting_title", ""),
                 meeting_date=cfg.get("meeting_date", ""),
                 meeting_comments=cfg.get("meeting_comments", ""),
+                output_language=cfg.get("output_language", "auto"),
+                ollama_num_ctx=cfg.get("ollama_notes_num_ctx", 16_384),
             )
-
-            if notes_text and qa_segments:
-                qa_transcript_text = notes.build_transcript_text_from_segments(qa_segments)
-                try:
-                    qa_prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, "qa_summary")
-                except FileNotFoundError as exc:
-                    log.warning("Q&A summary skipped: %s", exc)
-                    qa_prompt_path = None
-                if qa_prompt_path:
-                    qa_summary = notes.generate_notes(
-                        transcript_text=qa_transcript_text,
-                        prompt_path=qa_prompt_path,
-                        llm_backend=cfg["llm_backend"],
-                        ollama_base_url=cfg["ollama_base_url"],
-                        ollama_notes_model=cfg["ollama_notes_model"],
-                        anthropic_api_key=cfg["anthropic_api_key"],
-                        claude_model=cfg["claude_model"],
-                        filename=filename,
-                        single_pass_limit=cfg["single_pass_limit"],
-                        chunk_size=cfg["chunk_size"],
-                        meeting_title=cfg.get("meeting_title", ""),
-                        meeting_date=cfg.get("meeting_date", ""),
-                        meeting_comments=cfg.get("meeting_comments", ""),
-                    )
-                    if qa_summary:
-                        notes_text = notes_text.rstrip() + "\n\n" + qa_summary.strip()
-                        log.info("Q&A summary appended (%d transcript segment(s), from %.0fs%s).",
-                                 len(qa_segments), qa_start,
-                                 f" to {qa_end:.0f}s" if qa_end else " to end of recording")
-                    else:
-                        log.warning("Q&A summary generation failed - main notes saved without it.")
-            elif qa_start and not qa_segments:
-                log.warning(
-                    "qa_start_time_sec (%.0fs) is set but no transcript segments start at/after "
-                    "it - check the value: it must be already-converted real time in seconds, "
-                    "matching the transcript/slide report timestamps.", qa_start)
 
             if notes_text:
                 title = (cfg.get("meeting_title")
@@ -794,9 +1014,69 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
     elif cfg.get("no_summary"):
         log.info("Notes generation disabled (--no-summary).")
 
+    if cfg.get("move_processed_files", False) and not cfg.get("dry_run", False):
+        log.info("STAGE:archive")
+        move_processed_source_file(file, output_prefix, cfg)
+
     log.info("STAGE:done")
     log.info("DONE: %s", filename)
     return True
+
+
+def move_processed_source_file(file: str, output_prefix: str, cfg: dict) -> str:
+    """
+    Move the original source audio/video file into processed_subfolder_name
+    next to it (CONFIG["move_processed_files"], off by default). Returns
+    the file's final path: the moved location on success, or the original
+    file unchanged if the option is off, the destination already has a
+    same-named file (never overwrites - logs a warning and leaves the
+    source in place instead), or the move itself fails for any reason
+    (e.g. the NAS share drops mid-move) - archiving is a nice-to-have,
+    never worth losing track of a just-processed recording over.
+
+    Keeps everything that can reference the source file consistent with
+    the new location: rewrites the "<output_prefix>_source_media.txt"
+    sidecar (find_source_media's first, authoritative lookup - used by
+    the GUI's Play Sample button and the Rename Speakers dialog's
+    voiceprint suggestions) and, via db.update_source_path, the
+    transcripts/slides DB rows. Callers should use the RETURNED path for
+    anything after this point in the same run, not the original file
+    argument, in case a move happened.
+    """
+    if not cfg.get("move_processed_files", False):
+        return file
+
+    subfolder = (cfg.get("processed_subfolder_name") or "_processed").strip() or "_processed"
+    source = Path(file)
+    dest_dir = source.parent / subfolder
+    dest_path = dest_dir / source.name
+
+    if dest_path.exists():
+        log.warning("Archiving skipped: %s already exists in %s - leaving source file in place.",
+                   source.name, dest_dir)
+        return file
+
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(dest_path))
+    except OSError as exc:
+        log.warning("Archiving failed (%s) - leaving source file in place: %s", exc, source)
+        return file
+
+    log.info("Archived source file to: %s", dest_path)
+
+    sidecar = Path(output_prefix + "_source_media.txt")
+    if sidecar.exists():
+        sidecar.write_text(str(dest_path), encoding="utf-8")
+
+    try:
+        conn = db.get_connection(cfg["db_path"])
+        db.update_source_path(conn, str(source), str(dest_path))
+        conn.close()
+    except Exception as exc:
+        log.warning("DB source-path update after archiving failed (non-fatal): %s", exc)
+
+    return str(dest_path)
 
 
 def _dominant_speaker(speaker_map: dict, timestamp: float) -> str:
@@ -808,6 +1088,68 @@ def _dominant_speaker(speaker_map: dict, timestamp: float) -> str:
                 best_dist = d
                 best = spk
     return best
+
+
+def _add_qa_slide(slides: list[dict], segments: list[dict], cfg: dict) -> None:
+    """
+    Mutates `slides` in place (rewrites the LAST slide's transcript_seg,
+    then appends one new entry): if qa_start_time_sec is configured,
+    splits the Q&A portion out of the last detected slide - whose
+    display window otherwise runs to the end of the recording (frames in
+    the Q&A range are dropped before slide-change detection ever sees
+    them, so no new slide can be detected there - see process_file) -
+    into its own synthetic "Q&A Session" entry, complete with (LLM
+    permitting) discrete Q: / A: pairs extracted via
+    notes.generate_qa_pairs, instead of leaving the whole live Q&A
+    discussion glued onto the last real slide's transcript as one
+    continuous, unstructured block.
+
+    Used by process_file (fresh run, called AFTER _slides.json is saved
+    - see that call site's comment), reannotate_failed_slides, and
+    rebuild_outputs (Slide Review's "Rebuild outputs", loading segments
+    from the cached *_segments.json). No-op if qa_start_time_sec isn't
+    set, there are no cached segments to re-derive timing from, or there
+    are no slides to attach the split to.
+
+    Only the last slide's transcript_seg is touched; every earlier slide
+    keeps whatever text it already had (from process_file's alignment or
+    a prior apply_slide_edits merge) rather than being recomputed from
+    scratch, so an unrelated edit elsewhere in the slide list can't
+    change earlier slides' transcripts as a side effect of this.
+    """
+    qa_start = cfg.get("qa_start_time_sec")
+    qa_end = cfg.get("qa_end_time_sec")
+    if not qa_start or not segments or not slides:
+        return
+    if slides[-1].get("slide_type") == "qa_session":
+        return  # already split (e.g. called twice on the same in-memory list)
+
+    last_ts = slides[-1].get("timestamp_sec", 0)
+    boundaries = [last_ts, qa_start] + ([qa_end] if qa_end else [])
+    windows = transcriber.align_transcript_to_slides(segments, boundaries)
+    if windows:
+        slides[-1]["transcript_seg"] = windows[0]
+    qa_text = windows[1] if len(windows) > 1 else ""
+    if not qa_text.strip():
+        log.warning(
+            "qa_start_time_sec (%.0fs) is set but no transcript segments fall in "
+            "that window - no Q&A slide added.", qa_start)
+        return
+
+    qa_pairs = notes.generate_qa_pairs(
+        qa_text, llm_backend=cfg["llm_backend"], ollama_base_url=cfg["ollama_base_url"],
+        ollama_notes_model=cfg["ollama_notes_model"], anthropic_api_key=cfg["anthropic_api_key"],
+        claude_model=cfg["claude_model"], output_language=cfg.get("output_language", "auto"),
+        ollama_num_ctx=cfg.get("ollama_notes_num_ctx", 16_384),
+    )
+    slides.append({
+        "frame_index": -1, "timestamp_sec": qa_start, "snapshot_path": "",
+        "hash_value": "", "hamming_distance": 0,
+        "title": "Q&A Session", "bullets": [], "slide_type": "qa_session",
+        "transcript_seg": qa_text, "qa_pairs": qa_pairs, "speaker": "",
+    })
+    log.info("Q&A slide added (from %.0fs%s): %d pair(s) extracted.",
+             qa_start, f" to {qa_end:.0f}s" if qa_end else " to end of recording", len(qa_pairs))
 
 
 def reannotate_failed_slides(slides_json_path: str, overrides: dict | None = None,
@@ -855,7 +1197,8 @@ def reannotate_failed_slides(slides_json_path: str, overrides: dict | None = Non
         annotation = annotator.annotate_slide(
             snap, model=cfg["ollama_vlm_model"],
             ollama_url=cfg["ollama_base_url"].rstrip("/") + "/api/generate",
-            prompt=cfg["vlm_prompt"], timeout_sec=cfg["vlm_timeout_sec"],
+            prompt=annotator.build_prompt(cfg["vlm_prompt"], cfg.get("output_language", "auto")),
+            timeout_sec=cfg["vlm_timeout_sec"],
         )
         if annotation.get("title") or annotation.get("bullets"):
             slide["title"] = annotation.get("title", "")
@@ -874,6 +1217,16 @@ def reannotate_failed_slides(slides_json_path: str, overrides: dict | None = Non
     # run would have used.
     slides_dir = slides_json_path.parent
     stem = slides_json_path.stem.replace("_slides", "")
+
+    segments_json_path = slides_dir.parent / f"{stem}_segments.json"
+    qa_segments = []
+    if segments_json_path.exists():
+        try:
+            qa_segments = json.loads(segments_json_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("Could not read %s for Q&A slide rebuild: %s", segments_json_path.name, exc)
+    _add_qa_slide(slides, qa_segments, cfg)
+
     video_path = None
     for candidate in slides_dir.parent.glob(f"{stem}.*"):
         if candidate.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}:
@@ -1253,6 +1606,18 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
     blank (or unchanged and equal to "label") means "skip this one" when
     the file is later applied with apply_speaker_roster_json.
 
+    Alongside the JSON, also extracts one short sample clip (.wav, best
+    -effort, via speaker_id.extract_speaker_sample_clip, same helper the
+    single-file Rename Speakers dialog's "Play sample" button uses) per
+    speaker into a "<json stem>_samples" folder next to output_json_path,
+    named "<recording stem>__<label>.wav" - so a batch of 232 speakers
+    across 47 files can be listened to (double-click each .wav in
+    Explorer) while filling in "name" fields, instead of having to reopen
+    every file's dialog just to hear a voice. A speaker's "sample_clip"
+    field is that path if extraction succeeded, else null (no source
+    media found, ffmpeg missing, or the clip failed) - a missing preview
+    must never abort the export.
+
     A missing source recording, or a pyannote/voiceprint failure, for
     one file is logged and that file is still included with blank
     suggestions - one bad file must never lose the rest of the batch's
@@ -1262,7 +1627,8 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
     suggestions for the rest of this export and adds one top-level
     "warning" field to the output instead of one warning per file.
 
-    Returns {"path": output_json_path, "files": <count>, "speakers": <count>}.
+    Returns {"path": output_json_path, "files": <count>, "speakers": <count>,
+    "samples": <count>, "samples_dir": <path>}.
     """
     folder_path = Path(folder)
     if not folder_path.is_dir():
@@ -1271,9 +1637,17 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
     pattern_fn = folder_path.rglob if recursive else folder_path.glob
     segment_files = sorted(pattern_fn("*_segments.json"))
 
+    samples_dir = Path(output_json_path).parent / f"{Path(output_json_path).stem}_samples"
+    ffmpeg_available = speaker_id.check_ffmpeg()
+    if not ffmpeg_available:
+        log.warning("ffmpeg not found (bundled ffmpeg\\bin\\ or PATH) - speaker sample "
+                    "clips will not be extracted for this export; speakers must be "
+                    "named from labels/transcript context alone.")
+
     pyannote_unavailable: str | None = None
     file_entries = []
     total_speakers = 0
+    total_samples = 0
 
     for segments_json in segment_files:
         try:
@@ -1298,6 +1672,7 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
                 log.warning("Voiceprint suggestions unavailable for the rest of this "
                             "export: %s", exc)
 
+        recording_stem = segments_json.stem.replace("_segments", "")
         speakers = []
         for label in labels:
             info = suggestions.get(label) or {}
@@ -1307,11 +1682,25 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
                 "suggested_name": suggested_name,
                 "score": round(info["score"], 3) if info.get("score") is not None else None,
                 "name": suggested_name or "",
+                "sample_clip": None,
             }
             if "embedding" in info:
                 entry["embedding_b64"] = base64.b64encode(
                     speaker_id.serialize_embedding(info["embedding"])).decode("ascii")
                 entry["embedding_dim"] = int(info["embedding"].shape[0])
+            if ffmpeg_available and source_media:
+                clip_path = samples_dir / f"{recording_stem}__{label}.wav"
+                try:
+                    samples_dir.mkdir(parents=True, exist_ok=True)
+                    result_path = speaker_id.extract_speaker_sample_clip(
+                        source_media, segments, label, str(clip_path),
+                        max_duration=CONFIG.get("speaker_sample_seconds", 15.0))
+                    if result_path:
+                        entry["sample_clip"] = result_path
+                        total_samples += 1
+                except Exception as exc:
+                    log.warning("Could not extract sample clip for %s in %s: %s",
+                                label, segments_json, exc)
             speakers.append(entry)
         total_speakers += len(speakers)
 
@@ -1328,7 +1717,9 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
         "note": "Edit each speaker's \"name\" field, then apply with "
                 "apply_speaker_roster_json (GUI: Settings > Apply speaker "
                 "roster JSON...). Leave \"name\" blank, or equal to \"label\", "
-                "to skip a speaker.",
+                "to skip a speaker. Where present, \"sample_clip\" is a short "
+                ".wav in the samples folder next to this JSON: play it to hear "
+                "that voice before naming them.",
         "files": file_entries,
     }
     if pyannote_unavailable:
@@ -1340,9 +1731,11 @@ def export_speaker_roster_json(folder: str, output_json_path: str,
 
     Path(output_json_path).write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info("Speaker roster exported: %d file(s), %d speaker(s) -> %s",
-             len(file_entries), total_speakers, output_json_path)
-    return {"path": output_json_path, "files": len(file_entries), "speakers": total_speakers}
+    log.info("Speaker roster exported: %d file(s), %d speaker(s), %d sample clip(s) -> %s "
+             "(samples: %s)",
+             len(file_entries), total_speakers, total_samples, output_json_path, samples_dir)
+    return {"path": output_json_path, "files": len(file_entries), "speakers": total_speakers,
+            "samples": total_samples, "samples_dir": str(samples_dir)}
 
 
 def apply_speaker_roster_json(json_path: str, overrides: dict | None = None,
@@ -1528,6 +1921,16 @@ def rebuild_outputs(slides_json_path: str, edits: dict, overrides: dict | None =
 
     slides_dir = slides_json_path.parent
     stem = slides_json_path.stem.replace("_slides", "")
+
+    segments_json_path = slides_dir.parent / f"{stem}_segments.json"
+    segments = []
+    if segments_json_path.exists():
+        try:
+            segments = json.loads(segments_json_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("Could not read %s for Q&A slide rebuild: %s", segments_json_path.name, exc)
+    _add_qa_slide(slides, segments, cfg)
+
     video_path = None
     for candidate in slides_dir.parent.glob(f"{stem}.*"):
         if candidate.suffix.lower() in {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}:
@@ -1658,7 +2061,16 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None, progress_
     Row keys (only "file" is required; all others optional, blank/None
     means "use the shared value from the fields above"): file, language,
     meeting_title, meeting_date, meeting_comments, qa_start_time_sec,
-    qa_end_time_sec.
+    qa_end_time_sec, title_slide_image_path, srt_import_path.
+
+    srt_import_path (task: batch YouTube import - each video in the batch
+    can have its own .srt): if set, import_srt_transcript is called for
+    that row BEFORE process_file, so this row's transcription is skipped
+    in favor of the given .srt (see import_srt_transcript's docstring for
+    the cache files this writes). Unlike the other row keys, a failed
+    import does NOT fall through to a real whisperx transcription - that
+    would silently defeat the point of specifying the .srt in the first
+    place - it is logged and counted as an error for that row instead.
 
     Resume/retry and logging mirror run_file_list: a file already fully
     processed (notes generated) is skipped unless force_retranscribe is
@@ -1691,7 +2103,7 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None, progress_
     write_log(log_file, f"Batch (table): {datetime.now()} | {len(rows)} files")
 
     row_override_keys = ("language", "meeting_title", "meeting_date", "meeting_comments",
-                         "qa_start_time_sec", "qa_end_time_sec")
+                         "qa_start_time_sec", "qa_end_time_sec", "title_slide_image_path")
     # "language" is a row-only convenience name; process_file's config key is
     # whisper_language, matching run_file_list's existing |lang convention.
     row_to_cfg_key = {"language": "whisper_language"}
@@ -1726,6 +2138,17 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None, progress_
             val = row.get(key)
             if val not in (None, ""):
                 run_overrides[row_to_cfg_key.get(key, key)] = val
+
+        srt_import_path = (row.get("srt_import_path") or "").strip()
+        if srt_import_path:
+            if not import_srt_transcript(file, srt_import_path, run_overrides):
+                log.error("[%d/%d] .srt import failed for %s <- %s - skipping "
+                          "this file rather than falling back to a real "
+                          "transcription.", i, len(rows), file, srt_import_path)
+                write_log(log_file, f"[{i}] SRT IMPORT FAILED: {file} <- {srt_import_path}")
+                errors += 1
+                _report(i, "error")
+                continue
         try:
             success = process_file(file, run_overrides, stop_check=stop_check)
             dur = (datetime.now() - t_start).seconds
@@ -1757,9 +2180,28 @@ def run_batch_folder(folder: str, overrides: dict, recursive: bool = False, stop
         log.error("Not a folder: %s", folder)
         return
 
+    # Exclude processed_subfolder_name (see move_processed_source_file):
+    # without this, a recursive re-scan of the same parent folder would
+    # pick archived files back up and reprocess them - the whole point of
+    # move_processed_files is that a file, once done, never comes up
+    # again. Filtering here (rather than only relying on files no longer
+    # matching a plain, non-recursive scan) makes recursive=True safe too.
+    cfg = build_run_config(overrides)
+    processed_dirname = (cfg.get("processed_subfolder_name") or "_processed").strip() or "_processed"
+
+    # Exclude "<output_prefix>_enhanced_tmp.wav" stray files: the optional
+    # enhance_audio cleanup pass (see process_file, Step 1) writes this
+    # temporary file next to the source and unlink()s it afterwards, but a
+    # run interrupted mid-transcription (crash, --stop, power loss) can
+    # leave it behind. Left in place, a later batch/recursive scan picks
+    # it up as if it were its own source recording (it matches *.wav) and
+    # fails with "File not found" once whisperx tries to actually read it
+    # via its original, by-then-deleted path.
     pattern_fn = folder.rglob if recursive else folder.glob
     files = sorted(
         p for ext in SUPPORTED_EXTENSIONS for p in pattern_fn(f"*{ext}")
+        if processed_dirname not in p.relative_to(folder).parts
+        and not p.name.endswith("_enhanced_tmp.wav")
     )
     if not files:
         log.info("No supported audio/video files found in: %s", folder)
@@ -1828,27 +2270,19 @@ def run_notes_batch(folder: str, overrides: dict) -> None:
     log.info("NOTES BATCH DONE: OK=%d  Errors=%d  Log: %s", ok, errors, log_file)
 
 
-def run_notes_only(transcript_file: str, overrides: dict) -> None:
-    """Generate notes from an existing *_transcript_speakers.txt (no whisperx)."""
-    cfg = build_run_config(overrides)
-    stem = Path(transcript_file).stem.replace("_transcript_speakers", "")
-    output_prefix = resolve_output_prefix(str(Path(transcript_file).with_name(stem)), cfg)
-    filename = Path(transcript_file).name
-    transcript_text = transcriber.read_transcript_text(transcript_file)
-
-    prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, cfg["prompt_template"])
-    notes_text = notes.generate_notes(
-        transcript_text=transcript_text, prompt_path=prompt_path,
-        llm_backend=cfg["llm_backend"], ollama_base_url=cfg["ollama_base_url"],
-        ollama_notes_model=cfg["ollama_notes_model"], anthropic_api_key=cfg["anthropic_api_key"],
-        claude_model=cfg["claude_model"], filename=filename,
-        single_pass_limit=cfg["single_pass_limit"], chunk_size=cfg["chunk_size"],
-        meeting_title=cfg.get("meeting_title", ""), meeting_date=cfg.get("meeting_date", ""),
-        meeting_comments=cfg.get("meeting_comments", ""),
-    )
-    if not notes_text:
-        raise RuntimeError("Notes generation failed (see log above).")
-
+def _finalize_notes_outputs(transcript_file: str, notes_text: str, cfg: dict,
+                            prompt_path: Path, output_prefix: str, filename: str,
+                            stem: str) -> None:
+    """
+    Write the notes.txt/html/docx/pdf output files and update the DB row
+    for one already-generated notes_text. Extracted out of run_notes_only
+    so this exact same post-processing (report writing, DB upsert with
+    the same db_key resolution) runs identically whether notes_text came
+    from a synchronous call (run_notes_only) or from an Anthropic Message
+    Batch result retrieved later (run_notes_batch_via_batch_api) -
+    duplicating this would risk the two paths silently drifting apart
+    (e.g. one gaining a new output format the other forgets).
+    """
     title = (cfg.get("meeting_title")
             or derive_heading_from_filename(filename)
             or (prompt_path.stem.upper() + " NOTES"))
@@ -1881,6 +2315,7 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
     # during transcription, so this updates that row rather than
     # creating a duplicate); otherwise fall back to the transcript path
     # itself so the notes are still searchable via FTS5.
+    transcript_text = transcriber.read_transcript_text(transcript_file)
     media_dir = Path(transcript_file).parent
     db_key = transcript_file
     for candidate in media_dir.glob(f"{stem}.*"):
@@ -1895,6 +2330,413 @@ def run_notes_only(transcript_file: str, overrides: dict) -> None:
         prompt_template=Path(prompt_path).name, notes_text=notes_text,
     )
     conn.close()
+
+
+def run_notes_only(transcript_file: str, overrides: dict) -> None:
+    """Generate notes from an existing *_transcript_speakers.txt (no whisperx).
+
+    Q&A section (task #61/#112): when qa_start_time_sec isn't set, this
+    just rereads transcript_file verbatim - it already holds the FULL
+    transcript (writing it out happens in Step 1, before any Q&A
+    handling). When qa_start_time_sec IS set, transcript_file alone is no
+    longer enough - it has no timestamps left, and either the exclude
+    case (drop everything from qa_start_time_sec on) or the include case
+    (mark where Q&A starts for the model - see
+    notes.build_transcript_text_with_qa_marker) needs them - so the
+    transcript is rebuilt instead from the matching *_segments.json cache
+    (the same file rename_speakers.py's rename uses), the same way
+    process_file's Step 3 does it. This is what lets the Q&A boundary be
+    set - or corrected - AFTER the original run, typically once Slide
+    Review has pinned down where Q&A actually starts, and the summary
+    regenerated from here (GUI: "Notes-only (existing transcript)" mode,
+    or --notes-only) without re-transcribing.
+    """
+    cfg = build_run_config(overrides)
+    stem = Path(transcript_file).stem.replace("_transcript_speakers", "")
+    output_prefix = resolve_output_prefix(str(Path(transcript_file).with_name(stem)), cfg)
+    filename = Path(transcript_file).name
+
+    qa_start = cfg.get("qa_start_time_sec")
+    qa_end = cfg.get("qa_end_time_sec")
+    qa_include_in_summary = cfg.get("qa_include_in_summary", True)
+    transcript_text = None
+    if qa_start:
+        segments_json_path = Path(str(transcript_file).replace("_transcript_speakers.txt", "_segments.json"))
+        if segments_json_path.exists():
+            segments = json.loads(segments_json_path.read_text(encoding="utf-8"))
+            if not qa_include_in_summary:
+                main_segments = [s for s in segments if s.get("start", 0) < qa_start]
+                if len(main_segments) == len(segments):
+                    log.warning(
+                        "qa_start_time_sec (%.0fs) is set but no transcript segments start "
+                        "at/after it - check the value: it must be already-converted real "
+                        "time in seconds, matching the transcript/slide report timestamps.",
+                        qa_start)
+                transcript_text = notes.build_transcript_text_from_segments(main_segments)
+            else:
+                transcript_text = notes.build_transcript_text_with_qa_marker(
+                    segments, qa_start, qa_end)
+        else:
+            log.warning(
+                "qa_start_time_sec is set but no matching segment cache (%s) was found "
+                "next to %s - regenerating notes from the plain transcript file, "
+                "unfiltered/unmarked (Q&A stays in the summary either way, but without "
+                "the exclude filter or the marker that helps the model find it).",
+                segments_json_path.name, filename)
+    if transcript_text is None:
+        transcript_text = transcriber.read_transcript_text(transcript_file)
+
+    prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, cfg["prompt_template"])
+    notes_text = notes.generate_notes(
+        transcript_text=transcript_text, prompt_path=prompt_path,
+        llm_backend=cfg["llm_backend"], ollama_base_url=cfg["ollama_base_url"],
+        ollama_notes_model=cfg["ollama_notes_model"], anthropic_api_key=cfg["anthropic_api_key"],
+        claude_model=cfg["claude_model"], filename=filename,
+        single_pass_limit=cfg["single_pass_limit"], chunk_size=cfg["chunk_size"],
+        meeting_title=cfg.get("meeting_title", ""), meeting_date=cfg.get("meeting_date", ""),
+        meeting_comments=cfg.get("meeting_comments", ""),
+        output_language=cfg.get("output_language", "auto"),
+        ollama_num_ctx=cfg.get("ollama_notes_num_ctx", 16_384),
+    )
+    if not notes_text:
+        raise RuntimeError("Notes generation failed (see log above).")
+
+    _finalize_notes_outputs(transcript_file, notes_text, cfg, prompt_path, output_prefix,
+                            filename, stem)
+
+
+def run_notes_batch_via_batch_api(folder: str, overrides: dict,
+                                  poll_interval_sec: int = 30, stop_check=None) -> None:
+    """
+    Anthropic-only alternative to run_notes_batch: submits every pending
+    file's notes-generation request as ONE Anthropic Message Batch instead
+    of one live API call per file. Both input and output tokens are
+    billed at 50% of standard prices, and the prompt-caching discount on
+    the shared system prompt (see notes._build_anthropic_request) stacks
+    on top when the same recording_type/prompt_template/output_language
+    is used across the batch.
+
+    Deliberately a SEPARATE function from run_notes_batch rather than a
+    flag on it: this only makes sense for cfg["llm_backend"] == "anthropic"
+    (there is no Ollama batch API), it needs the whole file list up front
+    to submit as one batch instead of processing file-by-file, and it can
+    take anywhere from a couple of minutes up to the batch's 24-hour
+    expiry window to come back - not something you want a synchronous,
+    live-progress GUI/CLI run to silently turn into. run_notes_batch (one
+    call per file, immediate per-file results) is unchanged and remains
+    the default; use this one explicitly (--notes-batch-api) when
+    processing enough files that the cost/throughput trade-off is worth
+    the wait.
+
+    poll_interval_sec: how often to check the batch's processing_status
+    while waiting (Anthropic's own guidance uses 60s; 30s here trades a
+    few extra, cheap status-check calls for a shorter perceived wait on
+    the smaller batches this pipeline is likely to submit).
+
+    stop_check (optional): checked between polls. If it returns True, the
+    batch is canceled server-side (client.messages.batches.cancel) rather
+    than just abandoning our wait - a canceled batch still returns partial
+    results for anything that finished before cancellation, which are
+    then processed exactly like a normal completed batch's results.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        log.error("Not a folder: %s", folder)
+        return
+    transcripts = sorted(folder.glob("*_transcript_speakers.txt"))
+    if not transcripts:
+        log.info("No *_transcript_speakers.txt files found in: %s", folder)
+        return
+
+    cfg = build_run_config(overrides)
+    if cfg["llm_backend"] != "anthropic":
+        log.error("--notes-batch-api requires llm_backend=anthropic (got '%s'). "
+                 "Use --notes-batch for the ollama backend.", cfg["llm_backend"])
+        return
+    api_key = cfg.get("anthropic_api_key", "")
+    if not api_key or api_key.startswith("sk-ant-..."):
+        log.error("ANTHROPIC_API_KEY not set in keys.cfg - skipping batch submission.")
+        return
+
+    prompt_path = notes.resolve_prompt_path(PROMPTS_DIR, cfg["prompt_template"])
+    log_file = folder / f"notes_batch_api_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    write_log(log_file, f"Notes batch (Anthropic Batches API): {datetime.now()} | {folder}")
+
+    # Build one batch request per pending file, same skip rule as
+    # run_notes_batch (an existing _notes.txt means this file was already
+    # done - by either mode; the two are interchangeable from here on).
+    pending: dict[str, Path] = {}  # custom_id -> transcript file path
+    for i, tf in enumerate(transcripts, 1):
+        notes_file = Path(str(tf).replace("_transcript_speakers.txt", "_notes.txt"))
+        if notes_file.exists():
+            write_log(log_file, f"SKIPPED (already has notes): {tf.name}")
+            continue
+        pending[f"item-{i}"] = tf
+
+    if not pending:
+        log.info("Nothing to submit - every transcript already has notes.")
+        return
+
+    import anthropic
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request as BatchRequest
+
+    requests = []
+    for custom_id, tf in pending.items():
+        transcript_text = transcriber.read_transcript_text(str(tf))
+        request_body = notes.build_anthropic_batch_request(
+            transcript_text=transcript_text, prompt_path=prompt_path, filename=tf.name,
+            claude_model=cfg["claude_model"],
+            meeting_title=cfg.get("meeting_title", ""), meeting_date=cfg.get("meeting_date", ""),
+            meeting_comments=cfg.get("meeting_comments", ""),
+            output_language=cfg.get("output_language", "auto"),
+        )
+        requests.append(BatchRequest(
+            custom_id=custom_id,
+            params=MessageCreateParamsNonStreaming(**request_body),
+        ))
+
+    client = anthropic.Anthropic(api_key=api_key)
+    log.info("NOTES BATCH (Anthropic Batches API): submitting %d request(s).", len(requests))
+    batch = client.messages.batches.create(requests=requests)
+    write_log(log_file, f"Submitted batch {batch.id} with {len(requests)} request(s).")
+    log.info("Batch %s submitted - polling every %ds (Ctrl+C-safe; the batch keeps "
+             "running server-side even if this process stops).", batch.id, poll_interval_sec)
+
+    import time
+    while True:
+        batch = client.messages.batches.retrieve(batch.id)
+        if batch.processing_status == "ended":
+            break
+        if stop_check is not None and stop_check():
+            log.info("Stop requested - canceling batch %s.", batch.id)
+            client.messages.batches.cancel(batch.id)
+            write_log(log_file, f"Canceled by user: {batch.id}")
+            while batch.processing_status != "ended":
+                time.sleep(poll_interval_sec)
+                batch = client.messages.batches.retrieve(batch.id)
+            break
+        log.info("Batch %s: %s (processing=%d succeeded=%d errored=%d)", batch.id,
+                 batch.processing_status, batch.request_counts.processing,
+                 batch.request_counts.succeeded, batch.request_counts.errored)
+        time.sleep(poll_interval_sec)
+
+    ok, errors = 0, 0
+    for result in client.messages.batches.results(batch.id):
+        tf = pending.get(result.custom_id)
+        if tf is None:
+            log.warning("Batch result with unknown custom_id %r - skipping.", result.custom_id)
+            continue
+        if result.result.type != "succeeded":
+            log.error("Batch item failed (%s) for %s.", result.result.type, tf.name)
+            write_log(log_file, f"ERROR ({result.result.type}): {tf.name}")
+            errors += 1
+            continue
+        notes_text = notes._extract_text_block(result.result.message.content)
+        if not notes_text:
+            log.error("Batch item for %s succeeded but had no text block.", tf.name)
+            write_log(log_file, f"ERROR (no text block): {tf.name}")
+            errors += 1
+            continue
+        try:
+            file_stem = tf.stem.replace("_transcript_speakers", "")
+            output_prefix = resolve_output_prefix(str(tf.with_name(file_stem)), cfg)
+            _finalize_notes_outputs(str(tf), notes_text, cfg, prompt_path, output_prefix,
+                                    tf.name, file_stem)
+            write_log(log_file, f"OK: {tf.name}")
+            ok += 1
+        except Exception as e:
+            log.error("Finalizing batch result for %s failed: %s", tf.name, e)
+            write_log(log_file, f"ERROR (finalize): {tf.name} -- {e}")
+            errors += 1
+
+    write_log(log_file, f"Done: OK={ok} Errors={errors}")
+    log.info("NOTES BATCH (Anthropic Batches API) DONE: OK=%d  Errors=%d  Log: %s",
+             ok, errors, log_file)
+
+
+# ---------------------------------------------------------------------------
+# Document translation (Translate tab/CLI): txt/docx/pptx/pdf/images.
+# Independent of the audio/video pipeline above - no whisper/notes/slides
+# involved. translator.py does the LLM calls, doc_translate.py does the
+# per-format file I/O; this section only wires config + batch/log
+# conventions around them, mirroring run_file_list/run_batch_folder.
+# ---------------------------------------------------------------------------
+
+def _make_translate_fn(cfg: dict, target_language: str):
+    """Build a translate_fn(text) -> str|None closure binding the
+    configured LLM backend/model, for doc_translate.translate_file. Kept
+    here (not in translator.py/doc_translate.py) so neither of those
+    modules needs to know about config.py/CONFIG at all."""
+    import translator
+
+    def _fn(text: str):
+        return translator.translate_text(
+            text, target_language,
+            llm_backend=cfg["llm_backend"],
+            ollama_base_url=cfg["ollama_base_url"],
+            ollama_translate_model=cfg.get("ollama_translate_model") or cfg["ollama_notes_model"],
+            anthropic_api_key=cfg["anthropic_api_key"],
+            claude_model=cfg["claude_model"],
+            chunk_size=cfg.get("translate_chunk_size", 6_000),
+            ollama_num_ctx=cfg.get("ollama_translate_num_ctx", 8_192),
+        )
+    return _fn
+
+
+def _resolve_ocr_language(cfg: dict) -> str:
+    """
+    Map cfg["translate_ocr_language"] (a code from config.LANGUAGE_NAMES,
+    "auto", or a raw Tesseract --lang string) to what
+    doc_translate.translate_file's ocr_lang expects. This is the OCR
+    SOURCE language/script (what Tesseract should expect to see in the
+    image) - unrelated to target_language (what the translation is
+    written into). Getting this wrong is the #1 cause of "translation
+    doesn't make sense": Tesseract silently misreads a non-Latin script
+    (e.g. Chinese slides) as English-shaped glyphs, and the LLM then
+    faithfully "translates" that garbage into fluent-sounding nonsense
+    (observed 2026-07-18 - see doc_translate._ocr_image_text).
+    "auto" is not true language identification (Tesseract has no
+    reliable way to do that) - it resolves to a fixed "eng+deu" default.
+    """
+    from config import TESSERACT_LANG_MAP
+    code = cfg.get("translate_ocr_language", "auto")
+    if not code or code == "auto":
+        return "eng+deu"
+    return TESSERACT_LANG_MAP.get(code, code)
+
+
+def translate_single_file(path: str, target_language: str, overrides: dict):
+    """Translate one file. Returns the written output Path. Raises on
+    failure (unsupported type, missing file, OCR/extraction error) -
+    callers decide how to surface that (GUI dialog, CLI exit code)."""
+    import doc_translate
+    cfg = build_run_config(overrides)
+    translate_fn = _make_translate_fn(cfg, target_language)
+    return doc_translate.translate_file(
+        path, target_language, translate_fn,
+        output_dir_override=cfg.get("output_dir_override", ""),
+        ocr_lang=_resolve_ocr_language(cfg),
+    )
+
+
+def translate_batch_folder(folder: str, target_language: str, overrides: dict,
+                           stop_check=None, progress_callback=None) -> tuple[int, int]:
+    """Translate every supported file (doc_translate.TRANSLATABLE_EXTENSIONS)
+    found directly in folder (not recursive, matching run_batch_folder's
+    default). progress_callback(index, status), if given, is called with
+    the file's 1-based position and one of "running"/"done"/"failed"/
+    "error" - same convention as run_batch_rows, used by the GUI's batch
+    table Status column."""
+    import doc_translate
+    cfg = build_run_config(overrides)
+    translate_fn = _make_translate_fn(cfg, target_language)
+
+    folder_path = Path(folder)
+    files = sorted(
+        p for p in folder_path.iterdir()
+        if p.is_file() and p.suffix.lower() in doc_translate.TRANSLATABLE_EXTENSIONS
+    )
+    log_file = folder_path / f"translate_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    log.info("TRANSLATE BATCH (folder): %d file(s)", len(files))
+    write_log(log_file, f"Translate batch: {datetime.now()} | {folder} | {len(files)} files | -> {target_language}")
+
+    ok, errors = 0, 0
+    for i, f in enumerate(files, 1):
+        if stop_check is not None and stop_check():
+            log.info("Stop requested - halting translation batch after %d/%d file(s).", i - 1, len(files))
+            write_log(log_file, f"Stopped by user before [{i}]: {f.name}")
+            break
+        if progress_callback is not None:
+            try:
+                progress_callback(i, "running")
+            except Exception:
+                pass
+        log.info("[%d/%d] %s", i, len(files), f.name)
+        try:
+            dest = doc_translate.translate_file(
+                str(f), target_language, translate_fn,
+                output_dir_override=cfg.get("output_dir_override", ""),
+                ocr_lang=_resolve_ocr_language(cfg),
+            )
+            write_log(log_file, f"[{i}] OK: {f.name} -> {dest.name}")
+            ok += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(i, "done")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error("Translation failed for %s: %s", f.name, e)
+            write_log(log_file, f"[{i}] ERROR: {f.name} -- {e}")
+            errors += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(i, "failed")
+                except Exception:
+                    pass
+    write_log(log_file, f"Done: OK={ok} Errors={errors}")
+    log.info("TRANSLATE BATCH DONE: OK=%d  Errors=%d  Log: %s", ok, errors, log_file)
+    return ok, errors
+
+
+def translate_file_list(list_file: str, target_language: str, overrides: dict,
+                        stop_check=None, progress_callback=None) -> tuple[int, int]:
+    """Translate every path listed in list_file (one per line, blank/#
+    lines ignored), mirroring run_file_list's plain-text list format."""
+    import doc_translate
+    cfg = build_run_config(overrides)
+    translate_fn = _make_translate_fn(cfg, target_language)
+
+    entries = []
+    with open(list_file, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line)
+
+    log_file = Path(list_file).parent / f"translate_log_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt"
+    log.info("TRANSLATE BATCH (file list): %d file(s)", len(entries))
+    write_log(log_file, f"Translate batch: {datetime.now()} | {list_file} | {len(entries)} files | -> {target_language}")
+
+    ok, errors = 0, 0
+    for i, path in enumerate(entries, 1):
+        if stop_check is not None and stop_check():
+            log.info("Stop requested - halting translation batch after %d/%d file(s).", i - 1, len(entries))
+            write_log(log_file, f"Stopped by user before [{i}]: {path}")
+            break
+        if progress_callback is not None:
+            try:
+                progress_callback(i, "running")
+            except Exception:
+                pass
+        log.info("[%d/%d] %s", i, len(entries), path)
+        try:
+            dest = doc_translate.translate_file(
+                path, target_language, translate_fn,
+                output_dir_override=cfg.get("output_dir_override", ""),
+                ocr_lang=_resolve_ocr_language(cfg),
+            )
+            write_log(log_file, f"[{i}] OK: {path} -> {dest.name}")
+            ok += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(i, "done")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error("Translation failed for %s: %s", path, e)
+            write_log(log_file, f"[{i}] ERROR: {path} -- {e}")
+            errors += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(i, "failed")
+                except Exception:
+                    pass
+    write_log(log_file, f"Done: OK={ok} Errors={errors}")
+    log.info("TRANSLATE BATCH DONE: OK=%d  Errors=%d  Log: %s", ok, errors, log_file)
+    return ok, errors
 
 
 # ---------------------------------------------------------------------------
@@ -1964,12 +2806,32 @@ def parse_args() -> argparse.Namespace:
                         "--meeting-date/--comments still take precedence.")
     p.add_argument("--whisper-model", type=str, help="tiny|base|small|medium|large-v2|large-v3.")
     p.add_argument("--language", dest="language_flag", type=str, help="de|en|auto (flag form).")
+    p.add_argument("--output-language", type=str, metavar="LANG",
+                   help="Force the generated notes/summary AND VLM slide title/bullets into "
+                        "this language (e.g. de, en, fr), independent of --language/whisper's "
+                        "own transcription language. \"auto\" (default): no instruction added, "
+                        "notes/slides follow the transcript's/slide's own language. The verbatim "
+                        "transcript file is never translated.")
     p.add_argument("--llm-backend", choices=["ollama", "anthropic"])
     p.add_argument("--no-slides", action="store_true", help="Skip slide detection/VLM even for a video file.")
     p.add_argument("--no-vlm", action="store_true", help="Detect slides but skip VLM annotation.")
     p.add_argument("--no-whisper", action="store_true", help="Skip transcription.")
     p.add_argument("--no-summary", action="store_true", help="Skip notes/summary generation.")
     p.add_argument("--force-retranscribe", action="store_true", help="Ignore transcript cache.")
+    p.add_argument("--import-srt", type=str, metavar="SRT_FILE",
+                   help="Import SRT_FILE as the transcript for 'file' (the positional video/audio "
+                        "argument) instead of running whisperx - writes the same cache files a real "
+                        "transcription would, so any later run (Notes-only or full Video/Webinar "
+                        "with slides) skips re-transcription. Combine with --force-retranscribe to "
+                        "overwrite an existing transcript cache.")
+    p.add_argument("--date-subject-filename", action="store_true",
+                   help="Name output files \"YYYYMMDD_Subject\" from meeting_date/meeting_title "
+                        "instead of the source filename (falls back to the usual naming when "
+                        "meeting_title is blank). See CONFIG['use_date_subject_filename'].")
+    p.add_argument("--move-processed", action="store_true",
+                   help="After a file finishes successfully, move the source audio/video file "
+                        "into a processed_subfolder_name subfolder next to it (default "
+                        "\"_processed\"). Off by default. See CONFIG['move_processed_files'].")
     p.add_argument("--enhance-audio", action="store_true",
                    help="Run a conservative ffmpeg cleanup pass (rumble/hum filter, mild "
                         "denoise, volume normalization) on a temporary copy before "
@@ -1983,13 +2845,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--qa-start", type=float, metavar="SEC",
                    help="Start of a Q&A section, in seconds (already-converted real time, "
                         "matching the transcript/slide report). No new slides are detected from "
-                        "this point onward (to --qa-end, or the end of the recording). The "
-                        "matching transcript gets a separate, focused Q&A summary "
-                        "(prompts/qa_summary.md) appended to the notes, instead of being folded "
-                        "into the main summary.")
+                        "this point onward (to --qa-end, or the end of the recording). By "
+                        "default the matching transcript stays in the main transcript and is "
+                        "summarised by the same prompt/pass as the rest of the recording; pass "
+                        "--qa-exclude-from-summary to drop it from the summary instead.")
     p.add_argument("--qa-end", type=float, metavar="SEC",
                    help="End of the Q&A section, in seconds. Only used together with --qa-start. "
                         "Default: to the end of the recording.")
+    p.add_argument("--qa-exclude-from-summary", action="store_true",
+                   help="Only used together with --qa-start. Drop the Q&A section from the "
+                        "notes/summary entirely (its 'QUESTIONS & ANSWERS' section falls back to "
+                        "'No Q&A session') instead of the default of folding it into the same "
+                        "summary prompt. See CONFIG['qa_include_in_summary'].")
     p.add_argument("--animation-threshold", type=int, metavar="N",
                    help="Distances between this and --threshold are treated as the current slide "
                         "still building (e.g. bullets appearing one at a time), instead of a new "
@@ -2005,6 +2872,12 @@ def parse_args() -> argparse.Namespace:
                    help="Generate notes from an existing *_transcript_speakers.txt.")
     p.add_argument("--notes-batch", metavar="FOLDER",
                    help="Generate notes for every *_transcript_speakers.txt in FOLDER.")
+    p.add_argument("--notes-batch-api", metavar="FOLDER",
+                   help="Like --notes-batch, but submits every pending file as ONE Anthropic "
+                        "Message Batch (50%% off standard API prices, stacks with prompt "
+                        "caching) instead of one live call per file. Anthropic backend only "
+                        "(llm_backend=anthropic); can take minutes to hours to come back - "
+                        "see run_notes_batch_via_batch_api's docstring.")
     p.add_argument("--file-list", metavar="LIST_FILE",
                    help="Batch-process every file listed in LIST_FILE (one path per line).")
     p.add_argument("--batch-folder", metavar="FOLDER",
@@ -2017,6 +2890,30 @@ def parse_args() -> argparse.Namespace:
                         "snapshots already on disk. Updates JSON/CSV/HTML/PDF/DB in place.")
     p.add_argument("--log-file", action="store_true",
                    help="Also write this run's log to a timestamped file under log_dir (see config.py).")
+
+    # --- Document translation (Translate tab/CLI): independent of the
+    # audio/video pipeline above - no whisper/notes/slides involved.
+    p.add_argument("--translate", metavar="FILE",
+                   help="Translate a single txt/docx/pptx/pdf/image file into --target-language. "
+                        "docx/pptx/txt keep their format; pdf/images are written as a translated "
+                        ".docx (see doc_translate.py). Legacy .doc/.ppt are not supported.")
+    p.add_argument("--translate-batch-folder", metavar="FOLDER",
+                   help="Translate every supported file found directly in FOLDER into "
+                        "--target-language.")
+    p.add_argument("--translate-file-list", metavar="LIST_FILE",
+                   help="Translate every path listed in LIST_FILE (one per line, # comments "
+                        "ignored) into --target-language.")
+    p.add_argument("--target-language", type=str, metavar="LANG",
+                   help="Target language for --translate/--translate-batch-folder/"
+                        "--translate-file-list, e.g. de, en, fr (see config.LANGUAGE_NAMES). "
+                        "Required for those flags; unrelated to --language/--output-language above.")
+    p.add_argument("--ocr-language", type=str, metavar="LANG",
+                   help="OCR SOURCE language/script for image inputs to --translate/etc., e.g. "
+                        "de, zh (see config.TESSERACT_LANG_MAP), or a raw Tesseract --lang string "
+                        "(e.g. chi_sim, deu+fra). NOT the translation target - this is what script "
+                        "Tesseract should expect to see in the image. Getting this wrong silently "
+                        "garbles non-Latin scripts into fluent-sounding nonsense once translated. "
+                        "Default: config.py's translate_ocr_language (\"auto\" = \"eng+deu\").")
     return p.parse_args()
 
 
@@ -2055,12 +2952,15 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "prompt_template":     prompt_template,
         "whisper_model":       args.whisper_model,
         "whisper_language":    language,
+        "output_language":     args.output_language,
         "llm_backend":         args.llm_backend,
         "enable_slides":       False if args.no_slides else mode_slides,
         "enable_vlm":          False if args.no_vlm else mode_vlm,
         "enable_whisper":      False if args.no_whisper else None,
         "no_summary":          True if args.no_summary else None,
         "force_retranscribe":  True if args.force_retranscribe else None,
+        "use_date_subject_filename": True if args.date_subject_filename else None,
+        "move_processed_files": True if args.move_processed else None,
         "enhance_audio":       True if args.enhance_audio else None,
         "dry_run":             True if args.dry_run else None,
         "enable_diarization":  True if args.diarize else None,
@@ -2069,6 +2969,7 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "animation_threshold": args.animation_threshold,
         "qa_start_time_sec": args.qa_start,
         "qa_end_time_sec": args.qa_end,
+        "qa_include_in_summary": False if args.qa_exclude_from_summary else None,
         "recording_speed":     args.recording_speed,
         "convert_video_to_realtime": True if args.normalize_speed else None,
         "title_slide_image_path": args.title_image,
@@ -2080,6 +2981,7 @@ def overrides_from_args(args: argparse.Namespace) -> dict:
         "meeting_date":        meeting_date,
         "meeting_comments":    meeting_comments,
         "output_basename_override": args.output_name,
+        "translate_ocr_language": args.ocr_language,
     }
     return {k: v for k, v in overrides.items() if v is not None}
 
@@ -2103,12 +3005,30 @@ def main() -> int:
 
     overrides = overrides_from_args(args)
 
+    if args.translate or args.translate_batch_folder or args.translate_file_list:
+        target_language = args.target_language or CONFIG.get("translate_target_language", "en")
+        if not args.target_language:
+            log.info("--target-language not given, using default: %s", target_language)
+        if args.translate:
+            dest = translate_single_file(args.translate, target_language, overrides)
+            log.info("Translated: %s", dest)
+            return 0
+        if args.translate_batch_folder:
+            ok, errors = translate_batch_folder(args.translate_batch_folder, target_language, overrides)
+            return 0 if errors == 0 else 1
+        ok, errors = translate_file_list(args.translate_file_list, target_language, overrides)
+        return 0 if errors == 0 else 1
+
     if args.reannotate_failed:
         retried, still_failed = reannotate_failed_slides(args.reannotate_failed, overrides)
         return 0 if still_failed == 0 else 1
 
     if args.notes_batch:
         run_notes_batch(args.notes_batch, overrides)
+        return 0
+
+    if args.notes_batch_api:
+        run_notes_batch_via_batch_api(args.notes_batch_api, overrides)
         return 0
 
     if args.notes_only:
@@ -2127,6 +3047,10 @@ def main() -> int:
     if not file:
         log.info("No file selected.")
         return 0
+
+    if args.import_srt:
+        ok = import_srt_transcript(file, args.import_srt, overrides)
+        return 0 if ok else 1
 
     ok = process_file(file, overrides)
     return 0 if ok else 1

@@ -325,6 +325,24 @@ def save_csv(slides: list[dict], output_path: Path) -> None:
     log.info("CSV saved: %s", output_path)
 
 
+def _qa_pairs_html(qa_pairs: list[dict]) -> str:
+    """Render extracted Q&A pairs (see notes.generate_qa_pairs) as HTML
+    for the slide report's synthetic "Q&A Session" card. Shared by
+    save_html and save_html_for_pdf. Returns "" if qa_pairs is empty -
+    callers fall back to the raw transcript excerpt in that case."""
+    if not qa_pairs:
+        return ""
+    parts = []
+    for pair in qa_pairs:
+        q = pair.get("question", "")
+        a = pair.get("answer", "")
+        parts.append(
+            f'<div class="qa-pair"><p class="qa-q"><strong>Q:</strong> {q}</p>'
+            f'<p class="qa-a"><strong>A:</strong> {a}</p></div>'
+        )
+    return "".join(parts)
+
+
 def save_html(slides: list[dict], output_path: Path, video_name: str = "",
              meeting_title: str = "", meeting_date: str = "", meeting_comments: str = "",
              show_image: bool = True, show_bullets: bool = True, show_transcript: bool = True,
@@ -355,9 +373,16 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "",
 </div>"""
 
     cards = ""
-    for i, slide in enumerate(slides, start=1):
+    real_num = 0
+    for slide in slides:
+        is_qa = slide.get("slide_type") == "qa_session"
+        if is_qa:
+            real_num_label = "Q&A"
+        else:
+            real_num += 1
+            real_num_label = f"Slide {real_num}"
         ts = format_ts(slide.get("timestamp_sec", 0))
-        title = slide.get("title") or f"Slide {i}"
+        title = slide.get("title") or real_num_label
         stype = slide.get("slide_type", "")
         bullets = slide.get("bullets", [])
         if isinstance(bullets, str):
@@ -368,27 +393,37 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "",
         snap = slide.get("snapshot_path", "")
 
         img_tag = ""
-        if show_image:
+        if show_image and not is_qa:
             try:
                 snap_rel = Path(snap).name
-                img_tag = f'<img src="snapshots/{snap_rel}" alt="Slide {i}" loading="lazy">'
+                img_tag = f'<img src="snapshots/{snap_rel}" alt="{real_num_label}" loading="lazy">'
             except Exception:
                 img_tag = '<div class="no-img">No snapshot</div>'
-        thumb_html = f'<div class="thumb">{img_tag}</div>' if show_image else ""
+        thumb_html = f'<div class="thumb">{img_tag}</div>' if (show_image and not is_qa) else ""
 
         bullet_html = ""
-        if show_bullets:
+        if show_bullets and not is_qa:
             bullet_html = "<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:5]) + "</ul>"
-        transcript_html = (
-            f'<p class="transcript">{transcript[:300]}</p>'
-            if show_transcript and transcript else ""
-        )
+
+        if is_qa:
+            qa_html = _qa_pairs_html(slide.get("qa_pairs") or [])
+            if qa_html:
+                transcript_html = f'<div class="qa-pairs">{qa_html}</div>'
+            elif show_transcript and transcript:
+                transcript_html = f'<p class="transcript">{transcript}</p>'
+            else:
+                transcript_html = '<p class="qa-empty">No Q&amp;A content captured.</p>'
+        else:
+            transcript_html = (
+                f'<p class="transcript">{transcript}</p>'
+                if show_transcript and transcript else ""
+            )
 
         cards += f"""
-        <div class="card">
+        <div class="card{' qa-card' if is_qa else ''}">
             {thumb_html}
             <div class="meta">
-                <span class="num">Slide {i}</span>
+                <span class="num">{real_num_label}</span>
                 <span class="ts">{ts}</span>
                 <span class="stype">{stype}</span>
                 <h3>{title}</h3>
@@ -419,6 +454,12 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "",
   ul   {{ margin: 0.2rem 0; padding-left: 1.2rem; font-size: 0.83rem; color: #444; }}
   li   {{ margin: 0.1rem 0; }}
   .transcript {{ font-size: 0.78rem; color: #666; margin-top: 0.4rem; border-top: 1px solid #eee; padding-top: 0.4rem; }}
+  .qa-card {{ border: 1px solid #d8e6ff; }}
+  .qa-pairs {{ margin-top: 0.4rem; }}
+  .qa-pair {{ margin-bottom: 0.5rem; }}
+  .qa-q {{ font-size: 0.83rem; color: #1a1a1a; margin: 0.2rem 0; }}
+  .qa-a {{ font-size: 0.83rem; color: #444; margin: 0.1rem 0 0.3rem 0.8rem; }}
+  .qa-empty {{ font-size: 0.78rem; color: #999; font-style: italic; }}
   .meeting-info {{ font-size: 0.85rem; color: #1a56db; margin-bottom: 0.4rem; }}
   .meeting-comments {{ font-size: 0.82rem; color: #666; font-style: italic; margin-bottom: 0.8rem; }}
   .cover-slide {{ background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 1.5rem; }}
@@ -434,7 +475,7 @@ def save_html(slides: list[dict], output_path: Path, video_name: str = "",
 {f'<div class="meeting-comments">Comments: {meeting_comments}</div>' if meeting_comments else ""}
 <div class="meta-bar">
   Video: <strong>{video_name}</strong> &nbsp;|&nbsp;
-  Slides detected: <strong>{len(slides)}</strong>
+  Slides detected: <strong>{real_num}</strong>
   {f'&nbsp;|&nbsp; Recording speed: <strong>{recording_speed}x</strong> (timestamps converted: real_time = video_time / {recording_speed})' if recording_speed != 1.0 else ""}
 </div>
 {cover_html}
@@ -470,14 +511,24 @@ def save_slide_timing_summary(slides: list[dict], output_path: Path, video_name:
     if recording_speed != 1.0:
         lines.append(f"Recording speed: {recording_speed}x (timestamps converted: "
                      f"real_time = video_time / {recording_speed})")
-    lines += [f"Slides detected: {len(slides)}", ""]
-    for i, slide in enumerate(slides, start=1):
+    real_total = sum(1 for s in slides if s.get("slide_type") != "qa_session")
+    lines += [f"Slides detected: {real_total}", ""]
+    real_num = 0
+    for slide in slides:
+        is_qa = slide.get("slide_type") == "qa_session"
         ts = format_ts(slide.get("timestamp_sec", 0))
-        title = slide.get("title") or ""
-        line = f"Slide {i:03d}  {ts}"
+        if is_qa:
+            label = "Q&A      "
+            title = slide.get("title") or "Q&A Session"
+        else:
+            real_num += 1
+            label = f"Slide {real_num:03d}"
+            title = slide.get("title") or ""
+        line = f"{label}  {ts}"
         if title:
             line += f"  {title}"
         lines.append(line)
+
     with open(output_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     log.info("Slide timing summary saved: %s", output_path)
@@ -542,39 +593,57 @@ def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "
 </div>"""
 
     pages = ""
-    for i, slide in enumerate(slides, start=1):
+    total_real = sum(1 for s in slides if s.get("slide_type") != "qa_session")
+    real_num = 0
+    for idx, slide in enumerate(slides, start=1):
+        is_qa = slide.get("slide_type") == "qa_session"
+        if is_qa:
+            real_num_label = "Q&A"
+        else:
+            real_num += 1
+            real_num_label = f"Slide {real_num}"
         ts      = format_ts(slide.get("timestamp_sec", 0))
-        title   = slide.get("title") or f"Slide {i}"
+        title   = slide.get("title") or real_num_label
         stype   = slide.get("slide_type", "")
         bullets = slide.get("bullets", [])
         if isinstance(bullets, str):
             bullets = [bullets]
         transcript = slide.get("transcript_seg", "") or ""
-        transcript = _first_sentence(transcript) if transcript_mode == "first_sentence" else transcript[:400]
+        transcript = _first_sentence(transcript) if transcript_mode == "first_sentence" else transcript
         snap = slide.get("snapshot_path", "")
 
         img_html = ""
-        if show_image:
+        if show_image and not is_qa:
             try:
                 snap_rel = Path(snap).name
-                img_html = f'<img src="snapshots/{snap_rel}" alt="Slide {i}">'
+                img_html = f'<img src="snapshots/{snap_rel}" alt="{real_num_label}">'
             except Exception:
                 img_html = '<div class="no-snap">No snapshot</div>'
-        snap_html = f'<div class="snap">{img_html}</div>' if show_image else ""
+        snap_html = f'<div class="snap">{img_html}</div>' if (show_image and not is_qa) else ""
 
-        bullet_html = ("<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:5]) + "</ul>") if show_bullets else ""
-        transcript_html = (
-            f'<div class="transcript"><strong>Transcript:</strong> {transcript}</div>'
-            if show_transcript and transcript else ""
-        )
-        page_break = "page-break-after: always;" if i < len(slides) else ""
+        bullet_html = ("<ul>" + "".join(f"<li>{b}</li>" for b in bullets[:5]) + "</ul>") if (show_bullets and not is_qa) else ""
+
+        if is_qa:
+            qa_html = _qa_pairs_html(slide.get("qa_pairs") or [])
+            if qa_html:
+                transcript_html = f'<div class="qa-pairs">{qa_html}</div>'
+            elif show_transcript and transcript:
+                transcript_html = f'<div class="transcript"><strong>Transcript:</strong> {transcript}</div>'
+            else:
+                transcript_html = '<div class="qa-empty">No Q&amp;A content captured.</div>'
+        else:
+            transcript_html = (
+                f'<div class="transcript"><strong>Transcript:</strong> {transcript}</div>'
+                if show_transcript and transcript else ""
+            )
+        page_break = "page-break-after: always;" if idx < len(slides) else ""
 
         pages += f"""
-<div class="slide-page" style="{page_break}">
+<div class="slide-page{' qa-page' if is_qa else ''}" style="{page_break}">
   <div class="slide-header">
     <span class="ts">{ts}</span>
     <span class="stype">{stype}</span>
-    <span class="num">Slide {i} / {len(slides)}</span>
+    <span class="num">{real_num_label} / {total_real}</span>
   </div>
   {snap_html}
   <div class="annotation">
@@ -605,6 +674,11 @@ def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "
   .annotation h2 {{ font-size: 11pt; font-weight: bold; color: #1a1a1a; margin-bottom: 2mm; }}
   ul {{ padding-left: 5mm; font-size: 9pt; color: #333; line-height: 1.5; }}
   .transcript {{ font-size: 8pt; color: #666; margin-top: 2mm; border-top: 1px solid #eee; padding-top: 2mm; line-height: 1.4; }}
+  .qa-pairs {{ margin-top: 2mm; }}
+  .qa-pair {{ margin-bottom: 3mm; }}
+  .qa-q {{ font-size: 9pt; color: #1a1a1a; margin-bottom: 1mm; }}
+  .qa-a {{ font-size: 9pt; color: #444; margin-left: 4mm; }}
+  .qa-empty {{ font-size: 8pt; color: #999; font-style: italic; }}
   .cover {{ font-size: 9pt; color: #888; margin-bottom: 4mm; border-bottom: 2px solid #1a56db; padding-bottom: 3mm; }}
   .cover strong {{ color: #1a56db; font-size: 13pt; }}
   .cover .comments {{ font-style: italic; color: #666; margin-top: 1mm; }}
@@ -622,7 +696,7 @@ def save_html_for_pdf(slides: list[dict], output_path: Path, video_name: str = "
   <strong>{meeting_title or ("Slide Report: " + video_name)}</strong><br>
   {f"Video: {video_name}<br>" if meeting_title else ""}
   {f"Date: {meeting_date}<br>" if meeting_date else ""}
-  Slides detected: {len(slides)}
+  Slides detected: {total_real}
   {f'<br>Recording speed: {recording_speed}x (timestamps converted: real_time = video_time / {recording_speed})' if recording_speed != 1.0 else ""}
   {f'<div class="comments">Comments: {meeting_comments}</div>' if meeting_comments else ""}
 </div>
