@@ -1,0 +1,44 @@
+# =============================================================
+#  Transkription_Notes_Pipeline - .gitattributes
+#  Line-ending policy. Without this, git reports "LF will be replaced by
+#  CRLF" on every text file (37 files as of 2026-09-09) and one real change
+#  can arrive as a whole-file diff that buries it.
+#
+#  This repository already stores LF for every text file, so these rules
+#  are a no-op for existing history: they only stop future drift.
+#
+#  Do NOT run `git add --renormalize .` while feature work is uncommitted;
+#  it would mix line-ending churn into the feature diffs. Renormalize as
+#  its own commit instead.
+# =============================================================
+
+# Default: LF in the repository and LF on checkout, on every machine.
+# Explicit eol=lf rather than relying on core.autocrlf (currently true,
+# set system-wide), so behaviour does not depend on local git config.
+* text=auto eol=lf
+
+# Windows launchers and scripts keep CRLF in the working tree.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries: never convert, never diff as text.
+*.exe  -text
+*.dll  -text
+*.db   -text
+*.zip  -text
+*.png  -text
+*.jpg  -text
+*.jpeg -text
+*.gif  -text
+*.ico  -text
+*.pdf  -text
+*.docx -text
+*.pptx -text
+*.xlsx -text
+*.mp4  -text
+*.mp3  -text
+*.wav  -text
+*.m4a  -text
+*.mkv  -text
+*.mov  -text
