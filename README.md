@@ -3,7 +3,7 @@
 **Combined transcription + AI notes pipeline for audio and video recordings**,
 with optional slide-change detection for recorded webinars/presentations.
 
-Version 1.6, 2026-07-18. Merges two previously separate tools into one codebase:
+Version 1.7, 2026-09-09. Merges two previously separate tools into one codebase:
 
 - `Audio_Transkription_Notes_Pipeline` - WhisperX transcription + speaker
   diarization + LLM meeting/webinar notes (audio or video, no slide analysis)
@@ -203,6 +203,109 @@ for when the defaults are not enough.
   installed with `tesseract --list-langs`, and download any missing
   `.traineddata` from https://github.com/tesseract-ocr/tessdata (a
   fresh Windows Tesseract-OCR install typically bundles English only).
+
+---
+
+## What's new in V1.7 (2026-09-09)
+
+- **Automatic Q&A detection for webinars**: the Q&A block at the end of a
+  webinar no longer has to be timed by hand. Cue phrases in the transcript
+  ("now to the questions and answers", "kommen wir zu den Fragen",
+  "Fragerunde", German and English) set `qa_start_time_sec` for you, which
+  is the single value the rest of the Q&A pipeline already ran off: the
+  slide-detection frame filter, the summary split, the separate Q&A card in
+  the slide report, and the extracted question/answer pairs.
+  - On by default for the **Webinar Transcript** recording type only. Other
+    types rarely have a formal Q&A block, and a false boundary would quietly
+    cut part of the summary. Force it either way with `--qa-autodetect` /
+    `--no-qa-autodetect`, `qa_autodetect_start` in `config.py`, or the
+    "Auto-detect Q&A start" checkbox in the Q&A section.
+  - **Anything typed into "Starts at" always wins.** Detection only ever
+    fills a gap, and says so in the log when it steps aside.
+  - Only a **start** is ever detected, never an end, so the Q&A runs to the
+    end of the recording.
+  - Four guards keep it honest: only the final 40% of the recording is
+    searched (so "put your questions in the chat, we'll get to them at the
+    end" during the intro cannot trigger it), the phrase must start near the
+    beginning of a sentence, at least 60 seconds must remain, and an
+    announcement ("now to the questions") outranks a recurring opener ("any
+    more questions?"). "If you have any questions, just email me" is
+    deliberately not a cue phrase.
+  - If no phrase matches, the transcript's tail (not the whole transcript) is
+    passed to the configured LLM backend as a fallback. It fails silently and
+    changes nothing when no backend is available, so this never becomes a
+    hard Ollama/Anthropic dependency. See `notes.detect_qa_start`.
+
+- **Fixed: slide timestamps were wrong after a mid-recording Q&A block.**
+  Slide-change detection derived each timestamp from a frame's position in
+  the list it was handed, but frames inside a configured Q&A range are
+  removed before it ever sees them. Every slide after an excised block was
+  therefore reported too early, by exactly the length of the excision. Only
+  visible when "Ends at" was set (a Q&A in the middle of a recording); with
+  Q&A at the end, only trailing frames are dropped and nothing shifts.
+
+- **Batch runs are substantially faster**: the Whisper model, the alignment
+  model and the diarization pipeline are now loaded once per batch instead
+  of once per file. That was roughly 30-90 seconds per file of pure loading,
+  so an overnight run of 40 recordings spent a large part of an hour
+  reloading identical weights. VRAM is properly returned when the batch
+  finishes. Single-file runs are unchanged.
+
+- **Slide snapshots are no longer re-encoded**: each detected frame used to
+  be decoded and re-saved as PNG purely so the filename would end in
+  `.png`, which cost 0.2-0.6 s per slide and inflated each image 5-10x,
+  making both the VLM call and the PDF render heavier. The frame is now
+  copied as-is and keeps its own extension.
+
+- **`whisper_compute_type` actually works now.** It was silently discarded
+  by device resolution, so the setting had no effect. Its default changes to
+  `"auto"` (float16 on GPU, int8 on CPU, exactly as before), and an explicit
+  value is now passed through, which makes `int8_float16` reachable on
+  GPU - typically 1.3-2x faster decoding at roughly half the VRAM for
+  `large-v3`.
+
+- **`enhance_audio` is opt-in again, and visible.** It had been defaulting
+  to on despite being documented as off, adding a 1-3 minute ffmpeg pass to
+  every run with nothing in the GUI to show for it. The default is `False`
+  again and there is now an "Improve audio before transcribing" checkbox on
+  both Run tabs.
+
+- **ffmpeg is fetched by `install.ps1`** instead of living in the
+  repository. `config.get_ffmpeg_path()` still prefers a local
+  `ffmpeg\bin\` over PATH, so nothing changes at runtime; the binaries are
+  simply downloaded on install rather than stored in git (three ~87 MB
+  executables, under a GPL v3 licence).
+
+- **Speaker diarization** now pins
+  `pyannote/speaker-diarization-community-1`: free, fully local, and a lower
+  diarization error rate than the previous 3.1 across every dataset pyannote
+  publishes. Accept the model terms once at
+  https://huggingface.co/pyannote/speaker-diarization-community-1 with the
+  same `HF_TOKEN` as before.
+
+- **Import an existing `.srt`** instead of transcribing (`--import-srt`),
+  useful for an already-captioned download. Handles multi-line cues, inline
+  formatting and karaoke timing tags, and collapses YouTube's duplicated
+  rolling-caption lines.
+
+- **Calendar correlation** (`correlate_calendar_recordings.py`): matches a
+  folder of recordings against an `.ics` export on event end time versus the
+  recording's own end timestamp, since screen recorders name files when you
+  stop them. Writes a readable report plus a batch-ready CSV that loads
+  straight into the Batch tab with title, date and comments filled in.
+
+- **Speaker sample editing**: trim or rebuild a speaker's sample clip, and
+  run the same audio-cleanup pass over a single sample to make a marginal
+  voiceprint usable.
+
+- **Test suite grew from 371 to 585 tests**, still under 20 seconds.
+  `db.py`, `reporter.py` and `detector.py` had no tests at all and now do,
+  which covers every SQLite write, the full-text search including its
+  fallback path, all report output, and slide-change detection.
+
+A note on numbering: the version above is this project's release number.
+Commit subjects carry their own running `V1.xx` sequence, and this release is
+commits `V1.27` through `V1.30`, which is why the two do not line up.
 
 ---
 
