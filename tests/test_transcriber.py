@@ -233,3 +233,187 @@ class TestParseSrt:
         srt.write_text("", encoding="utf-8")
 
         assert transcriber.parse_srt(str(srt)) == []
+
+
+# -----------------------------------------------------------------
+# compute_type resolution and the batch model cache
+#
+# Both use a fake whisperx installed over transcriber._import_whisperx, so
+# no real model is ever loaded and these run fine in an environment with no
+# torch or whisperx installed at all.
+# -----------------------------------------------------------------
+
+class _FakeModel:
+    def __init__(self, calls):
+        self._calls = calls
+        self.options = types.SimpleNamespace(initial_prompt="stale prompt from a previous file")
+
+    def transcribe(self, audio, batch_size=16):
+        self._calls.append(("transcribe", batch_size))
+        return {"language": "en",
+                "segments": [{"start": 0.0, "end": 1.0, "text": " hello "}]}
+
+
+def _install_fake_whisperx(monkeypatch, calls):
+    """Returns the calls list, which records every load and transcribe, so a
+    test can assert how often the weights were actually loaded."""
+    def load_model(model_size, device, compute_type=None, language=None):
+        calls.append(("load_model", model_size, device, compute_type, language))
+        return _FakeModel(calls)
+
+    def load_align_model(language_code=None, device=None):
+        calls.append(("load_align_model", language_code, device))
+        return ("ALIGN_MODEL", {"language": language_code})
+
+    def align(segments, model_a, metadata, audio, device, return_char_alignments=False):
+        calls.append(("align", device))
+        return {"segments": segments}
+
+    fake = types.SimpleNamespace(
+        load_model=load_model,
+        load_audio=lambda path: "AUDIO",
+        load_align_model=load_align_model,
+        align=align,
+    )
+    monkeypatch.setattr(transcriber, "_import_whisperx", lambda: fake)
+    # Never let a real GPU probe decide the outcome of these tests.
+    monkeypatch.setattr(transcriber, "_resolve_device", lambda device: ("cpu", "int8"))
+    return calls
+
+
+class TestResolveDevice:
+    def test_explicit_cuda_suggests_float16(self):
+        assert transcriber._resolve_device("cuda") == ("cuda", "float16")
+
+    def test_explicit_cpu_suggests_int8(self):
+        assert transcriber._resolve_device("cpu") == ("cpu", "int8")
+
+
+class TestComputeTypeIsHonoured:
+    def test_auto_uses_the_device_suggestion(self, tmp_path, monkeypatch):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        transcriber.transcribe(str(tmp_path / "x.wav"), compute_type="auto",
+                               use_vocabulary=False)
+        assert next(c for c in calls if c[0] == "load_model")[3] == "int8"
+
+    def test_blank_uses_the_device_suggestion(self, tmp_path, monkeypatch):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        transcriber.transcribe(str(tmp_path / "x.wav"), compute_type="",
+                               use_vocabulary=False)
+        assert next(c for c in calls if c[0] == "load_model")[3] == "int8"
+
+    def test_explicit_value_survives(self, tmp_path, monkeypatch):
+        """The regression this pins: _resolve_device used to overwrite the
+        caller's compute_type unconditionally, so config's
+        whisper_compute_type never reached whisperx at all and
+        int8_float16 on GPU was unreachable."""
+        calls = _install_fake_whisperx(monkeypatch, [])
+        transcriber.transcribe(str(tmp_path / "x.wav"), compute_type="int8_float16",
+                               use_vocabulary=False)
+        assert next(c for c in calls if c[0] == "load_model")[3] == "int8_float16"
+
+    def test_float16_on_cpu_is_honoured_but_warned_about(self, tmp_path, monkeypatch, caplog):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        with caplog.at_level("WARNING"):
+            transcriber.transcribe(str(tmp_path / "x.wav"), compute_type="float16",
+                                   use_vocabulary=False)
+        assert next(c for c in calls if c[0] == "load_model")[3] == "float16"
+        assert "float16 on CPU" in caplog.text
+
+
+class TestModelCache:
+    def _enable(self, monkeypatch):
+        """Fresh, isolated caches. monkeypatch restores the real dicts and the
+        flag afterwards, so nothing leaks into later tests in the session."""
+        monkeypatch.setattr(transcriber, "_ASR_CACHE", {})
+        monkeypatch.setattr(transcriber, "_ALIGN_CACHE", {})
+        monkeypatch.setattr(transcriber, "_DIARIZE_CACHE", {})
+        monkeypatch.setattr(transcriber, "_CACHE_ENABLED", True)
+
+    def test_disabled_by_default_reloads_per_file(self, tmp_path, monkeypatch):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        monkeypatch.setattr(transcriber, "_CACHE_ENABLED", False)
+        for name in ("a.wav", "b.wav"):
+            transcriber.transcribe(str(tmp_path / name), use_vocabulary=False)
+        assert len([c for c in calls if c[0] == "load_model"]) == 2
+
+    def test_enabled_loads_the_asr_model_once_for_two_files(self, tmp_path, monkeypatch):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        self._enable(monkeypatch)
+        for name in ("a.wav", "b.wav"):
+            transcriber.transcribe(str(tmp_path / name), use_vocabulary=False)
+        assert len([c for c in calls if c[0] == "load_model"]) == 1
+        assert len([c for c in calls if c[0] == "transcribe"]) == 2
+
+    def test_enabled_loads_the_alignment_model_once(self, tmp_path, monkeypatch):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        self._enable(monkeypatch)
+        for name in ("a.wav", "b.wav"):
+            transcriber.transcribe(str(tmp_path / name), use_vocabulary=False)
+        assert len([c for c in calls if c[0] == "load_align_model"]) == 1
+
+    def test_a_different_model_size_is_cached_separately(self, tmp_path, monkeypatch):
+        calls = _install_fake_whisperx(monkeypatch, [])
+        self._enable(monkeypatch)
+        transcriber.transcribe(str(tmp_path / "a.wav"), model_size="large-v3",
+                               use_vocabulary=False)
+        transcriber.transcribe(str(tmp_path / "b.wav"), model_size="medium",
+                               use_vocabulary=False)
+        assert len([c for c in calls if c[0] == "load_model"]) == 2
+
+    def test_a_different_language_is_cached_separately(self, tmp_path, monkeypatch):
+        """wx.load_model bakes the language into the model, so a batch mixing
+        languages must not reuse the wrong one."""
+        calls = _install_fake_whisperx(monkeypatch, [])
+        self._enable(monkeypatch)
+        transcriber.transcribe(str(tmp_path / "a.wav"), language="de", use_vocabulary=False)
+        transcriber.transcribe(str(tmp_path / "b.wav"), language="en", use_vocabulary=False)
+        assert len([c for c in calls if c[0] == "load_model"]) == 2
+
+    def test_stale_vocabulary_prompt_is_cleared_on_reuse(self, tmp_path, monkeypatch):
+        """A cached model keeps whatever initial_prompt the previous file set.
+        Leaving it would silently bias the next transcription, so transcribe
+        clears it when no vocabulary is requested."""
+        captured = {}
+        calls = []
+
+        def load_model(model_size, device, compute_type=None, language=None):
+            model = _FakeModel(calls)
+            captured["model"] = model
+            return model
+
+        fake = types.SimpleNamespace(
+            load_model=load_model,
+            load_audio=lambda path: "AUDIO",
+            load_align_model=lambda language_code=None, device=None: ("M", {}),
+            align=lambda *a, **kw: {"segments": []},
+        )
+        monkeypatch.setattr(transcriber, "_import_whisperx", lambda: fake)
+        monkeypatch.setattr(transcriber, "_resolve_device", lambda d: ("cpu", "int8"))
+        self._enable(monkeypatch)
+
+        transcriber.transcribe(str(tmp_path / "a.wav"), use_vocabulary=False)
+        assert captured["model"].options.initial_prompt is None
+
+    def test_release_models_empties_every_cache(self, tmp_path, monkeypatch):
+        _install_fake_whisperx(monkeypatch, [])
+        self._enable(monkeypatch)
+        transcriber.transcribe(str(tmp_path / "a.wav"), use_vocabulary=False)
+        assert transcriber._ASR_CACHE and transcriber._ALIGN_CACHE
+        transcriber.release_models()
+        assert transcriber._ASR_CACHE == {}
+        assert transcriber._ALIGN_CACHE == {}
+        assert transcriber._DIARIZE_CACHE == {}
+
+    def test_release_models_is_safe_when_nothing_is_cached(self, monkeypatch):
+        self._enable(monkeypatch)
+        transcriber.release_models()
+        transcriber.release_models()
+
+    def test_enable_model_cache_false_releases(self, tmp_path, monkeypatch):
+        _install_fake_whisperx(monkeypatch, [])
+        self._enable(monkeypatch)
+        transcriber.transcribe(str(tmp_path / "a.wav"), use_vocabulary=False)
+        assert transcriber._ASR_CACHE
+        transcriber.enable_model_cache(False)
+        assert transcriber._ASR_CACHE == {}

@@ -68,6 +68,101 @@ def _build_diarization_pipeline(hf_token: str, device):
     return DiarizationPipeline(model_name=DIARIZATION_MODEL, token=hf_token, device=device)
 
 
+# ---------------------------------------------------------------------------
+# Model cache (batch runs)
+# ---------------------------------------------------------------------------
+# transcribe() loads the ASR model, the alignment model and the diarization
+# pipeline and frees them again on every call. That is the right trade for a
+# single file, but a batch pays it once per file: large-v3 is roughly 3 GB of
+# CTranslate2 weights, the wav2vec2 aligner about 1.2 GB, and constructing the
+# pyannote pipeline also performs a HuggingFace revision check over the
+# network. That is roughly 30-90s per file, so a 40-file overnight run spends
+# a large part of an hour reloading identical weights.
+#
+# The cache is opt-in and off by default, so the single-file path keeps its
+# exact previous behaviour (load, use, free). The batch runners in
+# run_pipeline.py call enable_model_cache() before their loop and
+# release_models() after it.
+_CACHE_ENABLED = False
+_ASR_CACHE: dict = {}
+_ALIGN_CACHE: dict = {}
+_DIARIZE_CACHE: dict = {}
+
+
+def enable_model_cache(enabled: bool = True) -> None:
+    """Keep loaded models in memory between transcribe() calls. Call
+    release_models() when the batch is finished: until then the weights stay
+    resident in VRAM."""
+    global _CACHE_ENABLED
+    _CACHE_ENABLED = enabled
+    if enabled:
+        log.info("Model cache enabled: whisper, alignment and diarization models "
+                 "will be reused across files in this run.")
+    else:
+        release_models()
+
+
+def release_models() -> None:
+    """Drop every cached model and hand the memory back. Safe to call at any
+    time, including when nothing is cached."""
+    cached = len(_ASR_CACHE) + len(_ALIGN_CACHE) + len(_DIARIZE_CACHE)
+    _ASR_CACHE.clear()
+    _ALIGN_CACHE.clear()
+    _DIARIZE_CACHE.clear()
+    gc.collect()
+    # gc.collect() alone does not return VRAM to torch's allocator, so the
+    # freed blocks stay reserved and can fragment a later, larger load.
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if cached:
+        log.info("Released %d cached model(s).", cached)
+
+
+def _load_asr_model(wx, model_size: str, device: str, compute_type: str, language):
+    """Cache key includes language because wx.load_model bakes it into the
+    model, so a batch mixing languages must not reuse the wrong one."""
+    key = (model_size, device, compute_type, language)
+    cached = _ASR_CACHE.get(key) if _CACHE_ENABLED else None
+    if cached is not None:
+        log.info("Reusing cached whisperx model: %s on %s (compute=%s)",
+                 model_size, device, compute_type)
+        return cached
+    log.info("Loading whisperx model: %s on %s (compute=%s)", model_size, device, compute_type)
+    model = wx.load_model(model_size, device, compute_type=compute_type, language=language)
+    if _CACHE_ENABLED:
+        _ASR_CACHE[key] = model
+    return model
+
+
+def _load_align_model(wx, language_code: str, device: str):
+    key = (language_code, device)
+    cached = _ALIGN_CACHE.get(key) if _CACHE_ENABLED else None
+    if cached is not None:
+        log.info("Reusing cached alignment model for language: %s", language_code)
+        return cached
+    log.info("Loading alignment model for language: %s", language_code)
+    pair = wx.load_align_model(language_code=language_code, device=device)
+    if _CACHE_ENABLED:
+        _ALIGN_CACHE[key] = pair
+    return pair
+
+
+def _load_diarization_pipeline(hf_token: str, device):
+    key = (device,)
+    cached = _DIARIZE_CACHE.get(key) if _CACHE_ENABLED else None
+    if cached is not None:
+        log.info("Reusing cached diarization pipeline.")
+        return cached
+    pipeline = _build_diarization_pipeline(hf_token, device)
+    if _CACHE_ENABLED:
+        _DIARIZE_CACHE[key] = pipeline
+    return pipeline
+
+
 def validate_language(language: str | None) -> str | None:
     """
     Validate the language code before passing it to whisperx.
@@ -99,7 +194,7 @@ def _import_whisperx():
     except ImportError:
         log.error(
             "whisperx not installed. "
-            "Run: C:\\Python\\Python311\\python.exe -m pip install whisperx==3.8.5"
+            "Run: C:\\Python\\Python311\\python.exe -m pip install whisperx==3.8.6"
         )
         return None
 
@@ -107,7 +202,14 @@ def _import_whisperx():
 def _resolve_device(device: str) -> tuple[str, str]:
     """
     Resolve 'auto' device to 'cuda' or 'cpu' based on torch availability.
-    Returns (device, compute_type) - compute_type switches to int8 on CPU.
+    Returns (device, suggested_compute_type) - int8 on CPU, float16 on GPU.
+
+    The compute_type half is only a SUGGESTION: transcribe() applies it when
+    the caller asks for "auto", and otherwise keeps what the caller passed.
+    It used to overwrite the caller's value unconditionally, which made
+    config's whisper_compute_type a dead knob and put faster-whisper's
+    int8_float16 on GPU (roughly 1.3-2x faster decode at about half the VRAM
+    for large-v3) out of reach entirely.
     """
     if device == "auto":
         try:
@@ -212,7 +314,9 @@ def transcribe(
       language            ISO code, "auto"/None for auto-detect
       device              "auto" | "cpu" | "cuda"
       batch_size          Parallel batches; reduce if OOM. CPU: 4, GPU: 8-16.
-      compute_type        "int8" (CPU/low VRAM) or "float16" (GPU) - overridden by device resolution
+      compute_type        "auto" (default: float16 on GPU, int8 on CPU),
+                          or an explicit faster-whisper type used as given,
+                          e.g. "int8_float16" / "int8" / "float32"
       hf_token             HuggingFace read token; required only for diarization.
       enable_diarization   Run speaker diarization (requires hf_token).
       min_speakers/max_speakers  Optional hints for diarization.
@@ -223,12 +327,22 @@ def transcribe(
 
     audio_path = str(file_path)
     language = validate_language(language)
-    device, compute_type = _resolve_device(device)
+    device, suggested_compute_type = _resolve_device(device)
+    if not compute_type or compute_type == "auto":
+        compute_type = suggested_compute_type
+    elif compute_type != suggested_compute_type:
+        # An explicit request wins, but say so. float16 on CPU is the one
+        # combination that is far more likely a mistake than a choice.
+        log.info("Using explicitly configured compute_type=%s on %s "
+                 "(device resolution would have suggested %s).",
+                 compute_type, device, suggested_compute_type)
+        if device == "cpu" and compute_type == "float16":
+            log.warning("compute_type=float16 on CPU is usually much slower than int8 "
+                        "and some builds reject it outright. Set whisper_compute_type "
+                        "back to auto or int8 in config.py if transcription fails.")
 
     # Step 1: Transcribe
-    log.info("Loading whisperx model: %s on %s (compute=%s)", model_size, device, compute_type)
-    model = wx.load_model(model_size, device, compute_type=compute_type,
-                           language=language)
+    model = _load_asr_model(wx, model_size, device, compute_type, language)
     audio = wx.load_audio(audio_path)
 
     # Domain vocabulary: TranscriptionOptions is a faster_whisper dataclass -
@@ -247,6 +361,14 @@ def transcribe(
             log.info("Vocabulary injected via model.options.initial_prompt.")
         except Exception as e:
             log.warning("Vocabulary injection skipped: %s", e)
+    else:
+        # Clear it explicitly rather than leaving it alone: a cached model
+        # still carries whatever prompt the previous file set, which would
+        # silently bias this transcription.
+        try:
+            model.options.initial_prompt = None
+        except Exception:
+            pass
 
     log.info("Transcribing: %s", audio_path)
     result = model.transcribe(audio, batch_size=batch_size)
@@ -254,20 +376,21 @@ def transcribe(
     log.info("Detected language: %s  |  segments before alignment: %d",
              detected_lang, len(result.get("segments", [])))
 
-    del model
-    gc.collect()
+    if not _CACHE_ENABLED:
+        del model
+        gc.collect()
 
     # Step 2: Align (word-level timestamps)
     try:
-        log.info("Loading alignment model for language: %s", detected_lang)
-        model_a, metadata = wx.load_align_model(language_code=detected_lang, device=device)
+        model_a, metadata = _load_align_model(wx, detected_lang, device)
         result = wx.align(
             result["segments"], model_a, metadata, audio, device,
             return_char_alignments=False,
         )
         log.info("Alignment complete: %d segments", len(result.get("segments", [])))
-        del model_a
-        gc.collect()
+        if not _CACHE_ENABLED:
+            del model_a
+            gc.collect()
     except Exception as exc:
         log.warning(
             "Alignment failed for language '%s': %s. "
@@ -286,7 +409,7 @@ def transcribe(
         else:
             try:
                 log.info("Running speaker diarization.")
-                diarize_model = _build_diarization_pipeline(hf_token, device)
+                diarize_model = _load_diarization_pipeline(hf_token, device)
                 diarize_kwargs = {}
                 if min_speakers:
                     diarize_kwargs["min_speakers"] = min_speakers

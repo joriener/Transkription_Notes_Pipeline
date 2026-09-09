@@ -441,19 +441,25 @@ def resolve_output_prefix(source_file: str, cfg: dict) -> str:
     return str(out_dir / stem)
 
 
-def _unique_snapshot_path(snapshot_dir: Path, base_name: str, slide_idx: int) -> Path:
+def _unique_snapshot_path(snapshot_dir: Path, base_name: str, slide_idx: int,
+                          suffix: str = ".png") -> Path:
     """
-    Build "<base_name>_slideNNN.png" under snapshot_dir. If that exact
+    Build "<base_name>_slideNNN<suffix>" under snapshot_dir. If that exact
     filename already exists (e.g. this output name was already used for
     a different source file in the same folder), append "_2", "_3", ...
     until a free filename is found, instead of overwriting.
+
+    suffix defaults to ".png" for callers that predate frame_format support;
+    process_file passes the staged frame's own extension, which is ".jpg"
+    whenever config's frame_format is left at its default.
     """
-    candidate = snapshot_dir / f"{base_name}_slide{slide_idx:03d}.png"
+    suffix = suffix or ".png"
+    candidate = snapshot_dir / f"{base_name}_slide{slide_idx:03d}{suffix}"
     if not candidate.exists():
         return candidate
     n = 2
     while True:
-        candidate = snapshot_dir / f"{base_name}_slide{slide_idx:03d}_{n}.png"
+        candidate = snapshot_dir / f"{base_name}_slide{slide_idx:03d}_{n}{suffix}"
         if not candidate.exists():
             return candidate
         n += 1
@@ -700,6 +706,12 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
 
         qa_start = cfg.get("qa_start_time_sec")
         qa_end = cfg.get("qa_end_time_sec")
+        # Each surviving frame's position in the ORIGINAL extracted sequence.
+        # Handed to the detector below so timestamps stay tied to the real
+        # video clock even when the Q&A filter removes frames from the middle
+        # (list position alone would shift every later slide earlier by the
+        # excised duration).
+        frame_indices = list(range(len(frames)))
         if qa_start and frames:
             # Q&A section (task #61): drop frames in the Q&A range before
             # slide-change detection ever sees them, so no new slides can
@@ -712,11 +724,13 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
             qa_start_raw = qa_start * speed
             qa_end_raw = qa_end * speed if qa_end else None
             before_count = len(frames)
-            frames = [
-                f for idx, f in enumerate(frames)
+            kept = [
+                (idx, f) for idx, f in enumerate(frames)
                 if not (idx / cfg["fps"] >= qa_start_raw
                        and (qa_end_raw is None or idx / cfg["fps"] < qa_end_raw))
             ]
+            frame_indices = [idx for idx, _ in kept]
+            frames = [f for _, f in kept]
             skipped = before_count - len(frames)
             if skipped:
                 log.info("Q&A range configured (from %.0fs%s): skipped %d frame(s), no new "
@@ -727,6 +741,7 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
             frames=frames, fps=cfg["fps"], threshold=cfg["hash_threshold"],
             algorithm=cfg["hash_algorithm"], min_slide_duration_sec=cfg["min_slide_duration_sec"],
             animation_threshold=cfg.get("animation_threshold", 0),
+            frame_indices=frame_indices,
         ) if frames else []
         changes = _rescale_slide_changes(changes, cfg.get("recording_speed", 1.0))
 
@@ -746,12 +761,18 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
             snap_tmp_dir = slides_dir / "_snap_tmp"
             snap_tmp_dir.mkdir(parents=True, exist_ok=True)
             snapshot_dir.mkdir(parents=True, exist_ok=True)
+            # Staged under the frame's own filename, extension included, so
+            # no format conversion happens: the extracted frame is already a
+            # finished image. Decoding each one and re-encoding it as PNG cost
+            # 0.2-0.6s per slide and inflated it 5-10x, which then made both
+            # the VLM payload and the Chromium PDF render heavier for no gain.
+            # ".png" is not required anywhere - annotator.annotate_batch
+            # matches by filename and the reports embed whatever path they are
+            # given.
             for change in changes:
-                dest = snap_tmp_dir / (change.frame_path.stem + ".png")
+                dest = snap_tmp_dir / change.frame_path.name
                 try:
-                    from PIL import Image
-                    with Image.open(change.frame_path) as img:
-                        img.save(dest, format="PNG")
+                    shutil.copy2(change.frame_path, dest)
                 except Exception as exc:
                     log.warning("Could not save snapshot %s: %s", dest, exc)
 
@@ -769,7 +790,7 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                 slides_annotated = [
                     {
                         "frame_index": c.frame_index, "timestamp_sec": c.timestamp_sec,
-                        "snapshot_path": str(snap_tmp_dir / (c.frame_path.stem + ".png")),
+                        "snapshot_path": str(snap_tmp_dir / c.frame_path.name),
                         "hash_value": c.hash_value, "hamming_distance": c.hamming_distance,
                         "title": "", "bullets": [], "slide_type": "",
                     }
@@ -791,7 +812,8 @@ def process_file(file: str, overrides: dict | None = None, stop_check=None) -> b
                 staged = Path(slide.get("snapshot_path", ""))
                 if not staged.exists():
                     continue
-                final_dest = _unique_snapshot_path(snapshot_dir, base_name, idx)
+                final_dest = _unique_snapshot_path(snapshot_dir, base_name, idx,
+                                                   suffix=staged.suffix)
                 try:
                     shutil.move(str(staged), str(final_dest))
                     slide["snapshot_path"] = str(final_dest)
@@ -2013,6 +2035,9 @@ def run_file_list(list_file: str, overrides: dict, stop_check=None) -> None:
     log.info("BATCH (file list): %d file(s)", len(entries))
     write_log(log_file, f"Batch: {datetime.now()} | {list_file} | {len(entries)} files")
     ok, errors, skipped = 0, 0, 0
+    # Reuse the whisper/alignment/diarization models across every file in
+    # this batch instead of reloading them per file (roughly 30-90s each).
+    transcriber.enable_model_cache(True)
     for i, (file, lang) in enumerate(entries, 1):
         if stop_check is not None and stop_check():
             log.info("Stop requested - halting batch after %d/%d file(s).", i - 1, len(entries))
@@ -2046,6 +2071,12 @@ def run_file_list(list_file: str, overrides: dict, stop_check=None) -> None:
             write_log(log_file, f"[{i}] ERROR ({dur}s): {file} -- {e}")
             write_log(log_file, traceback.format_exc())
             errors += 1
+    # Turn the cache off again AND hand the memory back. Releasing without
+    # disabling would leave _CACHE_ENABLED set for the rest of the process,
+    # so later single-file runs would keep their models resident with
+    # nothing left to release them. The per-file try/except above means the
+    # loop always reaches this point.
+    transcriber.enable_model_cache(False)
     write_log(log_file, f"Done: OK={ok} Errors={errors} Skipped={skipped}")
     log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
 
@@ -2109,6 +2140,9 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None, progress_
     row_to_cfg_key = {"language": "whisper_language"}
 
     ok, errors, skipped = 0, 0, 0
+    # Reuse the whisper/alignment/diarization models across every file in
+    # this batch instead of reloading them per file (roughly 30-90s each).
+    transcriber.enable_model_cache(True)
     for i, row in enumerate(rows, 1):
         file = (row.get("file") or "").strip()
         if not file:
@@ -2163,6 +2197,12 @@ def run_batch_rows(rows: list[dict], overrides: dict, stop_check=None, progress_
             write_log(log_file, traceback.format_exc())
             errors += 1
             _report(i, "error")
+    # Turn the cache off again AND hand the memory back. Releasing without
+    # disabling would leave _CACHE_ENABLED set for the rest of the process,
+    # so later single-file runs would keep their models resident with
+    # nothing left to release them. The per-file try/except above means the
+    # loop always reaches this point.
+    transcriber.enable_model_cache(False)
     write_log(log_file, f"Done: OK={ok} Errors={errors} Skipped={skipped}")
     log.info("BATCH DONE: OK=%d  Errors=%d  Skipped=%d  Log: %s", ok, errors, skipped, log_file)
 
@@ -2211,6 +2251,9 @@ def run_batch_folder(folder: str, overrides: dict, recursive: bool = False, stop
     log.info("BATCH (folder): %d file(s) in %s", len(files), folder)
     write_log(log_file, f"Batch folder: {datetime.now()} | {folder} | {len(files)} files")
     ok, errors = 0, 0
+    # Reuse the whisper/alignment/diarization models across every file in
+    # this batch instead of reloading them per file (roughly 30-90s each).
+    transcriber.enable_model_cache(True)
     for i, file in enumerate(files, 1):
         if stop_check is not None and stop_check():
             log.info("Stop requested - halting batch after %d/%d file(s).", i - 1, len(files))
@@ -2230,6 +2273,12 @@ def run_batch_folder(folder: str, overrides: dict, recursive: bool = False, stop
             write_log(log_file, f"[{i}] ERROR ({dur}s): {file.name} -- {e}")
             write_log(log_file, traceback.format_exc())
             errors += 1
+    # Turn the cache off again AND hand the memory back. Releasing without
+    # disabling would leave _CACHE_ENABLED set for the rest of the process,
+    # so later single-file runs would keep their models resident with
+    # nothing left to release them. The per-file try/except above means the
+    # loop always reaches this point.
+    transcriber.enable_model_cache(False)
     write_log(log_file, f"Done: OK={ok} Errors={errors}")
     log.info("BATCH FOLDER DONE: OK=%d  Errors=%d  Log: %s", ok, errors, log_file)
 

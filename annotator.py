@@ -287,7 +287,7 @@ def annotate_batch(
             log.info("Stop requested, VLM annotation halted at slide %d/%d.",
                      len(results) + 1, len(slides))
             for r in slides[len(results):]:
-                snap = snapshot_dir / r.frame_path.name.replace(r.frame_path.suffix, ".png")
+                snap = snapshot_dir / r.frame_path.name
                 results.append({
                     "frame_index": r.frame_index, "timestamp_sec": r.timestamp_sec,
                     "snapshot_path": str(snap), "hash_value": r.hash_value,
@@ -295,9 +295,10 @@ def annotate_batch(
                     "title": "", "bullets": [], "slide_type": "",
                 })
             break
-        snap = snapshot_dir / slide.frame_path.name.replace(
-            slide.frame_path.suffix, ".png"
-        )
+        # The staged snapshot keeps the extracted frame's own filename and
+        # extension (run_pipeline copies it there unchanged), so no ".png"
+        # assumption is needed here.
+        snap = snapshot_dir / slide.frame_path.name
         annotation = {}
         if snap.exists():
             annotation = annotate_slide(

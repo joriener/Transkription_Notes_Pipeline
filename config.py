@@ -191,7 +191,12 @@ CONFIG = {
     # "auto" resolves to cuda if available, else cpu (see transcriber.py).
     "whisper_device":      "auto",
     "whisper_batch_size":  16,          # reduce to 4-8 on CPU / low VRAM
-    "whisper_compute_type": "float16",  # float16 (GPU) | int8 (CPU)
+    # "auto" resolves with the device: float16 on GPU, int8 on CPU. Any
+    # explicit faster-whisper type is now honoured as given (it used to be
+    # silently discarded by device resolution), so "int8_float16" is
+    # reachable on GPU - typically 1.3-2x faster decode at roughly half the
+    # VRAM for large-v3.
+    "whisper_compute_type": "auto",     # auto | float16 | int8_float16 | int8 | float32
 
     # Bias Whisper towards GC/MS domain vocabulary. See vocabulary.py.
     "whisper_use_vocabulary": True,
@@ -210,7 +215,7 @@ CONFIG = {
     # original file is never modified and is still what Play Sample and
     # voiceprint extraction read from directly. See
     # transcriber.enhance_audio.
-    "enhance_audio": True,
+    "enhance_audio": False,
 
     # =========================================================
     # SPEAKER DIARIZATION  (pyannote, optional)

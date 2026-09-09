@@ -334,6 +334,13 @@ STAGE_TOOLTIPS = {
     "force_retranscribe": "Ignores any cached transcript, segments, or "
                           "slides already on disk for this file and "
                           "reprocesses it completely from scratch.",
+    "enhance_audio": "Runs a conservative ffmpeg cleanup pass over the audio "
+                     "before transcription (highpass for rumble/hum, mild "
+                     "denoise, loudness normalization between speakers). Off "
+                     "by default because audio processing can occasionally "
+                     "change what Whisper transcribes. Works on a temporary "
+                     "copy: the original file is never modified, and Play "
+                     "Sample and voiceprint extraction still read the original.",
     "dry_run": "Runs slide-change detection only, to preview slide "
               "timestamps, without VLM annotation, transcription, or "
               "notes generation.",
@@ -397,6 +404,7 @@ class PipelineGUI:
         self.shared_enable_diarization_var = tk.BooleanVar(value=CONFIG["enable_diarization"])
         self.shared_no_summary_var = tk.BooleanVar(value=False)
         self.shared_force_retranscribe_var = tk.BooleanVar(value=False)
+        self.shared_enhance_audio_var = tk.BooleanVar(value=CONFIG.get("enhance_audio", False))
 
         self._build_search_tab()
         self._build_templates_tab()
@@ -1476,6 +1484,7 @@ class RunTabController:
         self.enable_diarization_var = self.app.shared_enable_diarization_var
         self.no_summary_var = self.app.shared_no_summary_var
         self.force_retranscribe_var = self.app.shared_force_retranscribe_var
+        self.enhance_audio_var = self.app.shared_enhance_audio_var
 
         self.losslesscut_path_var = tk.StringVar(value=CONFIG.get("losslesscut_path", ""))
 
@@ -1861,6 +1870,11 @@ class RunTabController:
                                  variable=self.dry_run_var)
             cb.grid(row=1, column=2, sticky="w", **pad)
             Tooltip(cb, STAGE_TOOLTIPS["dry_run"])
+
+            cb = ttk.Checkbutton(toggles, text="Improve audio before transcribing",
+                                 variable=self.enhance_audio_var)
+            cb.grid(row=2, column=0, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["enhance_audio"])
         else:
             cb = ttk.Checkbutton(toggles, text="Speaker diarization",
                                  variable=self.enable_diarization_var)
@@ -1876,6 +1890,11 @@ class RunTabController:
                                  variable=self.force_retranscribe_var)
             cb.grid(row=0, column=2, sticky="w", **pad)
             Tooltip(cb, STAGE_TOOLTIPS["force_retranscribe"])
+
+            cb = ttk.Checkbutton(toggles, text="Improve audio before transcribing",
+                                 variable=self.enhance_audio_var)
+            cb.grid(row=1, column=0, sticky="w", **pad)
+            Tooltip(cb, STAGE_TOOLTIPS["enhance_audio"])
 
         # --- Notes format ---
         notes_format_frame = ttk.LabelFrame(step3_target, text="Notes format")
@@ -2045,6 +2064,7 @@ class RunTabController:
             "enable_diarization": self.enable_diarization_var,
             "no_summary":        self.no_summary_var,
             "force_retranscribe": self.force_retranscribe_var,
+            "enhance_audio":     self.enhance_audio_var,
         }
         if is_video:
             self._state_vars.update({
@@ -2770,6 +2790,7 @@ class RunTabController:
             "enable_diarization": self.enable_diarization_var.get(),
             "no_summary":         self.no_summary_var.get(),
             "force_retranscribe": self.force_retranscribe_var.get(),
+            "enhance_audio":      self.enhance_audio_var.get(),
             "output_dir_override": self.output_dir_var.get().strip(),
             "notes_format_txt":   self.notes_txt_var.get(),
             "notes_format_html":  self.notes_html_var.get(),

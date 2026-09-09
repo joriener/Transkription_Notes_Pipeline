@@ -1572,3 +1572,104 @@ class TestRunNotesBatchViaBatchAPI:
         assert len(batches_api.created_requests) == 2
         ids = {r["custom_id"] for r in batches_api.created_requests}
         assert ids == {"item-1", "item-2"}
+
+
+# -----------------------------------------------------------------
+# _unique_snapshot_path
+#
+# Snapshots used to be re-encoded from the extracted JPEG frame into PNG,
+# purely so the filename could end in ".png". The frame is now copied
+# unchanged, so the final snapshot name has to carry whatever extension the
+# staged frame actually has (".jpg" with config's default frame_format).
+# -----------------------------------------------------------------
+
+class TestUniqueSnapshotPath:
+    def test_defaults_to_png_for_older_callers(self, tmp_path):
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 1)
+        assert got.name == "talk_slide001.png"
+
+    def test_honours_an_explicit_suffix(self, tmp_path):
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 7, suffix=".jpg")
+        assert got.name == "talk_slide007.jpg"
+
+    def test_slide_number_is_zero_padded_to_three_digits(self, tmp_path):
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 42, suffix=".jpg")
+        assert got.name == "talk_slide042.jpg"
+
+    def test_collision_gets_a_numeric_suffix_keeping_the_extension(self, tmp_path):
+        (tmp_path / "talk_slide001.jpg").write_bytes(b"first")
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 1, suffix=".jpg")
+        assert got.name == "talk_slide001_2.jpg"
+
+    def test_repeated_collisions_keep_counting(self, tmp_path):
+        (tmp_path / "talk_slide001.jpg").write_bytes(b"a")
+        (tmp_path / "talk_slide001_2.jpg").write_bytes(b"b")
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 1, suffix=".jpg")
+        assert got.name == "talk_slide001_3.jpg"
+
+    def test_blank_suffix_falls_back_to_png(self, tmp_path):
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 1, suffix="")
+        assert got.name == "talk_slide001.png"
+
+    def test_never_returns_an_existing_path(self, tmp_path):
+        (tmp_path / "talk_slide001.jpg").write_bytes(b"a")
+        got = run_pipeline._unique_snapshot_path(tmp_path, "talk", 1, suffix=".jpg")
+        assert not got.exists()
+
+
+# -----------------------------------------------------------------
+# Batch runs and the transcriber model cache
+#
+# The runners enable transcriber's model cache so a batch loads the whisper,
+# alignment and diarization weights once instead of once per file, then turn
+# it off again afterwards. Turning it off matters as much as turning it on:
+# releasing without disabling used to leave the cache enabled for the rest
+# of the process, so later single-file runs kept their models resident with
+# nothing left to release them.
+# -----------------------------------------------------------------
+
+class TestBatchModelCache:
+    def _patch_db(self, monkeypatch):
+        monkeypatch.setattr(db, "validate_schema", lambda path: True)
+        monkeypatch.setattr(db, "get_connection", lambda path: FakeConn())
+        monkeypatch.setattr(db, "get_completed_transcript", lambda conn, file_path: None)
+
+    def _patch_run(self, monkeypatch, seen):
+        """process_file records whether the cache was enabled while it ran."""
+        import transcriber
+
+        def fake_process_file(file, overrides, stop_check=None):
+            seen.append(transcriber._CACHE_ENABLED)
+            return True
+
+        monkeypatch.setattr(run_pipeline, "process_file", fake_process_file)
+        monkeypatch.setattr(run_pipeline, "write_log", lambda *a, **kw: None)
+
+    def test_cache_is_enabled_while_the_batch_runs(self, monkeypatch, tmp_path):
+        import transcriber
+        self._patch_db(monkeypatch)
+        seen = []
+        self._patch_run(monkeypatch, seen)
+        rows = [{"file": str(tmp_path / "a.mp4")}, {"file": str(tmp_path / "b.mp4")}]
+        run_pipeline.run_batch_rows(rows, {"db_path": str(tmp_path / "x.db")})
+        assert seen == [True, True]
+
+    def test_cache_is_disabled_again_afterwards(self, monkeypatch, tmp_path):
+        import transcriber
+        self._patch_db(monkeypatch)
+        self._patch_run(monkeypatch, [])
+        run_pipeline.run_batch_rows([{"file": str(tmp_path / "a.mp4")}],
+                                    {"db_path": str(tmp_path / "x.db")})
+        assert transcriber._CACHE_ENABLED is False
+        assert transcriber._ASR_CACHE == {}
+
+    def test_release_models_alone_does_not_disable_the_cache(self, monkeypatch):
+        """Documents the split: release_models() frees memory, and
+        enable_model_cache(False) is what ends the caching window. The
+        runners deliberately call the latter."""
+        import transcriber
+        monkeypatch.setattr(transcriber, "_CACHE_ENABLED", True)
+        transcriber.release_models()
+        assert transcriber._CACHE_ENABLED is True
+        transcriber.enable_model_cache(False)
+        assert transcriber._CACHE_ENABLED is False
