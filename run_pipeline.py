@@ -1928,6 +1928,24 @@ def apply_speaker_roster_json(json_path: str, overrides: dict | None = None,
 # annotation. Used by gui.py's SlideReviewDialog.
 # ---------------------------------------------------------------------------
 
+def resolve_qa_start_edits(edits: dict, n: int) -> tuple[set[int], dict[str, str]]:
+    """
+    Expands edits.get("qa_start_index") (see apply_slide_edits' schema
+    docstring) into the merge_next_indices/title_overrides it implies,
+    merged with whatever was already set manually. Returns new
+    collections; does not mutate `edits`. Also used by gui.py's
+    SlideReviewDialog to preview, before rebuilding, which slides a Q&A
+    mark will merge and what the resulting slide will be titled.
+    """
+    merge_next = set(edits.get("merge_next_indices", []) or [])
+    title_overrides = dict(edits.get("title_overrides") or {})
+    qa_start = edits.get("qa_start_index")
+    if qa_start is not None and 0 <= qa_start < n:
+        merge_next |= set(range(qa_start, n - 1))
+        title_overrides.setdefault(str(n - 1), "Q&A Session")
+    return merge_next, title_overrides
+
+
 def apply_slide_edits(slides: list[dict], edits: dict) -> list[dict]:
     """
     Apply title/omit/merge edits to a list of slide dicts loaded from an
@@ -1936,7 +1954,7 @@ def apply_slide_edits(slides: list[dict], edits: dict) -> list[dict]:
 
     edits schema (also the on-disk format of <stem>_slides_edits.json):
       {"omit_indices": [1, 4], "merge_next_indices": [6, 7],
-       "title_overrides": {"2": "Corrected Title"}}
+       "title_overrides": {"2": "Corrected Title"}, "qa_start_index": 9}
     omit_indices: 0-based indices into the ORIGINAL slides list to drop
     entirely from the rebuilt output.
     merge_next_indices: 0-based indices whose slide is merged INTO the
@@ -1950,11 +1968,19 @@ def apply_slide_edits(slides: list[dict], edits: dict) -> list[dict]:
     (string key, for JSON compatibility) to a replacement title. Applied
     BEFORE merge, so a merged group's kept title (see _merge_slide_group)
     reflects the edit.
+    qa_start_index (Slide Review's "Mark Q&A start"): a 0-based ORIGINAL
+    slide index. Everything from that slide to the end of the list is
+    merged into one entry, same as chaining merge_next_indices over that
+    whole range, and (unless a manual title_overrides entry for the last
+    slide already exists) that entry is titled "Q&A Session". Kept as a
+    separate field rather than writing straight into merge_next_indices
+    so it can be moved to a different slide, or cleared, without
+    disturbing unrelated manual omit/merge/title edits - see
+    resolve_qa_start_edits.
     """
     omit = set(edits.get("omit_indices", []) or [])
-    merge_next = set(edits.get("merge_next_indices", []) or [])
-    title_overrides = edits.get("title_overrides") or {}
     n = len(slides)
+    merge_next, title_overrides = resolve_qa_start_edits(edits, n)
 
     if title_overrides:
         slides = [dict(s) for s in slides]
@@ -2080,6 +2106,50 @@ def rebuild_outputs(slides_json_path: str, edits: dict, overrides: dict | None =
     edits_path.write_text(json.dumps(edits, indent=2, ensure_ascii=False), encoding="utf-8")
     log.info("Rebuild complete. Edits saved: %s", edits_path)
     return True
+
+
+def regenerate_reports(source_file: str, overrides: dict) -> dict:
+    """
+    Combined convenience for gui.py's Tab 3 "Regenerate reports" button:
+    rebuilds the slide report (CSV/HTML/PDF/timing) using whatever edits
+    were last saved from the Slide Review dialog (the <stem>_slides_edits.json
+    rebuild_outputs writes), THEN regenerates the notes/summary (txt/html/
+    docx/pdf) from *_transcript_speakers.txt - previously two separate
+    actions (the dialog's "Rebuild outputs" and Mode = "Notes-only" + Run)
+    done here in one call. Neither stage re-runs transcription/detection/
+    VLM. Either half is silently skipped (not an error) if its source
+    file does not exist yet, e.g. a Meeting-tab recording has no slides.
+    Returns {"slides_rebuilt": bool, "notes_regenerated": bool,
+    "errors": [str, ...]}.
+    """
+    cfg = build_run_config(overrides)
+    output_prefix = resolve_output_prefix(source_file, cfg)
+    stem = Path(output_prefix).name
+    result: dict = {"slides_rebuilt": False, "notes_regenerated": False, "errors": []}
+
+    slides_json_path = Path(output_prefix + "_slides") / f"{stem}_slides.json"
+    if slides_json_path.exists():
+        edits: dict = {}
+        edits_path = slides_json_path.with_name(f"{stem}_slides_edits.json")
+        if edits_path.exists():
+            try:
+                edits = json.loads(edits_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                result["errors"].append(f"Could not read saved slide edits ({edits_path.name}): {exc}")
+        try:
+            result["slides_rebuilt"] = rebuild_outputs(str(slides_json_path), edits, overrides)
+        except Exception as exc:
+            result["errors"].append(f"Slide report: {exc}")
+
+    transcript_file = Path(output_prefix + "_transcript_speakers.txt")
+    if transcript_file.exists():
+        try:
+            run_notes_only(str(transcript_file), overrides)
+            result["notes_regenerated"] = True
+        except Exception as exc:
+            result["errors"].append(f"Notes/summary: {exc}")
+
+    return result
 
 
 # ---------------------------------------------------------------------------

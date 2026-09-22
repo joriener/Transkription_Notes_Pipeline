@@ -104,6 +104,116 @@ class TestApplySlideEdits:
     def test_empty_slide_list(self):
         assert run_pipeline.apply_slide_edits([], {"omit_indices": [0]}) == []
 
+    def test_qa_start_index_merges_to_end_and_titles_it(self):
+        slides = [make_slide(0, ts=1.0), make_slide(1, ts=2.0), make_slide(2, ts=3.0)]
+        out = run_pipeline.apply_slide_edits(slides, {"qa_start_index": 1})
+        assert len(out) == 2
+        assert out[0]["title"] == "Slide 0"
+        assert out[1]["title"] == "Q&A Session"
+        assert out[1]["timestamp_sec"] == 2.0
+
+    def test_qa_start_index_respects_manual_title_override_on_last_slide(self):
+        slides = [make_slide(0, ts=1.0), make_slide(1, ts=2.0)]
+        edits = {"qa_start_index": 0, "title_overrides": {"1": "Custom Q&A Title"}}
+        out = run_pipeline.apply_slide_edits(slides, edits)
+        assert len(out) == 1
+        assert out[0]["title"] == "Custom Q&A Title"
+
+    def test_qa_start_index_does_not_disturb_unrelated_manual_edits(self):
+        slides = [make_slide(0), make_slide(1), make_slide(2), make_slide(3)]
+        edits = {"omit_indices": [0], "qa_start_index": 2}
+        out = run_pipeline.apply_slide_edits(slides, edits)
+        assert [s["title"] for s in out] == ["Slide 1", "Q&A Session"]
+
+    def test_qa_start_index_none_is_noop(self):
+        slides = [make_slide(0), make_slide(1)]
+        out = run_pipeline.apply_slide_edits(slides, {"qa_start_index": None})
+        assert [s["title"] for s in out] == ["Slide 0", "Slide 1"]
+
+
+class TestResolveQaStartEdits:
+    def test_none_returns_manual_edits_unchanged(self):
+        merge, titles = run_pipeline.resolve_qa_start_edits(
+            {"merge_next_indices": [0], "title_overrides": {"0": "X"}}, 3)
+        assert merge == {0}
+        assert titles == {"0": "X"}
+
+    def test_expands_range_to_last_index(self):
+        merge, titles = run_pipeline.resolve_qa_start_edits({"qa_start_index": 2}, 5)
+        assert merge == {2, 3}
+        assert titles == {"4": "Q&A Session"}
+
+    def test_out_of_range_index_ignored(self):
+        merge, titles = run_pipeline.resolve_qa_start_edits({"qa_start_index": 9}, 3)
+        assert merge == set()
+        assert titles == {}
+
+
+# -----------------------------------------------------------------
+# regenerate_reports
+# -----------------------------------------------------------------
+
+class TestRegenerateReports:
+    def test_skips_both_when_neither_file_exists(self, tmp_path):
+        source = tmp_path / "meeting.mp4"
+        source.touch()
+        result = run_pipeline.regenerate_reports(str(source), {})
+        assert result == {"slides_rebuilt": False, "notes_regenerated": False, "errors": []}
+
+    def test_rebuilds_slides_and_regenerates_notes_when_both_exist(self, monkeypatch, tmp_path):
+        source = tmp_path / "meeting.mp4"
+        source.touch()
+        slides_dir = tmp_path / "meeting_slides"
+        slides_dir.mkdir()
+        (slides_dir / "meeting_slides.json").write_text("[]", encoding="utf-8")
+        (tmp_path / "meeting_transcript_speakers.txt").write_text("hi", encoding="utf-8")
+
+        calls = []
+        monkeypatch.setattr(run_pipeline, "rebuild_outputs",
+                           lambda path, edits, overrides: calls.append(("rebuild", path, edits)) or True)
+        monkeypatch.setattr(run_pipeline, "run_notes_only",
+                           lambda path, overrides: calls.append(("notes", path)))
+
+        result = run_pipeline.regenerate_reports(str(source), {})
+        assert result == {"slides_rebuilt": True, "notes_regenerated": True, "errors": []}
+        assert calls[0][0] == "rebuild" and calls[0][2] == {}
+        assert calls[1][0] == "notes"
+
+    def test_reuses_saved_slide_edits(self, monkeypatch, tmp_path):
+        source = tmp_path / "meeting.mp4"
+        source.touch()
+        slides_dir = tmp_path / "meeting_slides"
+        slides_dir.mkdir()
+        (slides_dir / "meeting_slides.json").write_text("[]", encoding="utf-8")
+        saved_edits = {"omit_indices": [1], "qa_start_index": 3}
+        (slides_dir / "meeting_slides_edits.json").write_text(json.dumps(saved_edits), encoding="utf-8")
+
+        seen = {}
+        monkeypatch.setattr(run_pipeline, "rebuild_outputs",
+                           lambda path, edits, overrides: seen.setdefault("edits", edits) or True)
+
+        run_pipeline.regenerate_reports(str(source), {})
+        assert seen["edits"] == saved_edits
+
+    def test_notes_failure_does_not_block_slide_result(self, monkeypatch, tmp_path):
+        source = tmp_path / "meeting.mp4"
+        source.touch()
+        slides_dir = tmp_path / "meeting_slides"
+        slides_dir.mkdir()
+        (slides_dir / "meeting_slides.json").write_text("[]", encoding="utf-8")
+        (tmp_path / "meeting_transcript_speakers.txt").write_text("hi", encoding="utf-8")
+
+        monkeypatch.setattr(run_pipeline, "rebuild_outputs", lambda path, edits, overrides: True)
+
+        def fake_notes_only(path, overrides):
+            raise RuntimeError("LLM unavailable")
+        monkeypatch.setattr(run_pipeline, "run_notes_only", fake_notes_only)
+
+        result = run_pipeline.regenerate_reports(str(source), {})
+        assert result["slides_rebuilt"] is True
+        assert result["notes_regenerated"] is False
+        assert "LLM unavailable" in result["errors"][0]
+
 
 # -----------------------------------------------------------------
 # run_batch_rows

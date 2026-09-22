@@ -2018,12 +2018,21 @@ class RunTabController:
                           "starts above, or rename speakers - all without re-transcribing.",
                      foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 8))
 
+            step3_tools = ttk.Frame(step3_target)
+            step3_tools.pack(fill="x", padx=8, pady=(8, 0))
+            ttk.Button(step3_tools, text="Regenerate reports", command=self._on_regenerate_reports).pack(
+                side="left")
+            ttk.Label(step3_tools,
+                     text="Rebuilds the slide report (using any edits saved from step 2's Slide "
+                          "Review dialog) AND regenerates the summary, in one click, for the file/"
+                          "path set above - no re-transcription, re-detection, or VLM calls.",
+                     foreground="#666", wraplength=760).pack(side="left", padx=(8, 0))
             ttk.Label(step3_target,
-                     text="To (re)generate just the summary/reports for a recording already "
-                          "processed in step 1 - e.g. after adjusting Q&A in step 2, or the "
-                          "formats above - set Mode (top of this tab) to \"Notes-only "
-                          "(existing transcript)\" and Run.",
-                     foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(8, 4))
+                     text="\"Regenerate reports\" above covers most cases. For finer control: "
+                          "\"Rebuild outputs\" inside step 2's Slide Review dialog rebuilds only the "
+                          "slide report from edits not yet saved there; Mode (top of this tab) set to "
+                          "\"Notes-only (existing transcript)\" + Run regenerates only the summary.",
+                     foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(4, 4))
 
         # --- Run button + progress ---
         run_frame = ttk.Frame(parent)
@@ -3049,6 +3058,67 @@ class RunTabController:
             retried, still_failed = run_pipeline.reannotate_failed_slides(
                 slides_json_path, overrides, stop_check=self.stop_event.is_set)
             self.log_queue.put(f"=== RE-ANNOTATE DONE: {retried} fixed, {still_failed} still failed ===")
+        except Exception as exc:
+            self.log_queue.put(f"FATAL ERROR: {exc}")
+            import traceback
+            self.log_queue.put(traceback.format_exc())
+        finally:
+            root_logger.removeHandler(handler)
+            self.log_queue.put("__RUN_COMPLETE__")
+
+    def _on_regenerate_reports(self):
+        """Tab 3's "Regenerate reports": for the file/path set at the top
+        of this tab (Single file mode), rebuilds the slide report using
+        whatever edits were last saved from step 2's Slide Review dialog
+        AND regenerates the notes/summary, in one call - previously two
+        separate actions ("Rebuild outputs" in that dialog, and Mode =
+        "Notes-only" + Run). See run_pipeline.regenerate_reports."""
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("Busy", "A run is already in progress.")
+            return
+        path = self.path_var.get().strip()
+        if not path or not Path(path).exists():
+            messagebox.showwarning(
+                "No file selected",
+                "Select the source file at the top of this tab first (Mode: Single file).")
+            return
+
+        self._clear_log()
+        self.run_button.config(state="disabled")
+        self.stop_button.config(state="normal")
+        self.stop_event.clear()
+        self.status_label.config(text="Regenerating reports...")
+        self.progress_var.set(0)
+        self.stage_label.config(text="")
+
+        overrides = self._build_overrides()
+
+        self.worker_thread = threading.Thread(
+            target=self._regenerate_reports_worker, args=(path, overrides), daemon=True
+        )
+        self.worker_thread.start()
+
+    def _regenerate_reports_worker(self, path: str, overrides: dict):
+        handler = QueueLogHandler(self.log_queue)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        level = getattr(logging, self.app.log_level_var.get().upper(), logging.INFO)
+        root_logger.setLevel(level)
+        try:
+            result = run_pipeline.regenerate_reports(path, overrides)
+            if result["slides_rebuilt"]:
+                self.log_queue.put("=== SLIDE REPORT REBUILT ===")
+            else:
+                self.log_queue.put("Slide report: skipped (no *_slides.json found for this file).")
+            if result["notes_regenerated"]:
+                self.log_queue.put("=== NOTES/SUMMARY REGENERATED ===")
+            else:
+                self.log_queue.put(
+                    "Notes/summary: skipped (no *_transcript_speakers.txt found for this file).")
+            for err in result.get("errors", []):
+                self.log_queue.put(f"ERROR: {err}")
+            self.log_queue.put("=== REGENERATE REPORTS DONE ===")
         except Exception as exc:
             self.log_queue.put(f"FATAL ERROR: {exc}")
             import traceback
@@ -4494,6 +4564,16 @@ class SlideReviewDialog(tk.Toplevel):
     once per snapshot path (cached in self._grid_photos) - a large batch
     overview never decodes hundreds of images just from opening the
     dialog or staying in list view.
+
+    "Mark Q&A start here": an alternative to the Q&A section fields on
+    the Video/Webinar tab (which need a typed timestamp and only split
+    the Q&A portion out of the LAST detected slide - see
+    run_pipeline._add_qa_slide) for recordings where the slide detector
+    already produced several separate entries during the live Q&A (e.g.
+    a flickering speaker webcam view). Select the first such slide and
+    mark it instead of toggling "Merge with next" repeatedly: everything
+    from there to the end is merged into one "Q&A Session" slide on
+    rebuild (edits.qa_start_index, see run_pipeline.resolve_qa_start_edits).
     """
 
     def __init__(self, master, overrides_source):
@@ -4598,6 +4678,8 @@ class SlideReviewDialog(tk.Toplevel):
         ttk.Button(btn_row, text="Toggle Omit", command=self._toggle_omit).pack(side="left")
         ttk.Button(btn_row, text="Toggle Merge with next", command=self._toggle_merge).pack(
             side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Mark Q&&A start here", command=self._toggle_qa_start).pack(
+            side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Edit Title...", command=self._edit_title).pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Clear all edits", command=self._clear_edits).pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Rebuild outputs", command=self._rebuild).pack(side="right")
@@ -4605,14 +4687,17 @@ class SlideReviewDialog(tk.Toplevel):
         self.status_label.pack(side="right", padx=(0, 12))
 
         ttk.Label(self, text="Select one or more rows, then Toggle Omit / Toggle Merge with next / "
-                            "Edit Title. \"Batch overview\" combines every video loaded this session; "
-                            "\"Rebuild outputs\" regenerates CSV/HTML/PDF/timing summary for the "
-                            "selected (or last loaded) video only - no re-transcription, "
-                            "re-detection, or VLM calls.",
+                            "Edit Title. \"Mark Q&A start here\" (select a single slide) merges that "
+                            "slide through the last one into a single \"Q&A Session\" entry - select "
+                            "the same slide again to clear the mark. \"Batch overview\" combines every "
+                            "video loaded this session; \"Rebuild outputs\" regenerates CSV/HTML/PDF/"
+                            "timing summary for the selected (or last loaded) video only - no "
+                            "re-transcription, re-detection, or VLM calls.",
                  foreground="#666", wraplength=860).pack(fill="x", padx=8, pady=(0, 8))
 
     def _blank_edits(self) -> dict:
-        return {"omit_indices": set(), "merge_next_indices": set(), "title_overrides": {}}
+        return {"omit_indices": set(), "merge_next_indices": set(), "title_overrides": {},
+                "qa_start_index": None}
 
     def _edits_path_for(self, path: str) -> Path:
         p = Path(path)
@@ -4685,6 +4770,7 @@ class SlideReviewDialog(tk.Toplevel):
                 edits["omit_indices"] = set(saved.get("omit_indices", []) or [])
                 edits["merge_next_indices"] = set(saved.get("merge_next_indices", []) or [])
                 edits["title_overrides"] = dict(saved.get("title_overrides", {}) or {})
+                edits["qa_start_index"] = saved.get("qa_start_index")
             except Exception:
                 pass
         self._edits_by_video[path] = edits
@@ -4707,20 +4793,23 @@ class SlideReviewDialog(tk.Toplevel):
             slides = self._slides_by_video.get(video, [])
             edits = self._edits_by_video.get(video) or self._blank_edits()
             omit = edits["omit_indices"]
-            merge_next = edits["merge_next_indices"]
             title_overrides = edits["title_overrides"]
+            qa_start_index = edits.get("qa_start_index")
+            effective_merge, effective_titles = run_pipeline.resolve_qa_start_edits(edits, len(slides))
             video_label = Path(video).stem
             for idx, slide in enumerate(slides):
                 bullets = slide.get("bullets") or []
                 first_bullet = bullets[0] if bullets else ""
-                title = title_overrides.get(str(idx), slide.get("title", ""))
+                title = effective_titles.get(str(idx), slide.get("title", ""))
                 status_parts = []
                 if idx in omit:
                     status_parts.append("OMIT")
-                if idx in merge_next:
+                if idx in effective_merge:
                     status_parts.append("MERGE->next")
                 if str(idx) in title_overrides:
                     status_parts.append("TITLE EDITED")
+                if idx == qa_start_index:
+                    status_parts.append("Q&A START")
                 row_id = str(len(self._row_refs))
                 self._row_refs.append((video, idx))
                 self.tree.insert("", "end", iid=row_id, values=(
@@ -4918,6 +5007,29 @@ class SlideReviewDialog(tk.Toplevel):
                 edits["merge_next_indices"].add(idx)
         self._refresh_tree()
 
+    def _toggle_qa_start(self):
+        """Marks the selected slide as where the Q&A session begins.
+        Everything from that slide through the last one is merged into a
+        single entry titled "Q&A Session" when outputs are rebuilt (see
+        run_pipeline.resolve_qa_start_edits) - e.g. select the first
+        slide that's really just the Q&A/live-discussion portion instead
+        of toggling "Merge with next" one slide at a time. Stored as its
+        own field (qa_start_index), independent of manual omit/merge
+        edits, so re-selecting a different slide moves the mark and
+        selecting the already-marked slide again clears it, without
+        touching unrelated edits."""
+        refs = self._selected_refs()
+        if not refs:
+            messagebox.showinfo("No selection", "Select the slide where the Q&A session starts.")
+            return
+        if len(refs) > 1:
+            messagebox.showinfo("One at a time", "Select a single slide to mark as the Q&A start.")
+            return
+        video, idx = refs[0]
+        edits = self._edits_by_video.setdefault(video, self._blank_edits())
+        edits["qa_start_index"] = None if edits.get("qa_start_index") == idx else idx
+        self._refresh_tree()
+
     def _edit_title(self):
         """Task #64: store a non-destructive title override for one
         slide (extends the edits schema, see run_pipeline.apply_slide_edits).
@@ -4966,6 +5078,7 @@ class SlideReviewDialog(tk.Toplevel):
             "omit_indices": sorted(edits["omit_indices"]),
             "merge_next_indices": sorted(edits["merge_next_indices"]),
             "title_overrides": dict(edits["title_overrides"]),
+            "qa_start_index": edits.get("qa_start_index"),
         }
         overrides = {}
         if hasattr(self._overrides_source, "_build_overrides"):
